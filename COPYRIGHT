@@ -1,5 +1,5 @@
 UnitAutogen — the tSQLt auto-generation framework
-Copyright (C) 2026  [Munaf Ibrahim Khatri]
+Copyright (C) 2026  Munaf Ibrahim Khatri
 
 This file records the copyright ownership and licensing of this project.
 
@@ -7,7 +7,7 @@ This file records the copyright ownership and licensing of this project.
 COPYRIGHT
 ---------
 All source code, scripts, and documentation in this repository are the
-original work of [Munaf Ibrahim Khatri], who is the sole author and the
+original work of Munaf Ibrahim Khatri, who is the sole author and the
 sole copyright holder, except where an individual file expressly states
 otherwise.
 
@@ -49,6 +49,17 @@ framework.  tSQLt is the work of its own authors, is licensed separately
 under its own terms, and is NOT included in or distributed with this
 repository.
 
-UnitAutogen is developed and tested against the Microsoft AdventureWorks
-sample database.  AdventureWorks is likewise NOT included in or
-redistributed wi
+UnitAutogen is developed and tested against the Microsoft AdventureWorks,
+Northwind, and WideWorldImporters sample databases.  These sample
+databases are likewise NOT included in or redistributed with this
+repository.  They are referenced only as test fixtures during
+development; users of UnitAutogen supply their own databases when
+running the framework against real production code.
+
+
+DATE OF FIRST PUBLIC RELEASE
+----------------------------
+UnitAutogen v0.9.0-beta was first published as open source on GitHub on
+28 May 2026 at:
+
+    https://github.com/unitautogen/unitautogen-public-repo
