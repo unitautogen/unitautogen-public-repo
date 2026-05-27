@@ -1,0 +1,54 @@
+UnitAutogen — the tSQLt auto-generation framework
+Copyright (C) 2026  [Munaf Ibrahim Khatri]
+
+This file records the copyright ownership and licensing of this project.
+
+
+COPYRIGHT
+---------
+All source code, scripts, and documentation in this repository are the
+original work of [Munaf Ibrahim Khatri], who is the sole author and the
+sole copyright holder, except where an individual file expressly states
+otherwise.
+
+
+LICENCE
+-------
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+License for more details.
+
+The full text of the licence is in the file named LICENSE in the root of
+this repository, and is also available at:
+
+    https://www.gnu.org/licenses/agpl-3.0.html
+
+
+COMMERCIAL LICENCE
+------------------
+UnitAutogen is offered to the public under the GNU AGPL v3.0 as stated
+above.  A separate commercial licence, which does not carry the copyleft
+obligations of the AGPL, is available from the copyright holder for
+organisations that wish to use this software without those obligations.
+
+For commercial licensing enquiries, contact:
+
+    licensing@unitautogen.com
+
+
+THIRD-PARTY COMPONENTS
+----------------------
+UnitAutogen is designed to operate together with the open-source tSQLt
+framework.  tSQLt is the work of its own authors, is licensed separately
+under its own terms, and is NOT included in or distributed with this
+repository.
+
+UnitAutogen is developed and tested against the Microsoft AdventureWorks
+sample database.  AdventureWorks is likewise NOT included in or
+redistributed wi

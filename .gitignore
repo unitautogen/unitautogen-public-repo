@@ -1,0 +1,43 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# SQL Server build / DACPAC output
+bin/
+obj/
+*.dacpac
+*.bacpac
+*.bak
+*.trn
+*.ldf
+*.mdf
+
+# Test / coverage artefacts (generated locally; not committed)
+*.xel
+*.xem
+*.log
+*.tmp
+TestResults/
+coverage/
+
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+secrets/
+appsettings.*.json
+
+# Local notes / scratch
+notes/
+scratch/
+*.draft.md
