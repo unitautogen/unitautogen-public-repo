@@ -1,3 +1,19 @@
+/*-----------------------------------------------------------------------------
+ * UnitAutogen - auto-generated tSQLt unit tests with real branch coverage
+ * Copyright (C) 2026  Munaf Ibrahim Khatri
+ *
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Affero General Public License v3.0 as published
+ * by the Free Software Foundation. See the LICENSE file at the repository
+ * root for the full text, and COPYRIGHT for the author's notice.
+ *
+ * Distributed WITHOUT ANY WARRANTY, even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ *
+ * A separate commercial licence (AGPL-free) is available from the copyright
+ * holder. Contact: licensing@unitautogen.com
+ *----------------------------------------------------------------------------*/
+
 /*============================================================================
   Verify_v9_4.sql   --   tSQLt Auto-Gen Framework   v9.4 end-to-end verification
   ----------------------------------------------------------------------------
