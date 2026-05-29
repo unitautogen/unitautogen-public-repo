@@ -46,6 +46,43 @@ That's the entire happy path. The two procedures above generate the test
 classes, run them, and print a coverage report - line and branch percentages
 plus a list of any uncovered lines.
 
+## CI/CD Integration
+
+UnitAutogen emits **Cobertura XML** (coverage) and **JUnit XML** (test results)
+natively consumed by Azure DevOps, GitHub Actions, Jenkins, GitLab CI, and SonarQube —
+no custom plugins required.
+
+**PowerShell wrapper — one call exports all three output files:**
+
+```powershell
+Import-Module './powershell/UnitAutogen.psm1'   # auto-installs SqlServer module
+
+Invoke-UnitAutogen `
+    -ServerInstance 'sql01' `
+    -Database       'YourDatabase' `
+    -OutputPath     './artifacts'
+
+# Writes:
+#   artifacts/coverage.xml          ← Cobertura XML for coverage tools
+#   artifacts/test-results.xml      ← JUnit XML for test result dashboards
+#   artifacts/coverage-report.html  ← Human-readable HTML report
+```
+
+Or call the SQL procs directly from SSMS:
+
+```sql
+EXEC TestGen.GenerateAndCoverDatabase @OutputMode = 'COBERTURA';  -- Cobertura XML
+EXEC TestGen.GetCoverageCoberturaXml;   -- re-export without re-running
+EXEC TestGen.GetTestResultsJunitXml;    -- JUnit XML
+EXEC TestGen.GetCoverageHtmlReport;     -- HTML report
+```
+
+Ready-to-use pipeline files are in the [`ci/`](ci/) folder:
+[`ci/azure-pipelines.yml`](ci/azure-pipelines.yml) and
+[`ci/github-actions.yml`](ci/github-actions.yml).
+
+Full usage guide: [`powershell/USAGE.md`](powershell/USAGE.md).
+
 ## Documentation
 
 | Document                                          | When to read it                                                                                |
@@ -59,6 +96,7 @@ plus a list of any uncovered lines.
 | [docs/strong-assertions.md](docs/strong-assertions.md) | The snapshot-and-replay assertion mechanism for branch tests.                             |
 | [docs/advanced-snippets.sql](docs/advanced-snippets.sql) | Paste-ready SQL for the advanced workflows above.                                        |
 | [INSTALL.md](INSTALL.md)                          | Full installation options, upgrade paths, modular install.                                     |
+| [powershell/USAGE.md](powershell/USAGE.md)        | PowerShell wrapper — CI/CD usage, Windows/SQL auth, Azure DevOps and GitHub Actions YAML.     |
 
 ## What works, what doesn't
 
@@ -74,11 +112,18 @@ Full architecture: [docs/architecture.md](docs/architecture.md).
 
 This is the **first public release** of UnitAutogen, labelled Beta because real-world testing only happens at scale once strangers run it on their own schemas. The engineering has been validated on three reference databases at high coverage, but you will surface things on production schemas that nobody has tried. Bug reports are the most valuable thing you can give us right now.
 
-What's coming next (your input shapes the order):
+**Shipped in this release:**
 
-- Polished CI/CD plug-ins for GitHub Actions and Azure DevOps Pipelines
-- HTML coverage dashboards and SonarQube / Cobertura output
-- A Pro tier with the above integrations for commercial users (open core stays free)
+- Cobertura XML + JUnit XML output — natively consumed by Azure DevOps, GitHub Actions, Jenkins, GitLab CI, SonarQube
+- HTML coverage report re-export without re-running tests
+- PowerShell wrapper module (`UnitAutogen.psm1`) with Windows and SQL auth support
+- Ready-to-use Azure DevOps and GitHub Actions pipeline YAML samples
+
+**What's coming next (your input shapes the order):**
+
+- Broader stored procedure pattern support (dynamic SQL, OUTPUT parameters, CLR)
+- SonarQube quality gate integration guide
+- NuGet package for easier pipeline consumption
 
 ## Contributing
 
