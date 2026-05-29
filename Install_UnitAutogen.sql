@@ -4664,6 +4664,121 @@ BEGIN
           );
 
         /* ------------------------------------------------------------------
+         * Inbound-FK cascade expansion.
+         *
+         * tSQLt.FakeTable works by renaming the real table.  SQL Server
+         * rejects the rename (Msg 15336) when other tables have enforced
+         * FK constraints pointing AT the target - e.g. many tables FK into
+         * [Production].[Product] so faking Product directly fails.
+         *
+         * Fix: BFS from each primary TABLE dep, collecting every table that
+         * has an inbound enforced FK (directly or transitively).  Emit
+         * SafeFakeTable calls for those tables BEFORE the primary deps,
+         * deepest inbound level first.  The fake copies carry no FK
+         * constraints, so the primary dep can then be renamed freely.
+         *
+         * These extra tables are faked only - no seed data is emitted for
+         * them.  Cursor guarantees deepest-first ordering (critical for
+         * multi-level FK chains such as Product <- WorkOrder <- WorkOrderRouting).
+         * -----------------------------------------------------------------*/
+        DECLARE @IFKTables TABLE
+        (
+            SchemaName SYSNAME NOT NULL,
+            ObjectName SYSNAME NOT NULL,
+            FakeLevel  INT     NOT NULL,
+            PRIMARY KEY (SchemaName, ObjectName)
+        );
+        DECLARE @IFKBatch TABLE
+        (
+            SchemaName SYSNAME NOT NULL,
+            ObjectName SYSNAME NOT NULL,
+            PRIMARY KEY (SchemaName, ObjectName)
+        );
+        DECLARE @IFKLevelCur INT = 0;
+        DECLARE @IFKAdded    INT = 1;
+
+        WHILE @IFKAdded > 0 AND @IFKLevelCur < 10
+        BEGIN
+            SET @IFKLevelCur += 1;
+            DELETE @IFKBatch;
+
+            IF @IFKLevelCur = 1
+                -- Level 1: direct inbound FKs of primary TABLE deps
+                INSERT @IFKBatch (SchemaName, ObjectName)
+                SELECT DISTINCT SCHEMA_NAME(r.schema_id), r.name
+                FROM   @Deps d
+                JOIN   sys.objects t
+                       ON  t.object_id = OBJECT_ID(QUOTENAME(d.SchemaName) + N'.' + QUOTENAME(d.ObjectName))
+                       AND t.type = 'U'
+                JOIN   sys.foreign_keys fk
+                       ON  fk.referenced_object_id = t.object_id
+                       AND fk.is_disabled          = 0
+                JOIN   sys.objects r
+                       ON  r.object_id = fk.parent_object_id
+                       AND r.type      = 'U'
+                WHERE  d.DepKind = 'TABLE'
+                  AND  SCHEMA_NAME(r.schema_id) NOT IN (N'tSQLt', N'TestGen', N'TestGenLog')
+                  AND  SCHEMA_NAME(r.schema_id) NOT LIKE 'test[_]%'
+                  AND  NOT EXISTS (SELECT 1 FROM @Deps d2
+                                   WHERE  d2.DepKind IN ('TABLE','VIEW')
+                                     AND  d2.SchemaName = SCHEMA_NAME(r.schema_id)
+                                     AND  d2.ObjectName = r.name)
+                  AND  NOT EXISTS (SELECT 1 FROM @IFKTables x
+                                   WHERE  x.SchemaName = SCHEMA_NAME(r.schema_id)
+                                     AND  x.ObjectName = r.name);
+            ELSE
+                -- Level N: inbound FKs of the previous level's newly added tables
+                INSERT @IFKBatch (SchemaName, ObjectName)
+                SELECT DISTINCT SCHEMA_NAME(r.schema_id), r.name
+                FROM   @IFKTables f
+                JOIN   sys.objects t
+                       ON  t.object_id = OBJECT_ID(QUOTENAME(f.SchemaName) + N'.' + QUOTENAME(f.ObjectName))
+                       AND t.type = 'U'
+                JOIN   sys.foreign_keys fk
+                       ON  fk.referenced_object_id = t.object_id
+                       AND fk.is_disabled          = 0
+                JOIN   sys.objects r
+                       ON  r.object_id = fk.parent_object_id
+                       AND r.type      = 'U'
+                WHERE  f.FakeLevel = @IFKLevelCur - 1
+                  AND  SCHEMA_NAME(r.schema_id) NOT IN (N'tSQLt', N'TestGen', N'TestGenLog')
+                  AND  SCHEMA_NAME(r.schema_id) NOT LIKE 'test[_]%'
+                  AND  NOT EXISTS (SELECT 1 FROM @IFKTables x
+                                   WHERE  x.SchemaName = SCHEMA_NAME(r.schema_id)
+                                     AND  x.ObjectName = r.name)
+                  AND  NOT EXISTS (SELECT 1 FROM @Deps d2
+                                   WHERE  d2.DepKind IN ('TABLE','VIEW')
+                                     AND  d2.SchemaName = SCHEMA_NAME(r.schema_id)
+                                     AND  d2.ObjectName = r.name);
+
+            INSERT @IFKTables (SchemaName, ObjectName, FakeLevel)
+            SELECT SchemaName, ObjectName, @IFKLevelCur FROM @IFKBatch;
+            SET @IFKAdded = @@ROWCOUNT;
+        END;
+
+        /* Emit SafeFakeTable for inbound-FK tables deepest-first (highest
+           FakeLevel first) so each level's FK constraints are gone before
+           the next level is renamed. */
+        IF EXISTS (SELECT 1 FROM @IFKTables)
+        BEGIN
+            DECLARE @IFKSchema SYSNAME, @IFKObj SYSNAME;
+            DECLARE ifk_cur CURSOR LOCAL FAST_FORWARD FOR
+                SELECT SchemaName, ObjectName
+                FROM   @IFKTables
+                ORDER  BY FakeLevel DESC, SchemaName, ObjectName;
+            OPEN ifk_cur;
+            FETCH NEXT FROM ifk_cur INTO @IFKSchema, @IFKObj;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                SET @MockBlock = @MockBlock
+                    + N'    EXEC TestGen.SafeFakeTable N''' + @IFKSchema + N'.' + @IFKObj
+                    + N''';  -- cascade-faked: inbound-FK dep' + @CRLF;
+                FETCH NEXT FROM ifk_cur INTO @IFKSchema, @IFKObj;
+            END;
+            CLOSE ifk_cur; DEALLOCATE ifk_cur;
+        END;
+
+        /* ------------------------------------------------------------------
          * Emit FakeTable calls via TestGen.SafeFakeTable, which tries
          * @SchemaBoundDependencies = 1 first and falls back to the older
          * signature if that argument isn't recognised. This avoids any
@@ -7408,7 +7523,7 @@ GO
 CREATE PROCEDURE TestGen.GenerateAndCoverDatabase
     @SchemaFilter   SYSNAME       = NULL,   -- NULL = every user schema
     @ExcludePattern NVARCHAR(200) = NULL,   -- LIKE pattern of proc names to skip
-    @OutputMode     VARCHAR(10)   = 'HTML'  -- HTML or TEXT
+    @OutputMode     VARCHAR(10)   = 'HTML'  -- HTML, TEXT, or COBERTURA
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -7615,6 +7730,15 @@ BEGIN
         FROM   TestGen.CoverageResult
         WHERE  BatchId = @BatchId
         ORDER  BY SchemaName, ProcName;
+        RETURN;
+    END;
+
+    /*------------------------------ COBERTURA ------------------------------*/
+    /* Delegates to TestGen.GetCoverageCoberturaXml (module 23).                      */
+    /* All existing TEXT / HTML code above is untouched.                     */
+    IF @OutputMode = 'COBERTURA'
+    BEGIN
+        EXEC TestGen.GetCoverageCoberturaXml @BatchId = @BatchId, @SchemaFilter = @SchemaFilter;
         RETURN;
     END;
 
@@ -9740,6 +9864,491 @@ END;
 GO
 PRINT 'TestGen.GetCoverageReport v2 created.';
 GO
+
+
+/* === 23_Coverage_Reporter_Xml.sql === */
+/*******************************************************************************
+ * TestGen.GetCoverageCoberturaXml
+ *
+ * Emits a Cobertura-compatible XML coverage document for a completed batch.
+ * Consumed natively by:
+ *   - Azure DevOps  "Publish Code Coverage Results" task (format: Cobertura)
+ *   - SonarQube / SonarCloud  sonar.coverageReportPaths
+ *   - Jenkins  Cobertura Plugin
+ *   - GitLab CI  coverage_report: cobertura
+ *
+ * Parameters
+ * ----------
+ *   @BatchId      DATETIME2(3)  -- BatchId from TestGen.CoverageResult.
+ *                                  NULL = most recent batch.
+ *   @SchemaFilter SYSNAME       -- Restrict to one schema. NULL = all schemas.
+ *
+ * Output
+ * ------
+ *   Single SELECT column  CoberturaXml NVARCHAR(MAX)
+ *
+ * Typical usage (direct)
+ * ----------------------
+ *   EXEC TestGen.GetCoverageCoberturaXml;                          -- latest batch, all schemas
+ *   EXEC TestGen.GetCoverageCoberturaXml @SchemaFilter = 'dbo';
+ *
+ * Typical usage (via GenerateAndCoverDatabase)
+ * --------------------------------------------
+ *   EXEC TestGen.GenerateAndCoverDatabase @OutputMode = 'COBERTURA';
+ *   EXEC TestGen.GenerateAndCoverDatabase @SchemaFilter = 'dbo', @OutputMode = 'COBERTURA';
+ *
+ * Design notes
+ * ------------
+ *   - All existing procs (GetCoverageReport, GenerateAndCoverDatabase TEXT/HTML)
+ *     are untouched.  This proc is self-contained.
+ *   - Branch condition-coverage uses the same EffectiveHit inference as
+ *     GetCoverageReport v2: a branch line is HIT iff the next executable
+ *     line after it was hit.  Each branch is modelled as 2 conditions
+ *     (taken / not-taken); we report 1/2 when taken, 0/2 when not.
+ *   - NOT_TESTABLE procedures are excluded from the XML (no CoverageLines rows
+ *     exist for them, and their metrics are NULL in CoverageResult).
+ *   - @Timestamp is Unix epoch seconds computed from @BatchId (UTC).
+ ******************************************************************************/
+
+IF OBJECT_ID('TestGen.GetCoverageCoberturaXml','P') IS NOT NULL
+    DROP PROCEDURE TestGen.GetCoverageCoberturaXml;
+GO
+
+CREATE PROCEDURE TestGen.GetCoverageCoberturaXml
+    @BatchId      DATETIME2(3) = NULL,   -- NULL = most recent batch
+    @SchemaFilter SYSNAME      = NULL    -- NULL = all schemas
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- -------------------------------------------------------------------------
+    -- 1. Resolve BatchId
+    -- -------------------------------------------------------------------------
+    IF @BatchId IS NULL
+        SELECT TOP 1 @BatchId = BatchId
+        FROM   TestGen.CoverageResult
+        ORDER  BY BatchId DESC;
+
+    IF @BatchId IS NULL
+    BEGIN
+        RAISERROR('TestGen.GetCoverageCoberturaXml: no coverage results found. Run GenerateAndCoverDatabase first.',16,1);
+        RETURN;
+    END;
+
+    -- -------------------------------------------------------------------------
+    -- 2. Database-level aggregates (excludes NOT_TESTABLE)
+    -- -------------------------------------------------------------------------
+    DECLARE @gTot INT, @gCov INT, @gTB INT, @gCB INT;
+    SELECT @gTot = ISNULL(SUM(TotalLines),0),
+           @gCov = ISNULL(SUM(CoveredLines),0),
+           @gTB  = ISNULL(SUM(TotalBranches),0),
+           @gCB  = ISNULL(SUM(CoveredBranches),0)
+    FROM   TestGen.CoverageResult
+    WHERE  BatchId     = @BatchId
+      AND  Testability <> N'NOT_TESTABLE'
+      AND  (@SchemaFilter IS NULL OR SchemaName = @SchemaFilter);
+
+    DECLARE @gLineRate   VARCHAR(20) = CAST(CASE WHEN @gTot > 0 THEN CAST(1.0 * @gCov / @gTot AS DECIMAL(10,4)) ELSE 0 END AS VARCHAR(20));
+    DECLARE @gBranchRate VARCHAR(20) = CAST(CASE WHEN @gTB  > 0 THEN CAST(1.0 * @gCB  / @gTB  AS DECIMAL(10,4)) ELSE 1 END AS VARCHAR(20));
+
+    -- Unix epoch seconds from BatchId (UTC)
+    DECLARE @Timestamp VARCHAR(20) = CAST(DATEDIFF(SECOND, CAST('1970-01-01' AS DATETIME2), @BatchId) AS VARCHAR(20));
+
+    -- -------------------------------------------------------------------------
+    -- 3. Build XML string
+    -- -------------------------------------------------------------------------
+    DECLARE @XML NVARCHAR(MAX);
+    SET @XML = N'<?xml version="1.0" encoding="UTF-8"?>' + CHAR(10);
+    SET @XML = @XML + N'<!DOCTYPE coverage SYSTEM "http://cobertura.sourceforge.net/xml/coverage-04.dtd">' + CHAR(10);
+    SET @XML = @XML
+        + N'<coverage'
+        + N' line-rate="'        + @gLineRate   + N'"'
+        + N' branch-rate="'      + @gBranchRate + N'"'
+        + N' lines-covered="'    + CAST(@gCov AS VARCHAR) + N'"'
+        + N' lines-valid="'      + CAST(@gTot AS VARCHAR) + N'"'
+        + N' branches-covered="' + CAST(@gCB  AS VARCHAR) + N'"'
+        + N' branches-valid="'   + CAST(@gTB  AS VARCHAR) + N'"'
+        + N' complexity="0"'
+        + N' version="0.9.0-beta"'
+        + N' timestamp="'        + @Timestamp + N'">' + CHAR(10);
+
+    SET @XML = @XML + N'  <sources><source>.</source></sources>' + CHAR(10);
+    SET @XML = @XML + N'  <packages>' + CHAR(10);
+
+    -- -------------------------------------------------------------------------
+    -- 4. Loop schemas -> packages
+    -- -------------------------------------------------------------------------
+    DECLARE @pkgSchema   SYSNAME;
+    DECLARE @pkgTot INT, @pkgCov INT, @pkgTB INT, @pkgCB INT;
+    DECLARE @pkgLineRate VARCHAR(20), @pkgBranchRate VARCHAR(20);
+
+    DECLARE pkg CURSOR LOCAL FAST_FORWARD FOR
+        SELECT DISTINCT SchemaName
+        FROM   TestGen.CoverageResult
+        WHERE  BatchId     = @BatchId
+          AND  Testability <> N'NOT_TESTABLE'
+          AND  (@SchemaFilter IS NULL OR SchemaName = @SchemaFilter)
+        ORDER  BY SchemaName;
+    OPEN pkg;
+    FETCH NEXT FROM pkg INTO @pkgSchema;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SELECT @pkgTot = ISNULL(SUM(TotalLines),0),
+               @pkgCov = ISNULL(SUM(CoveredLines),0),
+               @pkgTB  = ISNULL(SUM(TotalBranches),0),
+               @pkgCB  = ISNULL(SUM(CoveredBranches),0)
+        FROM   TestGen.CoverageResult
+        WHERE  BatchId     = @BatchId
+          AND  SchemaName  = @pkgSchema
+          AND  Testability <> N'NOT_TESTABLE';
+
+        SET @pkgLineRate   = CAST(CASE WHEN @pkgTot > 0 THEN CAST(1.0 * @pkgCov / @pkgTot AS DECIMAL(10,4)) ELSE 0 END AS VARCHAR(20));
+        SET @pkgBranchRate = CAST(CASE WHEN @pkgTB  > 0 THEN CAST(1.0 * @pkgCB  / @pkgTB  AS DECIMAL(10,4)) ELSE 1 END AS VARCHAR(20));
+
+        SET @XML = @XML
+            + N'    <package name="' + @pkgSchema + N'"'
+            + N' line-rate="'   + @pkgLineRate   + N'"'
+            + N' branch-rate="' + @pkgBranchRate + N'"'
+            + N' complexity="0">' + CHAR(10);
+        SET @XML = @XML + N'      <classes>' + CHAR(10);
+
+        -- ----------------------------------------------------------------------
+        -- 5. Loop procs -> classes
+        -- ----------------------------------------------------------------------
+        DECLARE @clsProc SYSNAME;
+        DECLARE @clsTot INT, @clsCov INT, @clsTB INT, @clsCB INT;
+        DECLARE @clsLineRate VARCHAR(20), @clsBranchRate VARCHAR(20);
+
+        DECLARE cls CURSOR LOCAL FAST_FORWARD FOR
+            SELECT ProcName,
+                   ISNULL(TotalLines,0),    ISNULL(CoveredLines,0),
+                   ISNULL(TotalBranches,0), ISNULL(CoveredBranches,0)
+            FROM   TestGen.CoverageResult
+            WHERE  BatchId     = @BatchId
+              AND  SchemaName  = @pkgSchema
+              AND  Testability <> N'NOT_TESTABLE'
+            ORDER  BY ProcName;
+        OPEN cls;
+        FETCH NEXT FROM cls INTO @clsProc, @clsTot, @clsCov, @clsTB, @clsCB;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SET @clsLineRate   = CAST(CASE WHEN @clsTot > 0 THEN CAST(1.0 * @clsCov / @clsTot AS DECIMAL(10,4)) ELSE 0 END AS VARCHAR(20));
+            SET @clsBranchRate = CAST(CASE WHEN @clsTB  > 0 THEN CAST(1.0 * @clsCB  / @clsTB  AS DECIMAL(10,4)) ELSE 1 END AS VARCHAR(20));
+
+            SET @XML = @XML
+                + N'        <class'
+                + N' name="'        + @pkgSchema + N'.' + @clsProc + N'"'
+                + N' filename="'    + @pkgSchema + N'/' + @clsProc + N'.sql"'
+                + N' line-rate="'   + @clsLineRate   + N'"'
+                + N' branch-rate="' + @clsBranchRate + N'"'
+                + N' complexity="0">' + CHAR(10);
+            SET @XML = @XML + N'          <methods/>' + CHAR(10);
+            SET @XML = @XML + N'          <lines>' + CHAR(10);
+
+            -- ------------------------------------------------------------------
+            -- 6. Per-line detail - same EffectiveHit logic as GetCoverageReport
+            -- ------------------------------------------------------------------
+            DECLARE @lNum INT, @lExec BIT, @lBranch BIT, @lHit INT;
+
+            DECLARE lns CURSOR LOCAL FAST_FORWARD FOR
+                WITH lines AS (
+                    SELECT cl.LineNum, cl.IsExec, cl.IsBranch,
+                           CASE WHEN EXISTS (
+                               SELECT 1 FROM TestGen.CoverageHits ch
+                               WHERE  ch.SchemaName = cl.SchemaName
+                                 AND  ch.ProcName   = cl.ProcName
+                                 AND  ch.LineNum    = cl.LineNum
+                           ) THEN 1 ELSE 0 END AS DirectHit
+                    FROM   TestGen.CoverageLines cl
+                    WHERE  cl.SchemaName = @pkgSchema
+                      AND  cl.ProcName   = @clsProc
+                ),
+                nx AS (
+                    SELECT l.LineNum,
+                           ( SELECT TOP 1 e.LineNum
+                             FROM   lines e
+                             WHERE  e.IsExec = 1 AND e.LineNum > l.LineNum
+                             ORDER  BY e.LineNum ) AS NextExecLine
+                    FROM   lines l
+                    WHERE  l.IsBranch = 1
+                ),
+                bi AS (
+                    SELECT n.LineNum, ISNULL(l.DirectHit, 0) AS BodyHit
+                    FROM   nx n LEFT JOIN lines l ON l.LineNum = n.NextExecLine
+                )
+                SELECT l.LineNum, l.IsExec, l.IsBranch,
+                       CASE
+                           WHEN l.IsExec   = 1 AND l.DirectHit = 1 THEN 1
+                           WHEN l.IsBranch = 1 AND b.BodyHit   = 1 THEN 1
+                           ELSE 0
+                       END AS EffectiveHit
+                FROM   lines l LEFT JOIN bi b ON b.LineNum = l.LineNum
+                WHERE  l.IsExec = 1 OR l.IsBranch = 1
+                ORDER  BY l.LineNum;
+
+            OPEN lns;
+            FETCH NEXT FROM lns INTO @lNum, @lExec, @lBranch, @lHit;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                IF @lBranch = 1
+                    SET @XML = @XML
+                        + N'            <line number="' + CAST(@lNum AS VARCHAR)
+                        + N'" hits="' + CAST(@lHit AS VARCHAR)
+                        + N'" branch="true"'
+                        + N' condition-coverage="'
+                        + CASE WHEN @lHit = 1 THEN N'50% (1/2)' ELSE N'0% (0/2)' END
+                        + N'">' + CHAR(10)
+                        + N'              <conditions>'
+                        + N'<condition number="0" type="jump" coverage="'
+                        + CASE WHEN @lHit = 1 THEN N'50%' ELSE N'0%' END
+                        + N'"/>'
+                        + N'</conditions>' + CHAR(10)
+                        + N'            </line>' + CHAR(10);
+                ELSE
+                    SET @XML = @XML
+                        + N'            <line number="' + CAST(@lNum AS VARCHAR)
+                        + N'" hits="' + CAST(@lHit AS VARCHAR)
+                        + N'" branch="false"/>' + CHAR(10);
+
+                FETCH NEXT FROM lns INTO @lNum, @lExec, @lBranch, @lHit;
+            END;
+            CLOSE lns; DEALLOCATE lns;
+
+            SET @XML = @XML + N'          </lines>' + CHAR(10);
+            SET @XML = @XML + N'        </class>' + CHAR(10);
+
+            FETCH NEXT FROM cls INTO @clsProc, @clsTot, @clsCov, @clsTB, @clsCB;
+        END;
+        CLOSE cls; DEALLOCATE cls;
+
+        SET @XML = @XML + N'      </classes>' + CHAR(10);
+        SET @XML = @XML + N'    </package>' + CHAR(10);
+
+        FETCH NEXT FROM pkg INTO @pkgSchema;
+    END;
+    CLOSE pkg; DEALLOCATE pkg;
+
+    SET @XML = @XML + N'  </packages>' + CHAR(10);
+    SET @XML = @XML + N'</coverage>' + CHAR(10);
+
+    SELECT @XML AS CoberturaXml;
+END;
+GO
+PRINT 'TestGen.GetCoverageCoberturaXml created.';
+GO
+
+
+/* === 24_TestResults_Reporter_Xml.sql === */
+/*******************************************************************************
+ * TestGen.GetTestResultsJunitXml
+ *
+ * Emits a JUnit-compatible XML test results document for a completed batch.
+ * Consumed natively by:
+ *   - Azure DevOps  "Publish Test Results" task (format: JUnit)
+ *   - GitHub Actions  dorny/test-reporter, mikepenz/action-junit-report
+ *   - Jenkins  JUnit Plugin
+ *   - GitLab CI  junit: test-results.xml
+ *   - SonarQube  sonar.junit.reportPaths
+ *
+ * Parameters
+ * ----------
+ *   @BatchId      DATETIME2(3)  -- BatchId from TestGen.CoverageResult.
+ *                                  NULL = most recent batch.
+ *   @SchemaFilter SYSNAME       -- Restrict to one schema. NULL = all schemas.
+ *
+ * Output
+ * ------
+ *   Single SELECT column  JUnitXml NVARCHAR(MAX)
+ *
+ * Typical usage (direct)
+ * ----------------------
+ *   EXEC TestGen.GetTestResultsJunitXml;                   -- latest batch
+ *   EXEC TestGen.GetTestResultsJunitXml @SchemaFilter = 'dbo';
+ *
+ * Structure
+ * ---------
+ *   <testsuites>               one per database run (batch)
+ *     <testsuite name="dbo">  one per schema
+ *       <testcase .../>        one per stored procedure
+ *         (no child)           all tests passed
+ *         <skipped/>           procedure is NOT_TESTABLE
+ *         <failure/>           one or more tSQLt tests failed
+ *         <error/>             generation failed or tests errored
+ *
+ * Design notes
+ * ------------
+ *   - Reads from TestGen.CoverageResult (populated by GenerateAndCoverDatabase).
+ *   - One <testcase> per stored procedure using aggregate pass/fail counts.
+ *   - XML special characters in messages are escaped (&amp; &lt; &gt; etc.).
+ *   - All variables declared at proc top -- no DECLARE inside loops (T-SQL
+ *     DECLARE initializers evaluate once at batch parse, not per iteration).
+ ******************************************************************************/
+
+IF OBJECT_ID('TestGen.GetTestResultsJunitXml','P') IS NOT NULL
+    DROP PROCEDURE TestGen.GetTestResultsJunitXml;
+GO
+
+CREATE PROCEDURE TestGen.GetTestResultsJunitXml
+    @BatchId      DATETIME2(3) = NULL,   -- NULL = most recent batch
+    @SchemaFilter SYSNAME      = NULL    -- NULL = all schemas
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @gTests    INT, @gFail   INT, @gErr  INT, @gSkip INT;
+    DECLARE @Timestamp VARCHAR(30);
+    DECLARE @XML       NVARCHAR(MAX);
+    DECLARE @pkgSchema SYSNAME;
+    DECLARE @pkgTests  INT, @pkgFail INT, @pkgErr INT, @pkgSkip INT;
+    DECLARE @clsProc   SYSNAME;
+    DECLARE @clsGen    BIT,  @clsRun  INT, @clsFail INT, @clsErr INT, @clsSkip INT;
+    DECLARE @clsTestability VARCHAR(20);
+    DECLARE @clsReason      NVARCHAR(400);
+    DECLARE @clsErrTxt      NVARCHAR(2000);
+    DECLARE @safeMsg        NVARCHAR(2000);
+
+    IF @BatchId IS NULL
+        SELECT TOP 1 @BatchId = BatchId
+        FROM   TestGen.CoverageResult
+        ORDER  BY BatchId DESC;
+
+    IF @BatchId IS NULL
+    BEGIN
+        RAISERROR('TestGen.GetTestResultsJunitXml: no results found. Run GenerateAndCoverDatabase first.',16,1);
+        RETURN;
+    END;
+
+    SELECT
+        @gTests = ISNULL(SUM(TestsRun),     0),
+        @gFail  = ISNULL(SUM(TestsFailed),  0),
+        @gErr   = ISNULL(SUM(TestsErrored), 0),
+        @gSkip  = ISNULL(SUM(TestsSkipped), 0)
+    FROM   TestGen.CoverageResult
+    WHERE  BatchId = @BatchId
+      AND  (@SchemaFilter IS NULL OR SchemaName = @SchemaFilter);
+
+    SET @Timestamp = CONVERT(VARCHAR(30), @BatchId, 126);
+
+    SET @XML = N'<?xml version="1.0" encoding="UTF-8"?>' + CHAR(10);
+    SET @XML = @XML
+        + N'<testsuites'
+        + N' name="UnitAutogen"'
+        + N' tests="'    + CAST(@gTests AS VARCHAR) + N'"'
+        + N' failures="' + CAST(@gFail  AS VARCHAR) + N'"'
+        + N' errors="'   + CAST(@gErr   AS VARCHAR) + N'"'
+        + N' skipped="'  + CAST(@gSkip  AS VARCHAR) + N'"'
+        + N' timestamp="' + @Timestamp + N'"'
+        + N' hostname="'  + DB_NAME()  + N'">' + CHAR(10);
+
+    DECLARE pkg CURSOR LOCAL FAST_FORWARD FOR
+        SELECT DISTINCT SchemaName
+        FROM   TestGen.CoverageResult
+        WHERE  BatchId = @BatchId
+          AND  (@SchemaFilter IS NULL OR SchemaName = @SchemaFilter)
+        ORDER  BY SchemaName;
+    OPEN pkg;
+    FETCH NEXT FROM pkg INTO @pkgSchema;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SELECT
+            @pkgTests = ISNULL(SUM(TestsRun),     0),
+            @pkgFail  = ISNULL(SUM(TestsFailed),  0),
+            @pkgErr   = ISNULL(SUM(TestsErrored), 0),
+            @pkgSkip  = ISNULL(SUM(TestsSkipped), 0)
+        FROM   TestGen.CoverageResult
+        WHERE  BatchId    = @BatchId
+          AND  SchemaName = @pkgSchema;
+
+        SET @XML = @XML
+            + N'  <testsuite'
+            + N' name="'     + @pkgSchema + N'"'
+            + N' tests="'    + CAST(@pkgTests AS VARCHAR) + N'"'
+            + N' failures="' + CAST(@pkgFail  AS VARCHAR) + N'"'
+            + N' errors="'   + CAST(@pkgErr   AS VARCHAR) + N'"'
+            + N' skipped="'  + CAST(@pkgSkip  AS VARCHAR) + N'"'
+            + N' time="0">'  + CHAR(10);
+
+        DECLARE cls CURSOR LOCAL FAST_FORWARD FOR
+            SELECT ProcName, GenSucceeded,
+                   TestsRun, TestsFailed, TestsErrored, TestsSkipped,
+                   Testability, NotTestableReason, ErrorText
+            FROM   TestGen.CoverageResult
+            WHERE  BatchId    = @BatchId
+              AND  SchemaName = @pkgSchema
+            ORDER  BY ProcName;
+        OPEN cls;
+        FETCH NEXT FROM cls INTO @clsProc, @clsGen, @clsRun, @clsFail, @clsErr, @clsSkip,
+                                  @clsTestability, @clsReason, @clsErrTxt;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SET @XML = @XML
+                + N'    <testcase'
+                + N' name="'      + @pkgSchema + N'.' + @clsProc + N'"'
+                + N' classname="' + @pkgSchema + N'"'
+                + N' time="0">';
+
+            IF @clsTestability = N'NOT_TESTABLE'
+            BEGIN
+                SET @safeMsg = ISNULL(@clsReason, N'not auto-testable');
+                SET @safeMsg = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                    @safeMsg, '&', '&amp;'), '<', '&lt;'), '>', '&gt;'), '"', '&quot;'), '''', '&apos;');
+                SET @XML = @XML + CHAR(10)
+                    + N'      <skipped message="' + @safeMsg + N'"/>' + CHAR(10)
+                    + N'    ';
+            END
+            ELSE IF @clsGen = 0
+            BEGIN
+                SET @safeMsg = ISNULL(@clsErrTxt, N'test generation failed');
+                SET @safeMsg = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                    @safeMsg, '&', '&amp;'), '<', '&lt;'), '>', '&gt;'), '"', '&quot;'), '''', '&apos;');
+                SET @XML = @XML + CHAR(10)
+                    + N'      <error message="' + @safeMsg + N'"/>' + CHAR(10)
+                    + N'    ';
+            END
+            ELSE IF @clsFail > 0
+            BEGIN
+                SET @safeMsg = CAST(@clsFail AS NVARCHAR) + N' of ' + CAST(@clsRun AS NVARCHAR)
+                    + N' tests failed'
+                    + CASE WHEN @clsErrTxt IS NOT NULL THEN N'. ' + @clsErrTxt ELSE N'' END;
+                SET @safeMsg = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                    @safeMsg, '&', '&amp;'), '<', '&lt;'), '>', '&gt;'), '"', '&quot;'), '''', '&apos;');
+                SET @XML = @XML + CHAR(10)
+                    + N'      <failure message="' + @safeMsg + N'"/>' + CHAR(10)
+                    + N'    ';
+            END
+            ELSE IF @clsErr > 0
+            BEGIN
+                SET @safeMsg = CAST(@clsErr AS NVARCHAR) + N' of ' + CAST(@clsRun AS NVARCHAR)
+                    + N' tests errored'
+                    + CASE WHEN @clsErrTxt IS NOT NULL THEN N'. ' + @clsErrTxt ELSE N'' END;
+                SET @safeMsg = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                    @safeMsg, '&', '&amp;'), '<', '&lt;'), '>', '&gt;'), '"', '&quot;'), '''', '&apos;');
+                SET @XML = @XML + CHAR(10)
+                    + N'      <error message="' + @safeMsg + N'"/>' + CHAR(10)
+                    + N'    ';
+            END;
+
+            SET @XML = @XML + N'</testcase>' + CHAR(10);
+
+            FETCH NEXT FROM cls INTO @clsProc, @clsGen, @clsRun, @clsFail, @clsErr, @clsSkip,
+                                      @clsTestability, @clsReason, @clsErrTxt;
+        END;
+        CLOSE cls; DEALLOCATE cls;
+
+        SET @XML = @XML + N'  </testsuite>' + CHAR(10);
+
+        FETCH NEXT FROM pkg INTO @pkgSchema;
+    END;
+    CLOSE pkg; DEALLOCATE pkg;
+
+    SET @XML = @XML + N'</testsuites>' + CHAR(10);
+
+    SELECT @XML AS JUnitXml;
+END;
+GO
+PRINT 'TestGen.GetTestResultsJunitXml created.';
+GO
+
 
 /*---------------------------------------------------------------------------
  * End-of-install: re-enable execution. Pairs with SET NOEXEC ON in the

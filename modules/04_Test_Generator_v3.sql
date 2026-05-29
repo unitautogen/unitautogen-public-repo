@@ -972,6 +972,121 @@ BEGIN
           );
 
         /* ------------------------------------------------------------------
+         * Inbound-FK cascade expansion.
+         *
+         * tSQLt.FakeTable works by renaming the real table.  SQL Server
+         * rejects the rename (Msg 15336) when other tables have enforced
+         * FK constraints pointing AT the target - e.g. many tables FK into
+         * [Production].[Product] so faking Product directly fails.
+         *
+         * Fix: BFS from each primary TABLE dep, collecting every table that
+         * has an inbound enforced FK (directly or transitively).  Emit
+         * SafeFakeTable calls for those tables BEFORE the primary deps,
+         * deepest inbound level first.  The fake copies carry no FK
+         * constraints, so the primary dep can then be renamed freely.
+         *
+         * These extra tables are faked only - no seed data is emitted for
+         * them.  Cursor guarantees deepest-first ordering (critical for
+         * multi-level FK chains such as Product <- WorkOrder <- WorkOrderRouting).
+         * -----------------------------------------------------------------*/
+        DECLARE @IFKTables TABLE
+        (
+            SchemaName SYSNAME NOT NULL,
+            ObjectName SYSNAME NOT NULL,
+            FakeLevel  INT     NOT NULL,
+            PRIMARY KEY (SchemaName, ObjectName)
+        );
+        DECLARE @IFKBatch TABLE
+        (
+            SchemaName SYSNAME NOT NULL,
+            ObjectName SYSNAME NOT NULL,
+            PRIMARY KEY (SchemaName, ObjectName)
+        );
+        DECLARE @IFKLevelCur INT = 0;
+        DECLARE @IFKAdded    INT = 1;
+
+        WHILE @IFKAdded > 0 AND @IFKLevelCur < 10
+        BEGIN
+            SET @IFKLevelCur += 1;
+            DELETE @IFKBatch;
+
+            IF @IFKLevelCur = 1
+                -- Level 1: direct inbound FKs of primary TABLE deps
+                INSERT @IFKBatch (SchemaName, ObjectName)
+                SELECT DISTINCT SCHEMA_NAME(r.schema_id), r.name
+                FROM   @Deps d
+                JOIN   sys.objects t
+                       ON  t.object_id = OBJECT_ID(QUOTENAME(d.SchemaName) + N'.' + QUOTENAME(d.ObjectName))
+                       AND t.type = 'U'
+                JOIN   sys.foreign_keys fk
+                       ON  fk.referenced_object_id = t.object_id
+                       AND fk.is_disabled          = 0
+                JOIN   sys.objects r
+                       ON  r.object_id = fk.parent_object_id
+                       AND r.type      = 'U'
+                WHERE  d.DepKind = 'TABLE'
+                  AND  SCHEMA_NAME(r.schema_id) NOT IN (N'tSQLt', N'TestGen', N'TestGenLog')
+                  AND  SCHEMA_NAME(r.schema_id) NOT LIKE 'test[_]%'
+                  AND  NOT EXISTS (SELECT 1 FROM @Deps d2
+                                   WHERE  d2.DepKind IN ('TABLE','VIEW')
+                                     AND  d2.SchemaName = SCHEMA_NAME(r.schema_id)
+                                     AND  d2.ObjectName = r.name)
+                  AND  NOT EXISTS (SELECT 1 FROM @IFKTables x
+                                   WHERE  x.SchemaName = SCHEMA_NAME(r.schema_id)
+                                     AND  x.ObjectName = r.name);
+            ELSE
+                -- Level N: inbound FKs of the previous level's newly added tables
+                INSERT @IFKBatch (SchemaName, ObjectName)
+                SELECT DISTINCT SCHEMA_NAME(r.schema_id), r.name
+                FROM   @IFKTables f
+                JOIN   sys.objects t
+                       ON  t.object_id = OBJECT_ID(QUOTENAME(f.SchemaName) + N'.' + QUOTENAME(f.ObjectName))
+                       AND t.type = 'U'
+                JOIN   sys.foreign_keys fk
+                       ON  fk.referenced_object_id = t.object_id
+                       AND fk.is_disabled          = 0
+                JOIN   sys.objects r
+                       ON  r.object_id = fk.parent_object_id
+                       AND r.type      = 'U'
+                WHERE  f.FakeLevel = @IFKLevelCur - 1
+                  AND  SCHEMA_NAME(r.schema_id) NOT IN (N'tSQLt', N'TestGen', N'TestGenLog')
+                  AND  SCHEMA_NAME(r.schema_id) NOT LIKE 'test[_]%'
+                  AND  NOT EXISTS (SELECT 1 FROM @IFKTables x
+                                   WHERE  x.SchemaName = SCHEMA_NAME(r.schema_id)
+                                     AND  x.ObjectName = r.name)
+                  AND  NOT EXISTS (SELECT 1 FROM @Deps d2
+                                   WHERE  d2.DepKind IN ('TABLE','VIEW')
+                                     AND  d2.SchemaName = SCHEMA_NAME(r.schema_id)
+                                     AND  d2.ObjectName = r.name);
+
+            INSERT @IFKTables (SchemaName, ObjectName, FakeLevel)
+            SELECT SchemaName, ObjectName, @IFKLevelCur FROM @IFKBatch;
+            SET @IFKAdded = @@ROWCOUNT;
+        END;
+
+        /* Emit SafeFakeTable for inbound-FK tables deepest-first (highest
+           FakeLevel first) so each level's FK constraints are gone before
+           the next level is renamed. */
+        IF EXISTS (SELECT 1 FROM @IFKTables)
+        BEGIN
+            DECLARE @IFKSchema SYSNAME, @IFKObj SYSNAME;
+            DECLARE ifk_cur CURSOR LOCAL FAST_FORWARD FOR
+                SELECT SchemaName, ObjectName
+                FROM   @IFKTables
+                ORDER  BY FakeLevel DESC, SchemaName, ObjectName;
+            OPEN ifk_cur;
+            FETCH NEXT FROM ifk_cur INTO @IFKSchema, @IFKObj;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                SET @MockBlock = @MockBlock
+                    + N'    EXEC TestGen.SafeFakeTable N''' + @IFKSchema + N'.' + @IFKObj
+                    + N''';  -- cascade-faked: inbound-FK dep' + @CRLF;
+                FETCH NEXT FROM ifk_cur INTO @IFKSchema, @IFKObj;
+            END;
+            CLOSE ifk_cur; DEALLOCATE ifk_cur;
+        END;
+
+        /* ------------------------------------------------------------------
          * Emit FakeTable calls via TestGen.SafeFakeTable, which tries
          * @SchemaBoundDependencies = 1 first and falls back to the older
          * signature if that argument isn't recognised. This avoids any
@@ -3716,7 +3831,7 @@ GO
 CREATE PROCEDURE TestGen.GenerateAndCoverDatabase
     @SchemaFilter   SYSNAME       = NULL,   -- NULL = every user schema
     @ExcludePattern NVARCHAR(200) = NULL,   -- LIKE pattern of proc names to skip
-    @OutputMode     VARCHAR(10)   = 'HTML'  -- HTML or TEXT
+    @OutputMode     VARCHAR(10)   = 'HTML'  -- HTML, TEXT, or COBERTURA
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -3923,6 +4038,15 @@ BEGIN
         FROM   TestGen.CoverageResult
         WHERE  BatchId = @BatchId
         ORDER  BY SchemaName, ProcName;
+        RETURN;
+    END;
+
+    /*------------------------------ COBERTURA ------------------------------*/
+    /* Delegates to TestGen.GetCoverageCoberturaXml (module 23).                      */
+    /* All existing TEXT / HTML code above is untouched.                     */
+    IF @OutputMode = 'COBERTURA'
+    BEGIN
+        EXEC TestGen.GetCoverageCoberturaXml @BatchId = @BatchId, @SchemaFilter = @SchemaFilter;
         RETURN;
     END;
 
