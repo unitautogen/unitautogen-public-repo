@@ -1,0 +1,115 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# UnitAutogen — GitHub Actions Workflow Sample
+#
+# What this workflow does:
+#   1. Runs UnitAutogen test generation and branch coverage on your SQL Server
+#      database via the PowerShell wrapper module.
+#   2. Publishes JUnit XML as a test report (via dorny/test-reporter).
+#   3. Uploads Cobertura XML and the HTML report as workflow artifacts.
+#
+# Setup — before using this workflow:
+#   1. Install UnitAutogen on the target database:
+#         Run Install_UnitAutogen.sql against your database in SSMS.
+#   2. Add the following secrets to your GitHub repository
+#      (Settings → Secrets and variables → Actions → New repository secret):
+#
+#         SQL_SERVER    — SQL Server instance  e.g. sql01\PROD or sql01,1433
+#         SQL_DATABASE  — Target database name e.g. Northwind
+#         SQL_USER      — SQL login name       (omit if using Windows auth)
+#         SQL_PASS      — SQL login password
+#
+#   3. Copy this file to .github/workflows/unitautogen.yml in your repository
+#      (it will not trigger automatically from the ci/ folder).
+#
+# Runner requirement:
+#   A Windows runner is required (SQL Server client libraries are Windows).
+#   Use 'windows-latest' for GitHub-hosted runners, or a self-hosted Windows
+#   runner with network access to the SQL Server instance.
+#
+# Note on Windows auth:
+#   GitHub-hosted runners cannot use Windows authentication against an
+#   on-premises SQL Server. Use SQL Server authentication with secrets, or
+#   a self-hosted runner on the same domain as the SQL Server.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: UnitAutogen — SQL Coverage
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:    # Allow manual trigger from the Actions tab
+
+jobs:
+  unitautogen:
+    name: Generate Tests & Measure Coverage
+    runs-on: windows-latest   # Replace with self-hosted runner label if needed
+
+    steps:
+
+      # ── 1. Checkout ─────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Run UnitAutogen ───────────────────────────────────────────────
+      #
+      # Uses SQL Server authentication via repository secrets.
+      # To use Windows auth on a self-hosted runner, remove the $cred block
+      # and the -Credential parameter.
+      #
+      - name: Run UnitAutogen
+        shell: pwsh
+        env:
+          SQL_SERVER:   ${{ secrets.SQL_SERVER }}
+          SQL_DATABASE: ${{ secrets.SQL_DATABASE }}
+          SQL_USER:     ${{ secrets.SQL_USER }}
+          SQL_PASS:     ${{ secrets.SQL_PASS }}
+        run: |
+          Import-Module '${{ github.workspace }}\powershell\UnitAutogen.psm1'
+
+          # SQL Server authentication — credentials from repository secrets.
+          # Remove this block and -Credential below to use Windows authentication.
+          $cred = New-Object PSCredential(
+              $env:SQL_USER,
+              (ConvertTo-SecureString $env:SQL_PASS -AsPlainText -Force)
+          )
+
+          New-Item -ItemType Directory -Path '${{ github.workspace }}\artifacts' -Force | Out-Null
+
+          Invoke-UnitAutogen `
+              -ServerInstance $env:SQL_SERVER `
+              -Database       $env:SQL_DATABASE `
+              -Credential     $cred `
+              -OutputPath     '${{ github.workspace }}\artifacts'
+
+      # ── 3. Publish JUnit test results ────────────────────────────────────
+      - name: Publish Test Results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: UnitAutogen Test Results
+          path: artifacts/test-results.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      # ── 4. Upload Cobertura XML as artifact ──────────────────────────────
+      #
+      # GitHub Actions does not natively render Cobertura in the UI.
+      # Upload as an artifact so it can be consumed by SonarCloud or
+      # downloaded for local inspection.
+      #
+      - name: Upload Coverage XML
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cobertura-coverage
+          path: artifacts/coverage.xml
+
+      # ── 5. Upload HTML report as artifact ────────────────────────────────
+      - name: Upload HTML Coverage Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: html-coverage-report
+          path: artifacts/coverage-report.html

@@ -1,0 +1,107 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# UnitAutogen — Azure DevOps Pipeline Sample
+#
+# What this pipeline does:
+#   1. Runs UnitAutogen test generation and branch coverage on your SQL Server
+#      database via the PowerShell wrapper module.
+#   2. Publishes Cobertura XML to the Azure DevOps Coverage tab.
+#   3. Publishes JUnit XML to the Azure DevOps Tests tab.
+#   4. Publishes the HTML report as a downloadable pipeline artifact.
+#
+# Setup — before running this pipeline:
+#   1. Install UnitAutogen on the target database:
+#         Run Install_UnitAutogen.sql against your database in SSMS.
+#   2. Create the following pipeline variables in Azure DevOps
+#      (Pipelines → Edit → Variables).  Mark SQL_PASS as secret.
+#
+#         SQL_SERVER    — SQL Server instance  e.g. sql01\PROD or sql01,1433
+#         SQL_DATABASE  — Target database name e.g. Northwind
+#         SQL_USER      — SQL login name       (omit if using Windows auth)
+#         SQL_PASS      — SQL login password   (mark as secret; omit if Windows auth)
+#
+#   3. If using Windows authentication (on-prem agent running as a domain
+#      service account), remove the $cred block and the -Credential parameter
+#      from the PowerShell step below.
+#
+# Agent requirement:
+#   A Windows agent is required (SQL Server client libraries are Windows).
+#   Use the hosted 'windows-latest' pool, or a self-hosted Windows agent that
+#   has network access to the SQL Server instance.
+# ─────────────────────────────────────────────────────────────────────────────
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+pool:
+  vmImage: 'windows-latest'   # Replace with your self-hosted agent pool if needed
+
+variables:
+  artifactsDir: '$(Build.ArtifactStagingDirectory)\unitautogen'
+
+steps:
+
+  # ── 1. Checkout source ────────────────────────────────────────────────────
+  - checkout: self
+
+  # ── 2. Create output directory ────────────────────────────────────────────
+  - task: PowerShell@2
+    displayName: 'Create artifacts directory'
+    inputs:
+      targetType: inline
+      script: New-Item -ItemType Directory -Path '$(artifactsDir)' -Force | Out-Null
+
+  # ── 3. Run UnitAutogen ────────────────────────────────────────────────────
+  #
+  # Uses SQL Server authentication. To switch to Windows auth, remove the
+  # $cred block and the -Credential parameter.
+  #
+  - task: PowerShell@2
+    displayName: 'Run UnitAutogen — generate tests + measure coverage'
+    inputs:
+      targetType: inline
+      script: |
+        Import-Module '$(Build.SourcesDirectory)\powershell\UnitAutogen.psm1'
+
+        # SQL Server authentication — credentials from pipeline secret variables.
+        # Remove this block and -Credential below to use Windows authentication.
+        $cred = New-Object PSCredential(
+            '$(SQL_USER)',
+            (ConvertTo-SecureString '$(SQL_PASS)' -AsPlainText -Force)
+        )
+
+        Invoke-UnitAutogen `
+            -ServerInstance '$(SQL_SERVER)' `
+            -Database       '$(SQL_DATABASE)' `
+            -Credential     $cred `
+            -OutputPath     '$(artifactsDir)'
+    env:
+      SQL_PASS: $(SQL_PASS)   # Map secret variable into the step environment
+
+  # ── 4. Publish code coverage (Cobertura XML) ──────────────────────────────
+  - task: PublishCodeCoverageResults@1
+    displayName: 'Publish Coverage — Cobertura'
+    inputs:
+      codeCoverageTool: Cobertura
+      summaryFileLocation: '$(artifactsDir)\coverage.xml'
+    condition: succeededOrFailed()
+
+  # ── 5. Publish test results (JUnit XML) ───────────────────────────────────
+  - task: PublishTestResults@2
+    displayName: 'Publish Test Results — JUnit'
+    inputs:
+      testResultsFormat: JUnit
+      testResultsFiles: '$(artifactsDir)\test-results.xml'
+      testRunTitle: 'UnitAutogen — $(SQL_DATABASE)'
+      failTaskOnFailedTests: true
+    condition: succeededOrFailed()
+
+  # ── 6. Publish HTML report as pipeline artifact ───────────────────────────
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish HTML Coverage Report'
+    inputs:
+      pathToPublish: '$(artifactsDir)\coverage-report.html'
+      artifactName: 'UnitAutogen-Coverage-Report'
+    condition: succeededOrFailed()
