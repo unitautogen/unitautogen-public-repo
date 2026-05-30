@@ -4907,3 +4907,370 @@ PENDING VERIFICATION
 FILES CHANGED
   - Install_UnitAutogen.sql                           (release copy)
   - Install_All_Combined_v10_FINAL.sql                (source, in main repo)
+
+================================================================================
+2026-05-29  Function support (scalar / inline-TVF / multi-statement-TVF)
+================================================================================
+NEW module modules/30_Function_Support_v1.sql, spliced into
+Install_UnitAutogen.sql (and the powershell/UnitAutogen/sql copy) just before
+the end-of-install banner.  Side-by-side with the procedure pipeline -
+GenerateTestsForProcedure / RunCoverage / InstrumentProcedure are unchanged.
+
+Public entry points:
+  EXEC TestGen.GenerateTestsForObject  @SchemaName=N'dbo', @ObjectName=N'YourFn';
+  EXEC TestGen.RunCoverageForFunction  @SchemaName=N'dbo', @FunctionName=N'YourFn';
+
+Coverage uses a shadow PROCEDURE (<fn>_covfn) built from the function body, so
+the existing XEvent/RunCoverage pipeline measures it verbatim - a function body
+can't host EXEC RecordCoverageHit and scalar UDFs are unreliable to capture
+directly (Froid inlining).  Assertions are characterization (no before/after
+delta): scalar = determinism + blessed-value-for-pure-functions + NULL; TVF =
+declared-shape + determinism.  Unbless-able value tests are emitted as
+[@tSQLt:SkipTest], never faked green.
+
+STATUS: experimental first cut, NOT yet verified on a live DB.  Validate on the
+reference databases and triage before treating as released.  Follow-ups:
+GenerateAndCoverDatabase still enumerates sys.procedures only (widen to
+sys.objects P/FN/IF/TF); per-branch coverage-driver seeding; TVF row-value
+blessing; FakeFunction emission for called-function dependencies.
+
+Internal design record: DESIGN_v11_Functions.md (dev repo).
+FILES: modules/30_Function_Support_v1.sql (new),
+       Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       docs/functions.md (new), CHANGES.md
+
+--------------------------------------------------------------------------------
+2026-05-29  v11 fix — RunCoverageForFunction stranded the instrumented _cov copy
+--------------------------------------------------------------------------------
+Symptom (reported on AdventureWorks2025): teardown failed with
+  Msg 3729 ... Cannot drop schema 'uat' because it is being referenced by
+  object 'fn_classify_covfn_cov'.
+
+Root cause: the cleanup in RunCoverageForFunction built the drop name as
+  @shadowFull + '_cov'  ->  [uat].[fn_classify_covfn]_cov
+putting the _cov suffix OUTSIDE the QUOTENAME brackets.  The real object is
+[uat].[fn_classify_covfn_cov] (suffix is part of the name), so OBJECT_ID()
+returned NULL, the DROP was skipped, and RunCoverage's instrumented copy was
+left behind in the user schema, blocking DROP SCHEMA.
+
+Fix: cleanup now uses QUOTENAME(@shadow + N'_cov') / QUOTENAME(@shadow + N'_orig')
+and also drops a stranded synonym, covering both the success path and a
+RunCoverage that died mid rename/synonym swap.
+
+Also: scripts/Verify_Functions.sql Section 6 now sweeps ALL procedures /
+synonyms / functions in [uat] before DROP SCHEMA, so a partial run can't block
+teardown again.
+
+FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       scripts/Verify_Functions.sql, CHANGES.md
+
+--------------------------------------------------------------------------------
+2026-05-29  v11 fixes from first AdventureWorks2025 validation run
+--------------------------------------------------------------------------------
+Shadow transform validated: Status=OK and correct shadow bodies for scalar /
+inline-TVF / multi-statement-TVF.  Generation + assertion tests pass.  Three
+issues found and fixed:
+
+1. COVERAGE 0% EVERYWHERE ("XEvent rows captured: 0").  The shadow is
+   instrumented and the driver runs, but a function shadow executes in a few ms;
+   RunCoverage's event_file target (MAX_DISPATCH_LATENCY = 1s) had not flushed to
+   disk before RunCoverage stopped the session and read it.  Procedure test
+   suites run long enough to flush mid-run; tiny function drivers do not.
+   Fix: the generated coverage driver now does WAITFOR DELAY '00:00:02' after the
+   shadow EXECs, holding the session open so the dispatch flush lands before the
+   read.  (Costs ~2s per function coverage run - perf follow-up noted.)
+
+2. SafeFakeTable failed on Production.Product ("participates in enforced
+   dependencies"), erroring the table-reading scalar's determinism test and its
+   coverage driver.  The determinism / result-shape assertions do not actually
+   need table isolation.  Fix: every emitted FakeTable call is now wrapped in
+   BEGIN TRY ... END TRY BEGIN CATCH END CATCH, so a fake that cannot be applied
+   degrades to running against real data instead of erroring the test.
+
+3. One real scalar shadow failed to compile (dbo.ufnGetSalesOrderStatusText:
+   "Incorrect syntax near 'END'") - a transform edge case, already handled as an
+   honest "COVERAGE DEFERRED" (not a crash).  Added a diagnostic: on shadow
+   compile failure BuildShadowProcForFunction now PRINTs the attempted shadow DDL
+   so the edge case can be pinpointed rather than guessed.
+
+Also (prior fix this session): RunCoverageForFunction cleanup now drops the
+instrumented _cov copy with the suffix INSIDE QUOTENAME, and Verify_Functions.sql
+Section 6 sweeps the whole [uat] schema before DROP SCHEMA.
+
+FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+--------------------------------------------------------------------------------
+2026-05-29  v11 repair - module/installer silent truncation
+--------------------------------------------------------------------------------
+The "Incorrect syntax near 'U' / near ';' in RunCoverageForFunction" install
+error was NOT a logic bug: a file write during the installer rebuild was
+silently truncated on the working mount, cutting RunCoverageForFunction off
+mid-statement at the relabel UPDATE (hence the bare "U").  Repaired by
+reassembling the module in /tmp and writing+verifying atomically; both
+Install_UnitAutogen.sql copies rebuilt to 11495 lines, proc intact, md5 match.
+The WAITFOR coverage fix, non-fatal FakeTable wrapping, and shadow-compile
+diagnostic are all present.
+
+--------------------------------------------------------------------------------
+2026-05-30  v11 ROOT CAUSE — function coverage always 0% (double-@ in driver)
+--------------------------------------------------------------------------------
+Symptom: every function (FN/IF/TF) reported 0% coverage even though the shadow
+proc executed and was correctly instrumented (RecordCoverageHit injected, test
+ran). Procedure coverage was unaffected.
+
+Long triage (live AdventureWorks2025), narrowed by controlled experiments:
+  - uspPrintError via RunCoverage      -> 3/3 hits  (proc path + XEvent fine)
+  - hand-written uat proc, driver-style -> captured  (driver PATTERN fine)
+  - compound one-line "BEGIN SET..RETURN..END" -> uncovered (a real but separate
+    instrumenter limitation; fixed by emitting multi-line - see below)
+  - exact shadow proc + hand driver     -> 3/3       (shadow proc + name fine)
+  - exact shadow proc + generated driver-> 0         (=> generated DRIVER bug)
+  - dumping the generated driver text revealed:  EXEC ... @@n=42, ...
+
+ROOT CAUSE: RunCoverageForFunction built the driver's named-argument list as
+N'@' + name, but sys.parameters.name ALREADY carries the leading '@'. The EXEC
+of the shadow therefore used '@@n' (double @), which is a syntax error; the
+driver's BEGIN TRY/CATCH swallowed it, so the shadow body never executed and no
+RecordCoverageHit events fired -> 0 captured for ALL function shapes (they share
+this driver).
+
+FIX: drop the extra prefix - use `name` (not N'@'+name) when building @namedHappy
+/ @namedNull in RunCoverageForFunction.
+
+ALSO FIXED this session (prerequisites surfaced during triage):
+  - RewriteScalarReturns now emits the RETURN rewrite MULTI-LINE
+    (BEGIN / SET @__ret=(expr); / RETURN; / END) instead of a single-line
+    compound block, which the line-based instrumenter could not place a hit
+    inside. (diagp2 proved the one-liner was uncovered.)
+  - RewriteScalarReturns stops the expression capture at the block-closing END
+    (CASE..END aware), fixing "RETURN @ret <newline> END" -> no longer swallows
+    the function's own END (ufnGetSalesOrderStatusText now builds).
+  - non-fatal FakeTable wrapping; _cov cleanup quoting; teardown schema sweep.
+
+FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+--------------------------------------------------------------------------------
+2026-05-30  v11 VERIFIED on AdventureWorks2025 — function coverage works
+--------------------------------------------------------------------------------
+After the double-@ driver fix (+ multi-line RETURN emit + END-aware capture),
+scripts/Verify_Functions.sql gives real line AND branch coverage for every shape:
+
+  uat.fn_classify        (FN)  4/4 line 100% | 4/4 branch 100%
+  uat.fn_inline          (IF)  1/1 line 100%
+  uat.fn_mstvf           (TF)  4/4 line 100% | 2/2 branch 100%
+  uat.fn_count_by_color  (FN)  3/3 line 100%  (real Production.Product; fake non-fatal)
+  dbo.ufnGetSalesOrderStatusText (FN) 3/3 line 100%  (shadow builds + captures)
+  dbo.ufnGetContactInformation   (TF) 5/6 line 83.3% (line 68 not reached by the
+                                       sample inputs - honest partial, not faked)
+
+Generation tests all pass; value/row characterization tests emit honest SkipTest.
+The "no coverage gaps" goal (every executable function line measurable) is met:
+gaps now reflect un-driven branches, never an instrumentation blind spot.
+
+Remaining follow-ups (not blockers): per-branch seeding of the coverage driver
+for deeper branch coverage on complex bodies; TVF row-value blessing; widen
+GenerateAndCoverDatabase to enumerate FN/IF/TF.
+
+--------------------------------------------------------------------------------
+2026-05-30  v11 — GenerateAndCoverDatabase widened to functions (VERIFIED)
+--------------------------------------------------------------------------------
+GenerateAndCoverDatabase now enumerates sys.objects type IN ('P','FN','IF','TF')
+(is_ms_shipped=0, excluding TestGen/tSQLt/TestGenLog schemas, test_% classes,
+_cov/_covfn/_orig, and dbo TestGen_% framework helpers). Procedures take the
+unchanged path; functions route through RunCoverageForFunction, which was
+enhanced to capture RunCoverage's test outcomes, compute coverage from the
+shadow's CoverageLines, and persist a CoverageResult row keyed by the FUNCTION
+(new optional @BatchId param). One unified report now covers both.
+
+Implementation: the override is appended in module 30 (DROP+CREATE after the
+base proc, so it wins) - built by programmatically transforming the real base
+proc text, not retyping it.
+
+VERIFIED on AdventureWorks2025: EXEC TestGen.GenerateAndCoverDatabase reported 20
+objects incl. all ufn* functions with real coverage (ufnGetStock 3/3 line + 100%
+branch; ufnGetSalesOrderStatusText 3/3; ufnGetContactInformation 5/6 honest
+partial) alongside the usp* procedures; 91.8% line overall. (First run also
+surfaced dbo.TestGen_RebuildTypeName - now excluded via the TestGen_% filter.)
+
+Known caveat: a function row's Tests count reflects its coverage driver, not its
+test_<fn> assertion suite (coverage is accurate); aggregating assertion-test
+counts is a follow-up. Report column header still reads "Procedure" (cosmetic).
+
+FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, docs/functions.md, CHANGES.md
+
+--------------------------------------------------------------------------------
+2026-05-30  v11 Batch B — TVF row blessing (kept); multi-variant seeding (reverted)
+--------------------------------------------------------------------------------
+ITEM 4 (KEPT, VERIFIED on AdventureWorks2025): GenerateTestsForTableFunction now
+blesses PURE table-valued functions (Fn_HasTableDependency=0).  At generation
+time it snapshots the current output into a persistent baseline,
+  TestGenLog.[FnBless_<schema>_<fn>] = SELECT * INTO ... FROM <fn>(<happy>)
+(TRY/CATCH), then emits a "returns blessed rows" test:
+  SELECT * INTO #actual FROM <fn>(<happy>); AssertEqualsTable '<blessFull>','#actual'.
+A real snapshot baseline (regression net), no literal serialization.  Table-
+dependent TVFs keep the honest SkipTest.  Verified: uat.fn_inline / uat.fn_mstvf
+now pass a blessed-rows test (3 pass / 0 skip); ufnGetContactInformation stays
+SkipTest.
+
+ITEM 3 (TRIED, then REVERTED): multi-variant driver seeding (drive the shadow
+with GetSampleValueLiteral variants 0/1/2 + NULL).  A high-boundary value fed to
+a parameter-bounded loop explodes it: uat.fn_mstvf's WHILE @i <= @n ran ~14.5s
+with a high @n (would effectively hang at INT max).  Generic boundary seeding of
+the driver is unsafe; the driver stays happy+NULL.  Real per-branch coverage
+needs predicate-aware value solving (which bounds loops) - a genuine follow-up,
+NOT generic variants.
+
+Delivered first as scripts/Patch_v11_BatchB.sql (standalone CREATE OR ALTER, run
++ verified on the live DB while the build sandbox was down), then folded into the
+module + both Install_UnitAutogen.sql copies (RunCoverageForFunction unchanged -
+already the safe happy+NULL version; only GenerateTestsForTableFunction changed).
+
+FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       scripts/Patch_v11_BatchB.sql, CHANGES.md
+
+================================================================================
+2026-05-30  v11 Step 1 — self-capping shadow loops (coverage probe can't hang)
+================================================================================
+GOAL (DESIGN_v11_BranchSeeding.md, Layer A): make a function coverage run
+provably non-hanging, as the safety foundation for future aggressive per-branch
+seeding (Step 2).  This is the headline reliability property for DevOps gating:
+the harness cannot run away on any input.
+
+FIRST ATTEMPT (statement budget) — TRIED, then REPLACED.  RecordCoverageHit
+gained an opt-in SESSION_CONTEXT statement budget, armed/disarmed by
+RunCoverageForFunction around the probe.  It worked (a 100M-iteration test
+function aborted at 9.4s instead of hanging) but had two faults: (1) SLOW -
+SESSION_CONTEXT read+write per hit is ~0.3ms, so reaching a 50k budget took
+~9s; (2) it let the loop run ~25k iterations, bloating the XEL file so
+RunCoverage's event-parse stage then churned for a long time.  A statement
+budget large enough to never false-abort a legit function is necessarily large
+enough to be slow and XEL-heavy.  Wrong mechanism.
+
+SHIPPED (per-loop local cap).  BuildShadowProcForFunction now passes the shadow
+body through a new pure helper, TestGen.InjectLoopGuards, before compiling it.
+Every clear statement-scope `WHILE <cond> BEGIN ...` loop gets a local counter
+injected on its own lines (instrument-friendly):
+      WHILE <cond>
+      BEGIN
+      SET @__lcN=@__lcN+1;
+      IF @__lcN>1000 BREAK;
+          <original body>
+      END
+with `DECLARE @__lcN INT=0;` prepended at proc scope (one per loop).  A local
+SET/IF is ~nanoseconds, the loop stops after 1000 iterations (one iteration
+already covers the body, so no coverage is lost), and the XEL stays small.
+
+InjectLoopGuards is a char-walk that is comment / string / bracket / paren
+aware.  It is conservative: it only injects when the loop body is a clear
+depth-0 BEGIN block; a single-statement loop body (scan hits a depth-0 ';'
+first) is left alone; anything malformed simply compiles-or-defers via
+BuildShadowProcForFunction's existing TRY/CATCH (honest "coverage deferred",
+never corruption).  All walker variables are declared once at the top - a
+`DECLARE @x = expr` inside a WHILE evaluates the initializer once at parse
+(CLAUDE.md gotcha), which would have made the inner-scan state carry across
+loops.  Returns the body byte-unchanged when no loop is capped, so non-looping
+functions are unaffected.
+
+The earlier budget code was reverted: RecordCoverageHit is back to the plain
+no-op; RunCoverageForFunction back to the safe happy+NULL driver with no
+session-context arming.  (Both were only ever applied to the live DB via the
+patch, never folded, so the installers needed no change there.)
+
+VERIFIED on AdventureWorks2025:
+  - No regression: Verify_Functions.sql reports identical coverage to Batch B
+    for all four shapes + real ufn* functions (the 1000 cap never trips for
+    their small loops, so output is byte-for-byte the same).
+  - Proof: uat.fnloop (WHILE @i<100000000 ... a 100-million-iteration loop)
+    now finishes its driver in ~0.7s (capped at 1000 iterations) and reports
+    100% line + 100% branch (5/5, 2/2) - where unguarded it would loop ~forever.
+  - Separately surfaced (pre-existing, logged): the base instrumenter cannot
+    inject hits into a ONE-LINE compound loop body (`BEGIN a; b; END` on a
+    single line) - the _cov copy fails to compile.  Not a Step-1 issue; a
+    follow-up is to have the shadow transform normalize one-line compound
+    blocks to multi-line (same idea as the RETURN rewrite) so they instrument.
+
+CAP is a constant (1000).  Per the design, a branch reachable only AFTER the
+1000th iteration is reported as honest residue, not driven - the correct outcome
+for a probe that must terminate.
+
+Delivered as scripts/Patch_v11_LoopGuard.sql (standalone CREATE OR ALTER, run +
+verified on the live DB while the build sandbox was down), then folded into the
+module + both Install_UnitAutogen.sql copies (InjectLoopGuards added before
+BuildShadowProcForFunction; the one SET @procBody = TestGen.InjectLoopGuards(...)
+line added inside it).  Installer marker lines identical across both copies
+(InjectLoopGuards CREATE at 10926, the call at 11103, GACD tail at 12061), tails
+intact - no truncation.
+
+NEXT (not started, needs go-ahead): Step 2 - predicate-inversion per-branch
+seeding (DESIGN_v11_BranchSeeding.md, Layer B), now safe to build on this cap.
+
+FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       scripts/Patch_v11_LoopGuard.sql, CHANGES.md
+
+================================================================================
+2026-05-30  v11 gap fix — one-line compound loop/branch bodies now instrument
+================================================================================
+SURFACED during the Step-1 loop-guard proof: a function whose loop body is
+written on ONE line,
+      WHILE @i < 100000000
+      BEGIN SET @s += @i; SET @i += 1; END
+produced a shadow line `BEGIN SET @s += @i; SET @i += 1; END` carrying a BEGIN,
+two statements and an END at once.  TestGen.InstrumentProcedure is strictly
+LINE-ORIENTED (it classifies one physical line at a time and injects one hit per
+executable line), so it cannot decompose that line and emitted a non-compiling
+_cov ("Incorrect syntax near ';'").  Coverage for such a function was a false
+0% / deferral.  Pre-existing limitation, exposed (not caused) by Step 1.
+
+FIX (in the shadow transform, NOT the shared instrumenter): new pure helper
+TestGen.NormalizeShadowBody reflows the shadow body to one-statement-per-line
+before it is instrumented - each BEGIN / END / ELSE on its own line, and
+';'-separated statements split apart.  BuildShadowProcForFunction now runs
+NormalizeShadowBody, then InjectLoopGuards, then compiles.  TestGen.ShadowLineMap
+is dormant (nothing reads it), so reflowing the shadow is safe.
+
+SAFE BY CONSTRUCTION: the normalizer ONLY inserts newlines, and only where a
+keyword shares a line with other code (it tracks "is there code before me on
+this line" / "after me on this line").  On an already-multi-line body - BEGIN
+alone, END alone, one statement per line - every rule is a no-op, so existing
+working shadows pass through byte-unchanged.  Char-walk, comment/string/bracket/
+paren aware; BEGIN TRY / BEGIN CATCH / END TRY / END CATCH kept intact as units;
+all walker vars declared once at the top (CLAUDE.md DECLARE-in-loop gotcha).
+Deliberately NOT split: an inline IF/ELSE body (`IF @x SET @y=1;`,
+`ELSE SET @y=1;`) is left as-is - the instrumenter already handles those via its
+bare-branch wrap, and splitting them would change existing functions' line
+counts.  ELSE only gets a newline BEFORE it (when it shares a line, e.g.
+`END ELSE`), never after, so `ELSE IF` / inline-ELSE bodies are untouched.
+
+VERIFIED on AdventureWorks2025:
+  - Whole-DB GenerateAndCoverDatabase: 19 objects, 9 real ufn* functions + 10
+    procedures, 87 tests, 0 failed, 0 errored - every function still compiles and
+    reports coverage (most 100%; ufnGetContactInformation 83.3% honest partial).
+    The normalizer disturbed nothing across the whole database.
+  - Gap proof: the one-line uat.fnloop (BEGIN SET..; SET..; END on a single line)
+    now reports "Instrumented procedure created" (no compile failure), the loop
+    caps at 1000, driver finishes 237ms, 100% line + 100% branch (3/3, 2/2) -
+    where it failed to compile twice before the fix.
+
+Delivered as scripts/Patch_v11_OneLineNorm.sql (CREATE OR ALTER, verified on the
+live DB while the build sandbox was down), then folded into the module + both
+Install_UnitAutogen.sql copies (NormalizeShadowBody added before
+BuildShadowProcForFunction; the SET @procBody = TestGen.NormalizeShadowBody(...)
+line added ahead of the InjectLoopGuards call).  Installer marker lines identical
+across both copies (NormalizeShadowBody CREATE at 11010, the two calls at
+11212/11216, GACD tail at 12174), tails intact - no truncation.
+
+KNOWN residue (honest): a loop/branch body whose statements are not ';'-separated
+on one line, or an inline ELSE body, may still not be fully decomposed - those
+stay as they are (the instrumenter handles inline bodies; anything it can't still
+defers via the shadow-compile TRY/CATCH).  The normalizer fixes the common
+one-line `BEGIN ...; ...; END` block, which was the reported case.
+
+FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       scripts/Patch_v11_OneLineNorm.sql, CHANGES.md

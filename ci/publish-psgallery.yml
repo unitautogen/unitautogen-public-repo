@@ -1,0 +1,75 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# UnitAutogen — Publish to PowerShell Gallery
+#
+# Triggered automatically when a version tag (e.g. v0.9.1, v1.0.0) is pushed.
+#
+# Setup — before using this workflow:
+#   1. Go to https://www.powershellgallery.com/account/apikeys and generate
+#      an API key scoped to "Push new packages and package versions".
+#   2. Add it to your GitHub repository as a secret named PSGALLERY_API_KEY:
+#         Settings → Secrets and variables → Actions → New repository secret
+#
+# Release flow:
+#   1. Update ModuleVersion in powershell/UnitAutogen/UnitAutogen.psd1
+#   2. Commit and push to main
+#   3. Tag the commit:  git tag v0.9.1 && git push origin v0.9.1
+#   4. This workflow fires, validates the manifest, and publishes the module.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Publish to PowerShell Gallery
+
+on:
+  push:
+    tags:
+      - 'v*'          # Triggers on v0.9.1, v1.0.0, etc.
+  workflow_dispatch:   # Allow manual trigger from the Actions tab
+
+jobs:
+  publish:
+    name: Publish UnitAutogen to PSGallery
+    runs-on: windows-latest
+
+    steps:
+
+      # ── 1. Checkout ─────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Validate manifest ────────────────────────────────────────────
+      - name: Validate module manifest
+        shell: pwsh
+        run: |
+          $manifest = Test-ModuleManifest `
+              -Path '${{ github.workspace }}\powershell\UnitAutogen\UnitAutogen.psd1' `
+              -ErrorAction Stop
+          Write-Host "Name    : $($manifest.Name)"
+          Write-Host "Version : $($manifest.Version)"
+          Write-Host "Exports : $($manifest.ExportedFunctions.Keys -join ', ')"
+
+          # Verify the bundled SQL installer is present
+          $sql = '${{ github.workspace }}\powershell\UnitAutogen\sql\Install_UnitAutogen.sql'
+          if (-not (Test-Path $sql)) {
+              throw "Bundled SQL installer missing: $sql"
+          }
+          Write-Host "SQL installer present ($((Get-Item $sql).Length) bytes)"
+
+      # ── 3. Publish ───────────────────────────────────────────────────────
+      - name: Publish to PSGallery
+        shell: pwsh
+        env:
+          PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+        run: |
+          .\publish.ps1 -ApiKey $env:PSGALLERY_API_KEY
+
+      # ── 4. Confirm ───────────────────────────────────────────────────────
+      - name: Confirm published version
+        shell: pwsh
+        run: |
+          # Give PSGallery a few seconds to index the new version
+          Start-Sleep -Seconds 10
+          $pkg = Find-Module -Name UnitAutogen -Repository PSGallery -ErrorAction SilentlyContinue
+          if ($pkg) {
+              Write-Host "PSGallery version: $($pkg.Version)"
+          } else {
+              Write-Warning "Module not yet visible on PSGallery (indexing may take a few minutes)."
+          }

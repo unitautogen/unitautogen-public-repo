@@ -72,9 +72,16 @@ the leaf-DML extractor is conservative.
 the parser; the framework will not generate per-branch tests for them. The
 procedure will likely be flagged NOT TESTABLE.
 
-**Functions and triggers.** UnitAutogen targets stored procedures specifically.
-Scalar functions, table-valued functions, and triggers are out of scope for
-this release line.
+**Triggers.** Out of scope for this release line.
+
+**Functions.** Scalar (`FN`), inline (`IF`) and multi-statement (`TF`)
+table-valued functions have generation and coverage support — see
+[functions.md](functions.md) — validated on AdventureWorks2025 (real line and
+branch coverage for all three shapes). Coverage of a function is measured on a
+derived "shadow procedure" because a function body cannot host the coverage
+probe directly. As with procedures, branches the generated inputs don't reach
+are reported as honest gaps. Row/value characterization of a table-reading
+function still needs a manual blessed baseline (emitted as a `SkipTest`).
 
 **Multi-database / cross-server procedures.** Procedures that reference objects
 in other databases or linked servers may parse but won't seed correctly.
