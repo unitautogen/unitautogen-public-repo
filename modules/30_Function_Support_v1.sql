@@ -1057,6 +1057,178 @@ GO
  *   3. call unchanged TestGen.RunCoverage on the shadow
  *   4. relabel CoverageResult to the function   5. clean up
  *==========================================================================*/
+/*===========================================================================
+ * v11 Step 2 (DESIGN_v11_BranchSeeding.md, Layer B): predicate-inversion
+ * branch seeding.  SeedFromLeaf inverts one comparison leaf to a value that
+ * makes the predicate TRUE; ExtractBranchSeeds pulls (param, satisfying value)
+ * leaves from a function body.  RunCoverageForFunction then drives the shadow
+ * once per leaf (target param satisfied, others happy), reaching value-gated
+ * branches on purpose.  A wrong seed is harmless (each seed EXEC is TRY/CATCH'd
+ * and the Step-1 loop cap makes it hang-proof); unsolvable predicates yield no
+ * seed and stay honest residue.
+ *==========================================================================*/
+IF OBJECT_ID('TestGen.SeedFromLeaf','FN') IS NOT NULL
+    DROP FUNCTION TestGen.SeedFromLeaf;
+GO
+CREATE FUNCTION TestGen.SeedFromLeaf(@op VARCHAR(12), @lit NVARCHAR(500))
+RETURNS NVARCHAR(500)
+AS
+BEGIN
+    IF @op IN ('=','<=','>=','IN','BETWEEN','LIKE') RETURN @lit;   -- literal satisfies as-is
+    IF @op = 'ISNULL' RETURN N'NULL';
+    IF @op IN ('<','>','<>')
+    BEGIN
+        DECLARE @bi BIGINT = TRY_CONVERT(BIGINT, @lit);
+        IF @bi IS NOT NULL
+            RETURN CONVERT(NVARCHAR(40), CASE WHEN @op='<' THEN @bi-1 ELSE @bi+1 END);
+        DECLARE @dn DECIMAL(38,10) = TRY_CONVERT(DECIMAL(38,10), @lit);
+        IF @dn IS NOT NULL
+            RETURN CONVERT(NVARCHAR(50), CASE WHEN @op='<' THEN @dn-1 ELSE @dn+1 END);
+        RETURN NULL;            -- non-numeric: cannot invert < > <>
+    END;
+    RETURN NULL;                -- ISNOTNULL and anything else: no seed
+END;
+GO
+PRINT 'TestGen.SeedFromLeaf installed.';
+GO
+IF OBJECT_ID('TestGen.ExtractBranchSeeds','TF') IS NOT NULL
+    DROP FUNCTION TestGen.ExtractBranchSeeds;
+GO
+CREATE FUNCTION TestGen.ExtractBranchSeeds(@Body NVARCHAR(MAX), @ParamCsv NVARCHAR(MAX))
+RETURNS @seeds TABLE (ParamName SYSNAME, SeedLiteral NVARCHAR(500))
+AS
+BEGIN
+    DECLARE @pset NVARCHAR(MAX) = N'|' + UPPER(REPLACE(REPLACE(REPLACE(ISNULL(@ParamCsv,N''),N' ',N''),CHAR(13),N''),CHAR(10),N'')) + N'|';
+    SET @pset = REPLACE(@pset, N',', N'|');     -- -> |@N|@STATUS|
+    IF @pset = N'||' RETURN;
+
+    DECLARE @len INT = LEN(@Body), @i INT = 1;
+    DECLARE @inLine BIT=0,@inBlk BIT=0,@inStr BIT=0,@inBr BIT=0;
+    DECLARE @ch NCHAR(1),@nx NCHAR(1),@pvc NCHAR(1);
+    DECLARE @tok NVARCHAR(200),@k INT,@kc NCHAR(1);
+    DECLARE @op VARCHAR(12),@operand NVARCHAR(500),@seed NVARCHAR(500),@w NVARCHAR(20),@w2 NVARCHAR(10);
+    DECLARE @prevWord NVARCHAR(20)=N'',@curWord NVARCHAR(40)=N'';
+    DECLARE @found BIT;
+
+    WHILE @i <= @len
+    BEGIN
+        SET @ch = SUBSTRING(@Body,@i,1);
+        SET @nx = CASE WHEN @i<@len THEN SUBSTRING(@Body,@i+1,1) ELSE N'' END;
+
+        IF @inLine=1 BEGIN IF @ch=CHAR(10) SET @inLine=0; SET @i+=1; CONTINUE; END;
+        IF @inBlk=1  BEGIN IF @ch=N'*' AND @nx=N'/' BEGIN SET @i+=2; SET @inBlk=0; CONTINUE; END; SET @i+=1; CONTINUE; END;
+        IF @inStr=1  BEGIN IF @ch=N'''' AND @nx=N'''' BEGIN SET @i+=2; CONTINUE; END; IF @ch=N'''' SET @inStr=0; SET @i+=1; CONTINUE; END;
+        IF @inBr=1   BEGIN IF @ch=N']' SET @inBr=0; SET @i+=1; CONTINUE; END;
+        IF @ch=N'-' AND @nx=N'-' BEGIN SET @i+=2; SET @inLine=1; SET @prevWord=N''; SET @curWord=N''; CONTINUE; END;
+        IF @ch=N'/' AND @nx=N'*' BEGIN SET @i+=2; SET @inBlk=1; SET @prevWord=N''; SET @curWord=N''; CONTINUE; END;
+        IF @ch=N'''' BEGIN SET @i+=1; SET @inStr=1; SET @prevWord=N''; SET @curWord=N''; CONTINUE; END;
+        IF @ch=N'['  BEGIN SET @i+=1; SET @inBr=1; SET @prevWord=N''; SET @curWord=N''; CONTINUE; END;
+
+        IF @ch LIKE N'[A-Za-z]'
+        BEGIN
+            SET @curWord = @curWord + @ch; SET @i+=1; CONTINUE;
+        END
+        ELSE IF @curWord <> N''
+        BEGIN
+            SET @prevWord = UPPER(@curWord); SET @curWord = N'';
+        END;
+
+        IF @ch = N'@'
+        BEGIN
+            SET @pvc = CASE WHEN @i=1 THEN N' ' ELSE SUBSTRING(@Body,@i-1,1) END;
+            IF PATINDEX(N'%[^A-Za-z0-9_@#]%',@pvc)=1
+            BEGIN
+                SET @tok = N'@'; SET @k = @i+1;
+                WHILE @k<=@len
+                BEGIN
+                    SET @kc = SUBSTRING(@Body,@k,1);
+                    IF @kc LIKE N'[A-Za-z0-9_@#]' BEGIN SET @tok+=@kc; SET @k+=1; END ELSE BREAK;
+                END;
+                IF CHARINDEX(N'|'+UPPER(@tok)+N'|', @pset) > 0 AND @prevWord <> N'SET'
+                BEGIN
+                    SET @op=NULL; SET @operand=NULL; SET @found=0;
+                    WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
+                    SET @kc = CASE WHEN @k<=@len THEN SUBSTRING(@Body,@k,1) ELSE N'' END;
+                    IF SUBSTRING(@Body,@k,2) IN (N'>=',N'<=',N'<>',N'!=')
+                    BEGIN SET @op=CASE WHEN SUBSTRING(@Body,@k,2)=N'!=' THEN '<>' ELSE SUBSTRING(@Body,@k,2) END COLLATE DATABASE_DEFAULT; SET @k+=2; END
+                    ELSE IF @kc=N'=' BEGIN SET @op='='; SET @k+=1; END
+                    ELSE IF @kc=N'<' BEGIN SET @op='<'; SET @k+=1; END
+                    ELSE IF @kc=N'>' BEGIN SET @op='>'; SET @k+=1; END
+                    ELSE
+                    BEGIN
+                        SET @w=N'';
+                        WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[A-Za-z]' BEGIN SET @w+=SUBSTRING(@Body,@k,1); SET @k+=1; END;
+                        SET @w=UPPER(@w);
+                        IF @w=N'IS'
+                        BEGIN
+                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
+                            SET @w2=N'';
+                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[A-Za-z]' BEGIN SET @w2+=SUBSTRING(@Body,@k,1); SET @k+=1; END;
+                            SET @w2=UPPER(@w2);
+                            IF @w2=N'NULL' SET @op='ISNULL';
+                        END
+                        ELSE IF @w=N'IN' SET @op='IN';
+                        ELSE IF @w=N'BETWEEN' SET @op='BETWEEN';
+                        ELSE IF @w=N'LIKE' SET @op='LIKE';
+                    END;
+
+                    IF @op IN ('=','<','>','<=','>=','<>','LIKE','IN','BETWEEN')
+                    BEGIN
+                        IF @op='IN'
+                        BEGIN
+                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
+                            IF SUBSTRING(@Body,@k,1)=N'(' SET @k+=1;
+                        END;
+                        WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
+                        SET @kc = CASE WHEN @k<=@len THEN SUBSTRING(@Body,@k,1) ELSE N'' END;
+                        IF @kc=N''''
+                        BEGIN
+                            SET @operand=N''''; SET @k+=1;
+                            WHILE @k<=@len
+                            BEGIN
+                                SET @kc=SUBSTRING(@Body,@k,1);
+                                IF @kc=N'''' AND SUBSTRING(@Body,@k+1,1)=N'''' BEGIN SET @operand+=N''''''; SET @k+=2; CONTINUE; END;
+                                SET @operand+=@kc; SET @k+=1;
+                                IF @kc=N'''' BREAK;
+                            END;
+                        END
+                        ELSE IF @kc LIKE N'[0-9]' OR (@kc IN (N'-',N'+',N'.') AND SUBSTRING(@Body,@k+1,1) LIKE N'[0-9]')
+                        BEGIN
+                            SET @operand=N'';
+                            IF @kc IN (N'-',N'+') BEGIN SET @operand+=@kc; SET @k+=1; END;
+                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[0-9.]' BEGIN SET @operand+=SUBSTRING(@Body,@k,1); SET @k+=1; END;
+                        END;
+
+                        IF @op='LIKE' AND @operand IS NOT NULL
+                        BEGIN
+                            SET @operand = REPLACE(REPLACE(@operand, N'%', N''), N'_', N'');
+                            IF @operand = N'''''' SET @operand = NULL;
+                        END;
+                    END;
+
+                    IF @op='ISNULL'
+                        INSERT @seeds(ParamName,SeedLiteral) VALUES(@tok, N'NULL');
+                    ELSE IF @op IS NOT NULL AND @operand IS NOT NULL
+                    BEGIN
+                        SET @seed = TestGen.SeedFromLeaf(@op, @operand);
+                        IF @seed IS NOT NULL
+                            INSERT @seeds(ParamName,SeedLiteral) VALUES(@tok, @seed);
+                    END;
+
+                    SET @i = @k; SET @prevWord=N''; CONTINUE;
+                END;
+                SET @i = @k; SET @prevWord=N''; CONTINUE;
+            END;
+        END;
+
+        SET @i += 1;
+    END;
+    RETURN;
+END;
+GO
+PRINT 'TestGen.ExtractBranchSeeds installed.';
+GO
+
 IF OBJECT_ID('TestGen.RunCoverageForFunction','P') IS NOT NULL
     DROP PROCEDURE TestGen.RunCoverageForFunction;
 GO
@@ -1101,12 +1273,17 @@ BEGIN
     DECLARE @shadowFull NVARCHAR(400)=QUOTENAME(@SchemaName)+N'.'+QUOTENAME(@shadow);
     DECLARE @driverClass SYSNAME = N'test_'+@shadow;
 
-    -- argument lists
+    -- per-parameter happy literal (drives @namedHappy below + the seed args)
+    DECLARE @ph TABLE (ord INT, name SYSNAME, happyLit NVARCHAR(MAX));
+    INSERT @ph (ord,name,happyLit)
+    SELECT parameter_id, name,
+           TestGen.GetSampleValueLiteral(TYPE_NAME(user_type_id),max_length,precision,scale,0)
+    FROM sys.parameters WHERE object_id=@objid AND parameter_id>0;
+
     DECLARE @namedHappy NVARCHAR(MAX)=N'', @namedNull NVARCHAR(MAX)=N'';
-    SELECT @namedHappy=@namedHappy+name+N'='
-             +TestGen.GetSampleValueLiteral(TYPE_NAME(user_type_id),max_length,precision,scale,0)+N', ',
-           @namedNull=@namedNull+name+N'=NULL, '
-    FROM sys.parameters WHERE object_id=@objid AND parameter_id>0 ORDER BY parameter_id;
+    SELECT @namedHappy=@namedHappy+name+N'='+happyLit+N', ',
+           @namedNull =@namedNull +name+N'=NULL, '
+    FROM @ph ORDER BY ord;
 
     -- FakeTable list for the driver
     DECLARE @fakes NVARCHAR(MAX)=N'';
@@ -1142,6 +1319,35 @@ BEGIN
         +CASE WHEN @namedNull=N'' THEN N'' ELSE N' '+@namedNull END
         +CASE WHEN @ret=N'' THEN N'' ELSE CASE WHEN @namedNull=N'' THEN N' ' ELSE N', ' END+@ret END+N';';
 
+    -- Step 2: predicate-inversion seed calls (one per branch leaf; target param
+    -- satisfied, others happy).  Wrapped so any extractor failure is non-fatal -
+    -- coverage then falls back to happy+NULL only.
+    DECLARE @execSeeds NVARCHAR(MAX)=N'', @seedCount INT=0;
+    BEGIN TRY
+        DECLARE @fndef NVARCHAR(MAX)=OBJECT_DEFINITION(@objid);
+        DECLARE @asp INT = TestGen.FindTopLevelAs(@fndef);
+        DECLARE @fnbody NVARCHAR(MAX)= CASE WHEN @asp>0 THEN SUBSTRING(@fndef,@asp+2,LEN(@fndef)) ELSE @fndef END;
+        DECLARE @paramCsv NVARCHAR(MAX)=N'';
+        SELECT @paramCsv=@paramCsv+name+N',' FROM @ph ORDER BY ord;
+        DECLARE @retClause NVARCHAR(120)=CASE WHEN @ret=N'' THEN N'' ELSE N', '+@ret END;
+        ;WITH leaf AS (SELECT DISTINCT ParamName, SeedLiteral FROM TestGen.ExtractBranchSeeds(@fnbody,@paramCsv))
+        SELECT @execSeeds = @execSeeds
+             + N'    BEGIN TRY EXEC '+@shadowFull+N' '+ z.args + @retClause + N'; END TRY BEGIN CATCH END CATCH;'+@CRLF,
+               @seedCount = @seedCount + 1
+        FROM (
+            SELECT l.ParamName, l.SeedLiteral,
+                   STRING_AGG(CONVERT(NVARCHAR(MAX),
+                        p.name + N'=' + CASE WHEN UPPER(p.name)=UPPER(l.ParamName) THEN l.SeedLiteral ELSE p.happyLit END),
+                        N', ') WITHIN GROUP (ORDER BY p.ord) AS args
+            FROM leaf l CROSS JOIN @ph p
+            GROUP BY l.ParamName, l.SeedLiteral
+        ) z;
+    END TRY
+    BEGIN CATCH
+        SET @execSeeds = N'';
+        PRINT 'RunCoverageForFunction: branch seeding skipped ('+ERROR_MESSAGE()+')';
+    END CATCH;
+
     DECLARE @drv NVARCHAR(MAX)=
         N'IF EXISTS (SELECT 1 FROM sys.schemas WHERE name=N'''+@driverClass+N''')'+@CRLF+
         N'    EXEC tSQLt.DropClass '''+@driverClass+N''';'+@CRLF+N'GO'+@CRLF+@CRLF+
@@ -1150,9 +1356,11 @@ BEGIN
         N'AS'+@CRLF+N'BEGIN'+@CRLF+N'    SET NOCOUNT ON;'+@CRLF+ISNULL(@fakes,N'')+@retDecl+
         N'    BEGIN TRY'+@CRLF+@execHappy+@CRLF+N'    END TRY BEGIN CATCH END CATCH;'+@CRLF+
         N'    BEGIN TRY'+@CRLF+@execNull+@CRLF+N'    END TRY BEGIN CATCH END CATCH;'+@CRLF+
+        ISNULL(@execSeeds,N'')+
         N'    EXEC tSQLt.AssertEquals 1, 1; -- driver: execution drives coverage'+@CRLF+
         N'END;'+@CRLF+N'GO'+@CRLF;
     EXEC TestGen.ExecuteBatchedScript @drv;
+    IF @seedCount > 0 PRINT 'RunCoverageForFunction: '+CAST(@seedCount AS VARCHAR)+' predicate-inversion seed(s) added for '+@SchemaName+'.'+@FunctionName+'.';
 
     -- 3. measure coverage on the shadow, capturing test outcomes so we can
     --    persist a CoverageResult row keyed by the FUNCTION (the shadow is an

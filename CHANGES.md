@@ -5274,3 +5274,63 @@ one-line `BEGIN ...; ...; END` block, which was the reported case.
 FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
        powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
        scripts/Patch_v11_OneLineNorm.sql, CHANGES.md
+
+================================================================================
+2026-05-30  v11 Step 2 - predicate-inversion branch seeding (reach value gates)
+================================================================================
+GOAL (DESIGN_v11_BranchSeeding.md, Layer B): reach value-gated branches of a
+function ON PURPOSE.  The happy+NULL driver only covers the arms those two
+inputs happen to land on; a branch like IF @status = 5 or IF @n < 0 is missed by
+luck.  Step 2 derives a parameter value that SATISFIES each branch predicate -
+from the predicate's own literal - and drives the shadow with it.
+
+NEW OBJECTS (module 30 + both installers):
+  - TestGen.SeedFromLeaf(@op,@lit): inverts one comparison leaf to a satisfying
+    value.  '=','<=','>=','IN','BETWEEN','LIKE' -> the literal as-is; '<' -> lit-1,
+    '>'/'<>' -> lit+1 (numeric only, else no seed); 'ISNULL' -> NULL; 'ISNOTNULL'
+    and anything non-invertible -> NULL (honest residue).
+  - TestGen.ExtractBranchSeeds(@Body,@ParamCsv) TVF: char-walk (comment/string/
+    bracket aware) that finds  @param <op> <literal>  leaves (incl. IS [NOT] NULL,
+    IN first-element, BETWEEN low, LIKE de-wildcarded) and returns (ParamName,
+    SeedLiteral).  Skips SET-assignments (prev word 'SET'); all walker vars
+    declared once at top (CLAUDE.md DECLARE-in-loop gotcha).
+  - RunCoverageForFunction: builds a per-parameter happy table (@ph), then for
+    each extracted leaf appends one driver EXEC (target param satisfied via
+    STRING_AGG, others happy) after the happy+NULL calls.
+
+SAFE BY CONSTRUCTION (three layers, so Step 2 can never regress coverage):
+  1. A wrong/over-eager seed is harmless - each seed EXEC is wrapped in TRY/CATCH
+     and just fails to enter its branch.
+  2. The whole seed-building block is itself in TRY/CATCH; any extractor error
+     sets @execSeeds='' and the run falls back to the prior happy+NULL behaviour.
+  3. Values come only from the code's own literals (and numeric +/-1), so emitted
+     args are always well-formed SQL.  The Step-1 loop cap makes every seed call
+     hang-proof, so seeding is free to be aggressive.
+
+NEVER LIE: a predicate the extractor can't invert (function-wrapped column,
+non-literal RHS, NOT IN, accumulated value, clock/env) yields no seed; that
+branch stays uncovered and is reported as honest residue.
+
+VERIFIED on AdventureWorks2025:
+  - fn_grade(@score) with four value-gated arms (>=90/>=80/>=70/else): extractor
+    derived @score = NULL,90,80,70; coverage went to 4/4 line + 5/5 BRANCH 100%
+    ("4 predicate-inversion seed(s) added") where happy+NULL alone hit only one
+    arm.  String/IN gate (= 'US', IN ('GB','UK'), = 'CA') derived 'US','GB','CA'.
+  - No regression: full Verify_Functions.sql sweep unchanged (fn_classify 4/4+4/4
+    with 3 seeds, fn_mstvf now 5/5+3/3 - the Step-1 guard's own IF is covered too,
+    ufnGetContactInformation 5/6 honest), 0 fail / 0 err.
+
+Delivered as scripts/Patch_v11_BranchSeeding.sql (+ scripts/Verify_BranchSeeding.sql)
+verified on the live DB, then folded into module 30 + both Install_UnitAutogen.sql
+copies (SeedFromLeaf + ExtractBranchSeeds before RunCoverageForFunction; @ph and
+the seed block inside it).  Both installer copies byte-identical (md5), exactly one
+of each object, tails intact - no truncation.
+
+LIMITS (stated plainly): single-param leaves only - a branch gated on a DIFFERENT
+param's predicate not satisfied by the happy value may still be residue (ancestor-
+chaining is a future step); reversed predicates (literal <op> @param) and NOT IN
+are not yet inverted.  These are residue, not wrong answers.
+
+FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       scripts/Patch_v11_BranchSeeding.sql, scripts/Verify_BranchSeeding.sql, CHANGES.md
