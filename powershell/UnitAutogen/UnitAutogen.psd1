@@ -1,5 +1,5 @@
 @{
-    ModuleVersion     = '0.9.0'
+    ModuleVersion     = '0.9.1'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -38,6 +38,20 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen/main/docs/logo.png'
             ReleaseNotes = @'
+## v0.9.1 (beta)
+
+Bundled SQL framework updated — user-defined function support + branch coverage:
+- Test generation + line/branch coverage for scalar (FN), inline (IF) and
+  multi-statement (TF) functions, via a shadow-procedure transform.
+- GenerateAndCoverDatabase now reports procedures AND functions in one run.
+- Hang-proof coverage probe: every shadow loop is capped, so a runaway loop can
+  never stall a coverage run.
+- Predicate-inversion branch seeding: value-gated branches (e.g. IF @x = 5) are
+  reached on purpose by deriving a satisfying parameter value from the code.
+- One-line compound function bodies now instrument correctly.
+
+PowerShell cmdlets are unchanged from v0.9.0.
+
 ## v0.9.0 (beta)
 
 New in this release:

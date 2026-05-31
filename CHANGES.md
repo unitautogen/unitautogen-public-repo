@@ -5334,3 +5334,473 @@ are not yet inverted.  These are residue, not wrong answers.
 FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
        powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
        scripts/Patch_v11_BranchSeeding.sql, scripts/Verify_BranchSeeding.sql, CHANGES.md
+
+================================================================================
+2026-05-31  v11 Step 2.1 - ancestor-chaining for branch seeding
+================================================================================
+GOAL (DESIGN_v11_AncestorChaining.md): reach a branch nested inside ANOTHER
+parameter's predicate.  Step 2 satisfied a branch's own leaf but left every other
+param happy, so  IF @kind='A' BEGIN IF @amount>1000 ... END  never reached the
+inner arm when happy @kind <> 'A'.
+
+CHANGE: ExtractBranchSeeds is rewritten predicate-aware.  It walks BEGIN/END
+nesting (@depth) and maintains a stack (@anc) of enclosing IF/WHILE gates tagged
+by the block depth they open.  When it meets an IF/WHILE it captures the predicate
+(paren/string/comment aware), extracts its invertible leaves, and emits a branch
+seed = those leaves PLUS, for every param not set by the leaf, the deepest
+enclosing gate's value.  Output gained a BranchId (many rows per branch).
+RunCoverageForFunction groups by BranchId and emits one shadow EXEC per branch
+(every assigned param overridden via STRING_AGG, others happy).  A top-level
+branch with no ancestors collapses to the exact Step-2 single-override call.
+
+The walker is now branch-predicate-driven (seeds only come from IF/WHILE/ELSE-IF
+predicates), which also drops the incidental CASE-WHEN leaves Step 2 emitted -
+those never affected branch coverage (CASE-in-RETURN is atomic), so verified
+fixtures are unchanged.  ELSE-negation ancestors and non-literal predicates remain
+honest residue.
+
+SAFETY unchanged (three TRY/CATCH layers + Step-1 loop cap): a wrong seed just
+fails to enter its branch; any extractor error falls back to happy+NULL.  Same-
+param conflicts (ancestor vs leaf): the leaf value wins; among ancestors the
+deepest wins; a final MAX dedup in the caller collapses any residue - a value that
+satisfies neither just means that (contradictory) branch stays uncovered, never
+faked.
+
+VERIFIED on AdventureWorks2025:
+  - fn_nested(@kind,@amount): extractor output shows the inner @amount branches
+    carrying @kind='A' / @kind='B' (BranchId 2 -> {@amount=1001,@kind='A'},
+    BranchId 4 -> {@amount=-1,@kind='B'}); coverage 2/2 line + 5/5 BRANCH 100%
+    (the big/neg arms unreachable before).
+  - No regression: fn_grade 5/5, fn_classify 4/4+4/4, fn_mstvf 5/5+3/3,
+    ufnGetContactInformation 5/6 honest, full Verify_Functions sweep 0 fail/0 err;
+    fn_region string/IN gate still 3 seeds.
+
+Delivered as scripts/Patch_v11_AncestorChaining.sql (+ Verify_AncestorChaining.sql)
+verified live, then folded into module 30 + both installers (ExtractBranchSeeds
+replaced, the seed CTE switched to BranchId).  Both installer copies byte-identical
+(md5), one of each object, no truncation.  Design: DESIGN_v11_AncestorChaining.md.
+
+FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       scripts/Patch_v11_AncestorChaining.sql, scripts/Verify_AncestorChaining.sql,
+       DESIGN_v11_AncestorChaining.md, CHANGES.md
+
+================================================================================
+2026-05-31  v5.3 instrumenter - bare no-semicolon branch body wrap-close
+================================================================================
+ROOT CAUSE
+  TestGen.InstrumentProcedure v5.1 wraps a bare (non-BEGIN) IF/WHILE/ELSE body
+  in a synthetic BEGIN/END so the injected RecordCoverageHit stays inside the
+  branch, but it only emitted the closing END when the wrapped statement reached
+  a ';'.  AdventureWorks house style omits the ';' on a single-statement branch
+  body, e.g. dbo.ufnGetStock:
+        IF (@ret IS NULL)
+            SET @ret = 0          -- no semicolon
+  The synthetic BEGIN then stayed open until a LATER ';' fired the END deep
+  inside the next block (the rewritten RETURN), so the rebuilt _cov was
+  unbalanced and FAILED TO COMPILE (Msg 102).  When _cov fails to compile,
+  RunCoverage's synonym points at a non-existent proc, no hits fire, and the
+  function is reported a false 0% line+branch (regression seen 2026-05-31:
+  ufnGetStock 0%, was 100% on 05-30 before the shadow began emitting the body
+  on its own no-';' line).
+
+FIX (v5.2 -> v5.3, two closure points added to the line walker)
+  1. Structural-boundary close: when @StmtWrap is open and the current line is a
+     BEGIN/END block boundary (@PB/@PE) or a new branch header, inject the
+     pending hit + synthetic END BEFORE emitting that line, then reset statement
+     state.  A bare body is a single statement, so the next structural token
+     ends it.
+  2. Opener-boundary close: on the existing no-';' boundary path (a new
+     statement opener ends an unterminated prior statement), also emit the
+     synthetic END when @StmtWrap is open, before opening the new statement.
+  Bodies that DO end with ';' instrument byte-identically to v5.2.
+
+VERIFIED on AdventureWorks2025 (live, via SQL MCP)
+  - dbo.ufnGetStock shadow ufnGetStock_covfn now instruments to a _cov that
+    COMPILES (was Msg 102).  Generated _cov shows the bare "SET @ret = 0"
+    wrapped BEGIN ... EXEC hit ... END, balanced.
+  - Drove coverage by temporarily pointing RecordCoverageHit at a real INSERT
+    (the XEvent capture path cannot run through the MCP - ALTER/DROP EVENT
+    SESSION is blocked inside the MCP's wrapping transaction, Msg 574).  All
+    four exec lines (7,14,18,20) hit, incl. line 14 the previously-uncoverable
+    bare body: 4/4 line 100%, 1/1 branch 100%.  RecordCoverageHit restored to
+    its no-op stub afterward; all scratch objects + the stray TestGenCoverage
+    event session cleaned up; real function intact.
+  NOTE: function coverage % through the live XEvent pipeline must still be
+  confirmed by a normal SSMS/sqlcmd run (no surrounding transaction); every
+  RunCoverage invoked via the MCP silently captures nothing and reports a false
+  0% for that reason, NOT a framework defect.
+
+Folded into module 20 + both installers (the two closure blocks, v5.3 header +
+created-banner).  Module InstrumentProcedure body byte-identical to both
+installer copies (931 lines, diff empty); both installers md5-identical; offline
+tsql_lint clean on all three.  (Module tail was silently truncated by a header
+edit and rebuilt from git HEAD + re-verified.)
+
+FILES: modules/20_Coverage_Instrumenter_v5.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+================================================================================
+2026-05-31  v11.x GACD resilience - connection-recovery no longer cascades
+================================================================================
+SYMPTOM
+  A full-DB sweep (GenerateAndCoverDatabase) reported 8 stored procedures as
+  "failed generation" (Gen=N) on AdventureWorks2025 - uspGetBillOfMaterials,
+  uspGetEmployeeManagers, uspGetManagerEmployees, uspGetWhereUsedProductID,
+  uspPrintError, and the three HR uspUpdateEmployee* procs.  All 8 carried the
+  IDENTICAL error: "GEN: The connection was recovered and rowcount in the first
+  query is not available. Please execute another query to get a valid rowcount."
+
+ROOT CAUSE (not a generation bug)
+  Every one of the 8 generates a VALID test class when run in isolation (proven
+  live: 7-12 tests each).  The 8 failure rows were written 0.37s apart (all
+  between 11:58:26.744 and 11:58:27.118) - they failed INSTANTLY without doing
+  any work.  The 9 functions, processed first, all succeeded.  This is a single
+  transient connection-recovery event (the sweep has minutes of WAITFOR DELAY +
+  XEvent operations): once the connection was recovered mid-run, @@ROWCOUNT
+  became unavailable, and because the GACD loop never re-synced, EVERY subsequent
+  object inherited the broken-rowcount state and failed generation identically.
+
+FIX (GACD made resilient)
+  1. Re-sync probe at the top of each loop iteration (SELECT @resync = 1;) so a
+     recovery on a prior object cannot poison the next - caps the blast radius at
+     the single coincident object instead of every remaining one.
+  2. Retry-once on the proc-generation path: if the caught error mentions
+     "connection was recovered" / "valid rowcount", re-sync and re-run
+     GenerateTestsForProcedure (deterministic, succeeds on a clean session) so
+     even the coincident object is recovered, not lost.
+
+VERIFIED on AdventureWorks2025 (live)
+  - All 8 procs generate valid test classes in isolation (BillOfMaterials 8,
+    EmployeeManagers 7, ManagerEmployees 7, WhereUsed 8, PrintError 1,
+    UpdateEmployeeHireInfo 12, UpdateEmployeeLogin 11, UpdatePersonalInfo 10).
+  - dm_exec_describe_first_result_set on the temp-table proc returns 8 columns
+    cleanly (ruled out as the trigger).
+
+Folded into module 30 + both installers (the v11 GenerateAndCoverDatabase - the
+LAST of the two GACD definitions in each installer; the older module-04 GACD is
+overwritten at install and left as-is).  Deployed live (CREATE OR ALTER).  Module
+GACD byte-identical to installer copy; both installers md5-identical; tsql_lint
+clean on all three.
+
+FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+================================================================================
+2026-05-31  UPDATE procs regain their before/after assertion (count-stable fix)
+================================================================================
+SYMPTOM (user-reported)
+  The 'touches only mocked tables' test for an UPDATE procedure
+  (e.g. HumanResources.uspUpdateEmployeePersonalInfo) had NO tSQLt assertion -
+  only a smoke TRY/CATCH and a PRINT of the row-count delta.  The before/after
+  AssertEqualsTable that read-only procs get had vanished.  Design intent from
+  day one: a stored proc's before/after state must be ASSERTED, not printed.
+
+ROOT CAUSE
+  The Test-4 isolation generator classified a proc as 'read-only' (gets the
+  per-table 'row counts held' AssertEqualsTable) vs 'DML' (gets no assertion)
+  by scanning for INSERT / UPDATE / DELETE / MERGE.  UPDATE was lumped in with
+  the count-changing verbs - but an UPDATE rewrites existing rows, it never adds
+  or removes any, so COUNT(*) is unchanged.  Every UPDATE-only proc therefore
+  wrongly fell into the no-assertion branch.
+
+FIX
+  Reclassify by whether the proc changes ROW COUNTS, not whether it writes at
+  all.  Only INSERT / DELETE / MERGE change counts; UPDATE does not.  New flag
+  @v94CountStable = (no INSERT/DELETE/MERGE) -> read-only OR UPDATE-only -> emit
+  the AssertEqualsTable before/after row-count assertion.  INSERT/DELETE/MERGE
+  procs still skip it (a counts-held assertion would false-fail) and keep the
+  informational delta print.  Guaranteed non-flaky: UPDATE never changes
+  COUNT(*), so the assertion passes for a correct proc or the TRY/CATCH fails it.
+
+VERIFIED (live classification on AdventureWorks2025)
+  - uspUpdateEmployeePersonalInfo, uspUpdateEmployeeLogin (pure UPDATE) -> now
+    COUNT-STABLE -> AssertEqualsTable emitted.
+  - uspUpdateEmployeeHireInfo (INSERT + UPDATE) -> count-changing -> correctly
+    still no counts-held assertion (it grows a table by design).
+  - read-only procs (uspGetBillOfMaterials, etc.) unchanged.
+  NOTE: asserts row-count stability (no rows added/removed).  The deeper 'the
+  updated row's VALUES changed correctly' check remains the characterization
+  scaffold (designed seed + #Expected), still an honest Skip.
+
+  Folded into module 04 + both installers (variable @v94IsReadOnly -> 
+  @v94CountStable; UPDATE dropped from the count-changing set).  GenerateTests-
+  ForProcedure body byte-identical module==installer; installers md5-identical;
+  tsql_lint clean.  Generator is 3270 lines (too large to hot-deploy via the
+  MCP) - applies on framework RE-INSTALL.
+
+FILES: modules/04_Test_Generator_v3.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+================================================================================
+2026-05-31  UPDATE procs now ASSERT the content change (not just count held)
+================================================================================
+Follow-on to the count-stable fix.  Row-count-held proves an UPDATE added/removed
+no rows, but not that it actually MODIFIED anything.  The 'touches only mocked
+tables' test now, for an UPDATE-only proc, also asserts the before/after CONTENT
+differs.
+
+HOW
+  For each directly-referenced (faked) table the test now captures a content hash
+  CHECKSUM_AGG(BINARY_CHECKSUM(<comparable cols>)) before and after the EXEC, using
+  the SAME column-type exclusion the v9.4 branch-delta uses (xml/text/ntext/image/
+  geography/geometry) plus hierarchyid (BINARY_CHECKSUM cannot hash CLR types).
+  After asserting the row counts are HELD (AssertEqualsTable), it asserts at least
+  one table's hash DIFFERS:
+     EXEC tSQLt.AssertEquals @Expected=1, @Actual=<any hash changed>,
+        @Message='UPDATE procedure must modify row content ...';
+  Guarded by IF EXISTS(#v94_HashBefore) so a table whose every column is excluded
+  never forces a false fail.  Only emitted for count-stable procs that contain an
+  UPDATE (@v94HasUpdate); read-only and INSERT/DELETE/MERGE paths are untouched.
+  Relies on the seed being arranged so the UPDATE's WHERE matches and its SET
+  writes a different value (user confirmed the seed is now designed that way).
+
+VERIFIED (live mechanism check on AdventureWorks2025 - generator itself is 3270
+lines, too large to hot-deploy via the MCP, so applies on RE-INSTALL)
+  - Change detection: changing row 1's NationalIDNumber 'SampleText_1'->'Sam'
+    (exactly uspUpdateEmployeePersonalInfo's happy-arg effect) flips the hash
+    208947 -> 2134023283, change_detected = 1.
+  - Column compatibility: BINARY_CHECKSUM over ALL of HumanResources.Employee's
+    comparable columns (15 cols; only OrganizationNode/hierarchyid excluded)
+    returns 1249850349 with no type error - the exclusion list is correct.
+
+FILES: modules/04_Test_Generator_v3.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+================================================================================
+2026-05-31  Kill the AssertEquals 1,1 tautology - real before/after assertions
+================================================================================
+User-reported: the per-input proc tests asserted EXEC tSQLt.AssertEquals 1, 1 - a
+tautology that can never fail (if the proc throws the test errors BEFORE reaching
+the line; if it doesn't, 1=1 trivially passes).  The line asserted nothing.
+
+FIX - every per-input test now carries a REAL assertion:
+  * A shared before/after row-count guard (@PreCnt/@PostCnt) is built once per
+    proc: for a COUNT-STABLE proc (read-only or UPDATE-only) it captures each
+    faked table's COUNT(*) before and after the EXEC and asserts AssertEqualsTable
+    '#rcB','#rcA' - i.e. no rows were added or removed.  This FAILS if the proc
+    unexpectedly INSERTs/DELETEs.
+  * The EXEC is wrapped in BEGIN TRY/CATCH; a throw calls tSQLt.Fail with the real
+    ERROR_MESSAGE() (so the failure is explicit + descriptive, not a generic test
+    error).  For COUNT-CHANGING procs (INSERT/DELETE/MERGE) the guard is empty and
+    the TRY/CATCH 'must not throw' is the assertion.
+  Applied to all five smoke sites: happy-path (Test 1), low/high boundary (Test 2),
+  NULL-injection (Test 3), and the OUTPUT-param test (Test 6).  The ExpectException
+  branches (procs that validate + reject) are untouched.  @v94CountStable is now
+  computed once at the top and shared with the isolation test (Test 4).
+  The ONE deliberately-kept AssertEquals 1,1 is RunCoverageForFunction's coverage
+  DRIVER (-- driver: execution drives coverage): a no-op assert whose only job is
+  to make tSQLt run the body so coverage is measured - not a behaviour test.
+
+VERIFIED (live, hand-built as the fixed generator emits, run via tSQLt)
+  - A happy-path test for HumanResources.uspUpdateEmployeePersonalInfo with the
+    @PreCnt/@PostCnt guard + TRY/CATCH COMPILES and RUNS = Success (counts held
+    5->5; AssertEqualsTable passes).  It now CAN fail: an insert/delete breaks the
+    count equality, a throw hits tSQLt.Fail.
+  Generator (3270 lines) is too large to hot-deploy via the MCP, so applies on
+  RE-INSTALL.  Module 04 GenerateTestsForProcedure byte-identical to both
+  installers; installers md5-identical; tsql_lint clean.
+
+FILES: modules/04_Test_Generator_v3.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+================================================================================
+2026-05-31  Golden-master result baseline made REAL (read-only procs assert output)
+================================================================================
+Goal: a read-only proc should run on its seeded data and ASSERT the actual result
+rows - not just shape/smoke.  The framework had @CaptureRows (Test 8 'returns rows
+matching baseline') but it was OFF by default and, as wired, NON-FUNCTIONAL.
+
+BUG FOUND (proved live): the baseline was captured INSIDE the test via
+AssertResultRowsMatchBaseline's capture-on-first-run path - but tSQLt rolls every
+test back, so the captured baseline never persisted.  Result: the test captured-
+and-passed on EVERY run and never actually asserted - a tautology.  Confirmed:
+after a passing run, TestGenLog.ResultRowsBaseline had 0 rows.
+
+FIX
+  * New helper TestGen.CaptureResultBaseline @TestClass,@MockSql,@ExecSql: persists
+    the EXPECTED baseline at GENERATION time, OUTSIDE any tSQLt rollback.  It opens
+    a savepoint, runs @MockSql (FakeTable+seed) + the proc, copies the result rows
+    (as FOR JSON) and shape into TABLE VARIABLES (which survive a rollback), rolls
+    the faking back (real tables untouched), then persists to ResultRowsBaseline /
+    ResultShapeBaseline.  Uses a global ##temp for the dynamic JSON capture, then
+    copies to the table var before the savepoint rollback.
+  * GenerateTestsForProcedure now calls it (when @ExecuteScript=1) right after
+    emitting Test 8, so the generated 'returns rows matching baseline' test ASSERTS
+    the proc's seeded output (reconstruct #Expected from baseline -> AssertEqualsTable).
+  * @CaptureRows default flipped 0 -> 1 (golden master ON by default), in both
+    GenerateTestsForProcedure and GenerateAndRunCoverage.
+  * Guarded to DETERMINISTIC procs only (@v94Deterministic): a body with GETDATE/
+    SYSDATETIME/SYSUTCDATETIME/GETUTCDATE/CURRENT_TIMESTAMP/NEWID/NEWSEQUENTIALID/
+    RAND would drift between capture and assert, so it gets no row-baseline test
+    (shape test + scaffold still apply).
+  The manual 'hand-built expectation' scaffold (Test 9) stays a SKIP for the user.
+
+VERIFIED end-to-end on AdventureWorks2025 (live):
+  - Capture PERSISTS past tSQLt rollback: 3 rows / 2 cols, JSON = the seeded output.
+  - Real Production.ProductCategory left intact (4 real rows; faking rolled back).
+  - Matching run -> reconstruction path -> Success (baseline still present after).
+  - Drift (proc changed 3 rows -> 2) -> tSQLt reports 1 FAILED.  Real assertion.
+
+Also: tools/tsql_lint.py no longer miscounts 'BEGIN TRAN[SACTION]' as a block
+opener (it has no matching END).  CaptureResultBaseline added to both installers;
+generator wiring in module 04 + both installers (GenerateTestsForProcedure byte-
+identical module==installer; installers md5-identical; lint clean).  Helper is small
+and deploys live, but the 3270-line generator wiring applies on RE-INSTALL.
+
+FILES: modules/04_Test_Generator_v3.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, tools/tsql_lint.py, CHANGES.md
+
+================================================================================
+2026-05-31  Golden-master reverted to OFF by default (arg/seed mismatch blocker)
+================================================================================
+The previous entry turned @CaptureRows ON by default.  A Northwind sweep then
+showed 6 of 7 row-baseline tests FAILING.  Root cause (diagnosed, not yet fixed):
+  * The auto-generated happy ARG does not match the auto-generated SEED.  e.g.
+    CustOrderHist is seeded with Customers 'Samp1'..'Samp5' but EXEC'd with
+    @CustomerID = 'Sam' - which matches NO seeded row, so the proc returns 0 rows.
+    The captured baseline is therefore empty/trivial (the generated test even
+    PRINTs a NOTE saying the result set is empty).  An empty baseline + the
+    reconstruction path then produced failures in the full sweep.
+  * tSQLt.Run cannot be driven through the SQL MCP (it raises 'A severe error
+    happened during test execution' under the connector's wrapping transaction),
+    so the failures could not be reproduced / a fix validated remotely.
+DECISION: reverted @CaptureRows default 1 -> 0 in GenerateTestsForProcedure and
+GenerateAndRunCoverage.  Sweeps return to the clean honest-skip state (Northwind
+0 fails).  The machinery is RETAINED and proven-in-isolation:
+  - TestGen.CaptureResultBaseline (persists the expected baseline at generation
+    time, outside tSQLt's rollback, via savepoint + table variables) - verified
+    live: capture persists, match passes, drift fails, real tables untouched.
+  - The generation-time capture call + determinism guard stay wired but DORMANT
+    (only fire when @CaptureRows=1).
+REAL FIX NEEDED (next): derive the happy ARGS from the SEEDED key values so the
+proc returns rows for its own seed (the 'reverse-order seeding to determine the
+correct input' idea, applied to args).  Only then is a row baseline meaningful.
+
+FILES: modules/04_Test_Generator_v3.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+================================================================================
+2026-05-31  Matched STRING key args now line up with the seed (procs return rows)
+================================================================================
+Root cause of the 0-row procs / trivial baselines: @ParamMatchedColumns already
+detects a param whose name matches a PK/FK column in a faked dependency, and pins
+INT keys to 1 (matching the seeded ints) - but STRING keys fell back to the generic
+GetSampleValueLiteral(...,0) = 'Sam', while the seeder writes 'Samp1' for an nchar(5)
+key.  So  WHERE Customers.CustomerID = @CustomerID('Sam')  matched no seeded row
+('Samp1'..'Samp5') and CustOrderHist (et al.) returned 0 rows.
+
+FIX: for a matched CHAR/VARCHAR/NCHAR/NVARCHAR param, the happy arg is now the
+SEEDER'S ROW-1 value, computed by mirroring the seeder's exact logic:
+   charLen = (nchar/nvarchar ? max/2 : max), MAX->200, min 1
+   charLen>=3 : target=min(charLen,12); STUFF(LEFT('SampleText_1'+REPLICATE('X',
+                target),target), target,1,'1')   -- preserves the row digit at the end
+   else       : RIGHT(REPLICATE('0',charLen)+'1', charLen)
+Verified the formula reproduces the seeder exactly: 5->'Samp1', 40->'SampleText_1',
+10->'SampleTex1', 3->'Sa1', 2->'01', 1->'1'.  INT keys still pin to 1 (unchanged).
+
+Effect: read-only key-filtered procs now EXECUTE against matching seeded rows and
+return rows, so the per-input tests actually exercise the proc body (not just smoke
+an empty result).  This is also the prerequisite for a meaningful row baseline -
+@CaptureRows stays OFF for now (couldn't be validated remotely: tSQLt.Run can't run
+through the SQL MCP); re-enable + validate with an SSMS sweep once the arg fix is
+confirmed clean.
+
+FILES: modules/04_Test_Generator_v3.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+================================================================================
+2026-05-31  Golden master RE-ENABLED (arg-from-seed validated)
+================================================================================
+With matched string key args now aligned to the seed, the empty-baseline problem
+is gone, so @CaptureRows is back ON by default in GenerateTestsForProcedure and
+GenerateAndRunCoverage.
+VALIDATED live on Northwind (login granted db_owner): the regenerated CustOrderHist
+test now EXECs @CustomerID='Samp1' (the seeded key, not 'Sam'), and
+TestGen.CaptureResultBaseline persists a NON-EMPTY baseline:
+   1 row, 2 cols -> {"ProductName":"SampleText_1","Total":1}; real tables intact.
+So the row-baseline test now asserts a real seeded outcome (pass on match, fail on
+drift - proven earlier on AdventureWorks).  Step-1 sweep (arg fix only) was already
+clean: Northwind 50 tests, 0 fail / 0 err, 100% line+branch.
+NOTE: the golden test's end-to-end assert could not be run through the SQL MCP
+(tSQLt.Run raises 'severe error' under the connector transaction) - validate the
+full pass via an SSMS sweep.
+
+FILES: modules/04_Test_Generator_v3.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+================================================================================
+2026-05-31  Shape test false-drift fixed (bare vs full type name) + tail restored
+================================================================================
+ROOT CAUSE of the 6 "1 fail" procs in the Northwind sweeps (CustOrderHist,
+CustOrdersDetail, Employee Sales by Country, Sales by Year, SalesByCategory,
+Ten Most Expensive Products): the FAILING test was "returns a stable result-set
+shape" (NOT the golden row-baseline test, which passes).
+  - CaptureResultBaseline/CaptureResultShape store SqlTypeName from TYPE_NAME() =
+    the BARE name, e.g. 'nvarchar'.
+  - AssertResultShape built #ActualShape from dm_exec_describe_first_result_set's
+    system_type_name = the FULL name, e.g. 'nvarchar(40)'.
+  - AssertEqualsTable then saw 'nvarchar' <> 'nvarchar(40)' and FAILED.
+  CustOrdersOrders passed because all its columns are int/datetime (no length
+  suffix, so bare == full).  Every failing proc had at least one nvarchar(n)/
+  decimal(p,s)-style column.  Length/precision/scale/nullability already matched.
+
+FIX (one line, both installers + live on Northwind and AdventureWorks2025):
+  AssertResultShape now compares the BARE type name - it strips from the first
+  '(' (CHAR(40)) in system_type_name:
+     LEFT(system_type_name,
+          ISNULL(NULLIF(CHARINDEX(CHAR(40), system_type_name), 0) - 1,
+                 LEN(system_type_name)))
+  Size is still asserted via MaxLength/Precision/Scale, so nothing is lost.
+  Existing baselines need NO re-bless (they were already bare).  CHAR(40) is used
+  instead of '(' so the offline linter's string-masker is not perturbed.
+
+ALSO: the Edit tool silently TRUNCATED both installer files mid-line at
+"PRINT 'UnitAutogen framewo" (lost the success/failure banner + final END/GO) -
+the classic large-file Edit truncation.  Restored the 12-line tail byte-exact
+from git HEAD (CRLF-normalized).  Both files now lint clean and are byte-identical
+(md5 568825b7779cdbe6638f5485318d947f).  Verify file tails after Edits on big files.
+
+VALIDATION still pending the user's SSMS sweep (tSQLt.Run cannot run via the MCP).
+Upstream of the assert is proven: only the type-name dimension drifted, and it is
+now normalized on both sides; CustOrdersOrders passing confirms the other
+dimensions already align under fakes.
+
+FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       CHANGES.md
+
+================================================================================
+2026-05-31  Generator regression fixed: CASE expression as an EXEC parameter
+================================================================================
+SYMPTOM: AdventureWorks2025 sweep showed 2 procs "failed generation" -
+HumanResources.uspUpdateEmployeeLogin and .uspUpdateEmployeePersonalInfo, both
+with ErrorText "GEN: Incorrect syntax near the keyword 'CASE'".
+NOT a connection-recovery cascade (that older transient error is a different
+message).  CoverageResult timeline was decisive: both procs had GenSucceeded=True
+through 13:03 today, then failed from 14:10 onward - i.e. the UPDATE content-change
+assertion added this session broke them.  (uspUpdateEmployeeHireInfo kept
+generating because it routes to the INSERT/grow assertion path, not this one.)
+
+ROOT CAUSE: the UPDATE content-change assertion emitted
+    EXEC tSQLt.AssertEquals @Expected = 1,
+         @Actual = CASE WHEN @v94ContentChanged > 0 THEN 1 ELSE 0 END, ...
+A CASE expression is NOT a legal EXEC parameter value in T-SQL, so the generated
+test failed to CREATE -> GenSucceeded=False.  (The parallel INSERT-path assertion
+already did this correctly by assigning the CASE into a variable first.)
+
+FIX (both installers, lint clean, byte-identical md5 a774ebd344327dedee3e83324aa1b919):
+    DECLARE @v94Changed INT = CASE WHEN @v94ContentChanged > 0 THEN 1 ELSE 0 END;
+    EXEC tSQLt.AssertEquals @Expected = 1, @Actual = @v94Changed, @Message = ...;
+INT (not BIT) to match the int @Expected literal under tSQLt's type-aware compare.
+Confirmed this was the ONLY generated CASE-as-EXEC-parameter in the file.
+
+Lands on RE-INSTALL (the 3270-line GenerateTestsForProcedure is too large to
+hot-deploy via the MCP) - reinstall + re-sweep AdventureWorks to confirm the 2
+procs generate and the UPDATE content assertion runs.
+
+ALSO: the Edit tool truncated both installer tails AGAIN mid-banner during this
+edit; restored byte-exact from HEAD via Python.  Switched off Edit for these large
+files - use Python string-replace + verify the tail every time.
+
+FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       CHANGES.md

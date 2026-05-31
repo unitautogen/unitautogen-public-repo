@@ -15,7 +15,23 @@
  *----------------------------------------------------------------------------*/
 
 /*******************************************************************************
- * TestGen.InstrumentProcedure v5.2  (replaces v5.1)
+ * TestGen.InstrumentProcedure v5.3  (replaces v5.2)
+ *
+ * v5.3 NEW (vs v5.2):
+ *   - A bare branch body with NO terminating ';' is now closed correctly.
+ *     v5.1 wraps a bare (non-BEGIN) IF/WHILE/ELSE body in a synthetic
+ *     BEGIN/END so the injected RecordCoverageHit stays inside the branch, but
+ *     it only emitted the closing END when the body reached a ';'.  Semicolon-
+ *     free bodies in the AdventureWorks house style - e.g. ufnGetStock's
+ *     "IF (@ret IS NULL) SET @ret = 0" with no ';' - left the synthetic BEGIN
+ *     open until a LATER ';' fired the END deep inside the next block, so the
+ *     rebuilt _cov was unbalanced and FAILED TO COMPILE (Msg 102), reporting a
+ *     false 0% coverage.  v5.3 closes the wrap at the structural token that
+ *     actually ends a bare single-statement body: the next BEGIN/END block
+ *     boundary or branch header (handled BEFORE the line is emitted), and the
+ *     next statement opener on the no-';' boundary path.  Bodies that DO end
+ *     with ';' instrument byte-identically to v5.2.  Verified on dbo.ufnGetStock
+ *     (now 100% line + branch).
  *
  * v5.2 NEW (vs v5.1):
  *   - BEGIN TRY / BEGIN CATCH / END TRY / END CATCH are now recognised as
@@ -502,6 +518,30 @@ BEGIN
                 ELSE 0
             END;
 
+            -- v5.3: close an open bare-branch wrap whose statement never reached a
+            -- ';'.  A bare branch body is a single statement, so the next structural
+            -- token - a BEGIN/END block boundary or a new branch header - ENDS it.
+            -- Inject the pending hit and the matching synthetic END here, BEFORE this
+            -- line is emitted, so the wrap stays balanced and _cov compiles.
+            -- Without this, semicolon-free AdventureWorks bodies (e.g. ufnGetStock's
+            -- "IF (@ret IS NULL) SET @ret = 0" with no ';') left the wrap open until
+            -- a later ';' fired the END inside the next block -> Msg 102.
+            IF @StmtWrap = 1 AND @StmtStart IS NOT NULL AND @StmtStart <> @LN
+               AND (@PB = 1 OR @PE = 1 OR @IsBranchHeader = 1)
+            BEGIN
+                SET @Body = @Body
+                    + N'    EXEC TestGen.RecordCoverageHit '''
+                    + REPLACE(@SchemaName,'''','''''') + N''','''
+                    + REPLACE(@ProcName  ,'''','''''') + N''','
+                    + CAST(@StmtStart AS NVARCHAR(10)) + N';' + CHAR(10)
+                    + N'    END' + CHAR(10);
+                SET @StmtStart      = NULL;
+                SET @StmtWrap       = 0;
+                SET @StmtIsTerminal = 0;
+                SET @OpenStmt       = NULL;
+                SET @InsertMode     = NULL;
+            END;
+
             IF @Blank = 0 AND @Cmnt = 0 AND @PB = 0 AND @PE = 0 AND @Noise = 0
             BEGIN
                 IF @IsBranchHeader = 1
@@ -646,6 +686,13 @@ BEGIN
                                 + REPLACE(@SchemaName,'''','''''') + N''','''
                                 + REPLACE(@ProcName  ,'''','''''') + N''','
                                 + CAST(@StmtStart AS NVARCHAR(10)) + N';' + CHAR(10);
+                            -- v5.3: if the statement that just ended (without ';') was
+                            -- a synthetic-wrapped bare branch body, close its wrap now.
+                            IF @StmtWrap = 1
+                            BEGIN
+                                SET @Body = @Body + N'    END' + CHAR(10);
+                                SET @StmtWrap = 0;
+                            END;
                             SET @StmtStart      = NULL;
                             SET @StmtIsTerminal = 0;
                             SET @OpenStmt       = NULL;
@@ -1035,5 +1082,5 @@ BEGIN
         PRINT 'WARNING: injection count differs from IsExec count - check for unterminated statements.';
 END;
 GO
-PRINT 'TestGen.InstrumentProcedure v5.2 created (TRY/CATCH structural-keyword fix).';
+PRINT 'TestGen.InstrumentProcedure v5.3 created (bare no-semicolon branch-body wrap-close fix).';
 GO

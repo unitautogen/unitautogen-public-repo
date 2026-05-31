@@ -1094,21 +1094,29 @@ GO
 IF OBJECT_ID('TestGen.ExtractBranchSeeds','TF') IS NOT NULL
     DROP FUNCTION TestGen.ExtractBranchSeeds;
 GO
+-- v11 Step 2.1: predicate-aware + ancestor-chaining.  Tracks BEGIN/END nesting
+-- and a stack of enclosing IF/WHILE gates; each branch's seed = its own leaves
+-- PLUS every ancestor gate's satisfying assignment.  Returns BranchId so the
+-- caller drives one shadow EXEC per branch with all assigned params overridden.
+-- See DESIGN_v11_AncestorChaining.md.
 CREATE FUNCTION TestGen.ExtractBranchSeeds(@Body NVARCHAR(MAX), @ParamCsv NVARCHAR(MAX))
-RETURNS @seeds TABLE (ParamName SYSNAME, SeedLiteral NVARCHAR(500))
+RETURNS @seeds TABLE (BranchId INT, ParamName SYSNAME, SeedLiteral NVARCHAR(500))
 AS
 BEGIN
     DECLARE @pset NVARCHAR(MAX) = N'|' + UPPER(REPLACE(REPLACE(REPLACE(ISNULL(@ParamCsv,N''),N' ',N''),CHAR(13),N''),CHAR(10),N'')) + N'|';
-    SET @pset = REPLACE(@pset, N',', N'|');     -- -> |@N|@STATUS|
+    SET @pset = REPLACE(@pset, N',', N'|');
     IF @pset = N'||' RETURN;
 
-    DECLARE @len INT = LEN(@Body), @i INT = 1;
+    DECLARE @anc  TABLE (AtDepth INT, ParamName SYSNAME, SeedLiteral NVARCHAR(500));
+    DECLARE @pend TABLE (ParamName SYSNAME, SeedLiteral NVARCHAR(500));
+    DECLARE @leaf TABLE (ParamName SYSNAME, SeedLiteral NVARCHAR(500));
+
+    DECLARE @len INT = LEN(@Body), @i INT = 1, @depth INT = 0, @branch INT = 0;
     DECLARE @inLine BIT=0,@inBlk BIT=0,@inStr BIT=0,@inBr BIT=0;
-    DECLARE @ch NCHAR(1),@nx NCHAR(1),@pvc NCHAR(1);
-    DECLARE @tok NVARCHAR(200),@k INT,@kc NCHAR(1);
-    DECLARE @op VARCHAR(12),@operand NVARCHAR(500),@seed NVARCHAR(500),@w NVARCHAR(20),@w2 NVARCHAR(10);
-    DECLARE @prevWord NVARCHAR(20)=N'',@curWord NVARCHAR(40)=N'';
-    DECLARE @found BIT;
+    DECLARE @ch NCHAR(1),@nx NCHAR(1),@pvc NCHAR(1),@aft NCHAR(1);
+    DECLARE @hasPending BIT=0, @bodyIsBegin BIT, @fw VARCHAR(6);
+    DECLARE @pp INT,@psA BIT,@pcl BIT,@pbk BIT,@stop BIT;
+    DECLARE @tok NVARCHAR(200),@k INT,@kc NCHAR(1),@op VARCHAR(12),@operand NVARCHAR(500),@seed NVARCHAR(500),@w NVARCHAR(20),@w2 NVARCHAR(10);
 
     WHILE @i <= @len
     BEGIN
@@ -1119,105 +1127,131 @@ BEGIN
         IF @inBlk=1  BEGIN IF @ch=N'*' AND @nx=N'/' BEGIN SET @i+=2; SET @inBlk=0; CONTINUE; END; SET @i+=1; CONTINUE; END;
         IF @inStr=1  BEGIN IF @ch=N'''' AND @nx=N'''' BEGIN SET @i+=2; CONTINUE; END; IF @ch=N'''' SET @inStr=0; SET @i+=1; CONTINUE; END;
         IF @inBr=1   BEGIN IF @ch=N']' SET @inBr=0; SET @i+=1; CONTINUE; END;
-        IF @ch=N'-' AND @nx=N'-' BEGIN SET @i+=2; SET @inLine=1; SET @prevWord=N''; SET @curWord=N''; CONTINUE; END;
-        IF @ch=N'/' AND @nx=N'*' BEGIN SET @i+=2; SET @inBlk=1; SET @prevWord=N''; SET @curWord=N''; CONTINUE; END;
-        IF @ch=N'''' BEGIN SET @i+=1; SET @inStr=1; SET @prevWord=N''; SET @curWord=N''; CONTINUE; END;
-        IF @ch=N'['  BEGIN SET @i+=1; SET @inBr=1; SET @prevWord=N''; SET @curWord=N''; CONTINUE; END;
+        IF @ch=N'-' AND @nx=N'-' BEGIN SET @i+=2; SET @inLine=1; CONTINUE; END;
+        IF @ch=N'/' AND @nx=N'*' BEGIN SET @i+=2; SET @inBlk=1; CONTINUE; END;
+        IF @ch=N''''  BEGIN SET @i+=1; SET @inStr=1; CONTINUE; END;
+        IF @ch=N'['   BEGIN SET @i+=1; SET @inBr=1; CONTINUE; END;
 
-        IF @ch LIKE N'[A-Za-z]'
+        SET @pvc = CASE WHEN @i=1 THEN N' ' ELSE SUBSTRING(@Body,@i-1,1) END;
+        IF PATINDEX(N'%[^A-Za-z0-9_@#]%',@pvc)=1
         BEGIN
-            SET @curWord = @curWord + @ch; SET @i+=1; CONTINUE;
-        END
-        ELSE IF @curWord <> N''
-        BEGIN
-            SET @prevWord = UPPER(@curWord); SET @curWord = N'';
-        END;
-
-        IF @ch = N'@'
-        BEGIN
-            SET @pvc = CASE WHEN @i=1 THEN N' ' ELSE SUBSTRING(@Body,@i-1,1) END;
-            IF PATINDEX(N'%[^A-Za-z0-9_@#]%',@pvc)=1
+            IF UPPER(SUBSTRING(@Body,@i,5))=N'BEGIN'
+               AND PATINDEX(N'%[^A-Za-z0-9_@#]%',CASE WHEN @i+5<=@len THEN SUBSTRING(@Body,@i+5,1) ELSE N' ' END)=1
             BEGIN
-                SET @tok = N'@'; SET @k = @i+1;
-                WHILE @k<=@len
+                SET @depth += 1;
+                IF @hasPending=1
                 BEGIN
-                    SET @kc = SUBSTRING(@Body,@k,1);
-                    IF @kc LIKE N'[A-Za-z0-9_@#]' BEGIN SET @tok+=@kc; SET @k+=1; END ELSE BREAK;
+                    INSERT @anc (AtDepth,ParamName,SeedLiteral) SELECT @depth,ParamName,SeedLiteral FROM @pend;
+                    DELETE FROM @pend; SET @hasPending=0;
                 END;
-                IF CHARINDEX(N'|'+UPPER(@tok)+N'|', @pset) > 0 AND @prevWord <> N'SET'
-                BEGIN
-                    SET @op=NULL; SET @operand=NULL; SET @found=0;
-                    WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
-                    SET @kc = CASE WHEN @k<=@len THEN SUBSTRING(@Body,@k,1) ELSE N'' END;
-                    IF SUBSTRING(@Body,@k,2) IN (N'>=',N'<=',N'<>',N'!=')
-                    BEGIN SET @op=CASE WHEN SUBSTRING(@Body,@k,2)=N'!=' THEN '<>' ELSE SUBSTRING(@Body,@k,2) END COLLATE DATABASE_DEFAULT; SET @k+=2; END
-                    ELSE IF @kc=N'=' BEGIN SET @op='='; SET @k+=1; END
-                    ELSE IF @kc=N'<' BEGIN SET @op='<'; SET @k+=1; END
-                    ELSE IF @kc=N'>' BEGIN SET @op='>'; SET @k+=1; END
-                    ELSE
-                    BEGIN
-                        SET @w=N'';
-                        WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[A-Za-z]' BEGIN SET @w+=SUBSTRING(@Body,@k,1); SET @k+=1; END;
-                        SET @w=UPPER(@w);
-                        IF @w=N'IS'
-                        BEGIN
-                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
-                            SET @w2=N'';
-                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[A-Za-z]' BEGIN SET @w2+=SUBSTRING(@Body,@k,1); SET @k+=1; END;
-                            SET @w2=UPPER(@w2);
-                            IF @w2=N'NULL' SET @op='ISNULL';
-                        END
-                        ELSE IF @w=N'IN' SET @op='IN';
-                        ELSE IF @w=N'BETWEEN' SET @op='BETWEEN';
-                        ELSE IF @w=N'LIKE' SET @op='LIKE';
-                    END;
+                SET @i += 5; CONTINUE;
+            END;
+            IF UPPER(SUBSTRING(@Body,@i,3))=N'END'
+               AND PATINDEX(N'%[^A-Za-z0-9_@#]%',CASE WHEN @i+3<=@len THEN SUBSTRING(@Body,@i+3,1) ELSE N' ' END)=1
+            BEGIN
+                DELETE FROM @anc WHERE AtDepth=@depth;
+                IF @depth>0 SET @depth-=1;
+                SET @hasPending=0;
+                SET @i += 3; CONTINUE;
+            END;
+            SET @fw = NULL;
+            IF UPPER(SUBSTRING(@Body,@i,2))=N'IF'
+               AND PATINDEX(N'%[^A-Za-z0-9_@#]%',CASE WHEN @i+2<=@len THEN SUBSTRING(@Body,@i+2,1) ELSE N' ' END)=1
+                SET @fw='IF';
+            ELSE IF UPPER(SUBSTRING(@Body,@i,5))=N'WHILE'
+               AND PATINDEX(N'%[^A-Za-z0-9_@#]%',CASE WHEN @i+5<=@len THEN SUBSTRING(@Body,@i+5,1) ELSE N' ' END)=1
+                SET @fw='WHILE';
 
-                    IF @op IN ('=','<','>','<=','>=','<>','LIKE','IN','BETWEEN')
+            IF @fw IS NOT NULL
+            BEGIN
+                SET @i += CASE WHEN @fw='IF' THEN 2 ELSE 5 END;
+                DELETE FROM @leaf;
+                SET @pp=0; SET @psA=0; SET @pcl=0; SET @pbk=0; SET @stop=0; SET @bodyIsBegin=0;
+                WHILE @i<=@len AND @stop=0
+                BEGIN
+                    SET @ch=SUBSTRING(@Body,@i,1);
+                    SET @nx=CASE WHEN @i<@len THEN SUBSTRING(@Body,@i+1,1) ELSE N'' END;
+                    IF @pcl=1 BEGIN IF @ch=CHAR(10) SET @pcl=0; SET @i+=1; CONTINUE; END;
+                    IF @psA=1 BEGIN IF @ch=N'''' AND @nx=N'''' BEGIN SET @i+=2; CONTINUE; END; IF @ch=N'''' SET @psA=0; SET @i+=1; CONTINUE; END;
+                    IF @pbk=1 BEGIN IF @ch=N']' SET @pbk=0; SET @i+=1; CONTINUE; END;
+                    IF @ch=N'-' AND @nx=N'-' BEGIN SET @i+=2; SET @pcl=1; CONTINUE; END;
+                    IF @ch=N'''' BEGIN SET @i+=1; SET @psA=1; CONTINUE; END;
+                    IF @ch=N'[' BEGIN SET @i+=1; SET @pbk=1; CONTINUE; END;
+                    IF @ch=N'(' BEGIN SET @pp+=1; SET @i+=1; CONTINUE; END;
+                    IF @ch=N')' BEGIN SET @pp=CASE WHEN @pp>0 THEN @pp-1 ELSE 0 END; SET @i+=1; CONTINUE; END;
+
+                    IF @pp=0
                     BEGIN
-                        IF @op='IN'
+                        SET @pvc=CASE WHEN @i=1 THEN N' ' ELSE SUBSTRING(@Body,@i-1,1) END;
+                        IF UPPER(SUBSTRING(@Body,@i,5))=N'BEGIN' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',@pvc)=1
+                           AND PATINDEX(N'%[^A-Za-z0-9_@#]%',CASE WHEN @i+5<=@len THEN SUBSTRING(@Body,@i+5,1) ELSE N' ' END)=1
+                        BEGIN SET @bodyIsBegin=1; SET @stop=1; CONTINUE; END;
+                        IF @ch=N';' BEGIN SET @stop=1; CONTINUE; END;
+                        IF @ch=N'@' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',@pvc)=1
                         BEGIN
-                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
-                            IF SUBSTRING(@Body,@k,1)=N'(' SET @k+=1;
-                        END;
-                        WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
-                        SET @kc = CASE WHEN @k<=@len THEN SUBSTRING(@Body,@k,1) ELSE N'' END;
-                        IF @kc=N''''
-                        BEGIN
-                            SET @operand=N''''; SET @k+=1;
-                            WHILE @k<=@len
+                            SET @tok=N'@'; SET @k=@i+1;
+                            WHILE @k<=@len BEGIN SET @kc=SUBSTRING(@Body,@k,1); IF @kc LIKE N'[A-Za-z0-9_@#]' BEGIN SET @tok+=@kc; SET @k+=1; END ELSE BREAK; END;
+                            IF CHARINDEX(N'|'+UPPER(@tok)+N'|',@pset)>0
                             BEGIN
-                                SET @kc=SUBSTRING(@Body,@k,1);
-                                IF @kc=N'''' AND SUBSTRING(@Body,@k+1,1)=N'''' BEGIN SET @operand+=N''''''; SET @k+=2; CONTINUE; END;
-                                SET @operand+=@kc; SET @k+=1;
-                                IF @kc=N'''' BREAK;
+                                SET @op=NULL; SET @operand=NULL;
+                                WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
+                                SET @kc=CASE WHEN @k<=@len THEN SUBSTRING(@Body,@k,1) ELSE N'' END;
+                                IF SUBSTRING(@Body,@k,2) IN (N'>=',N'<=',N'<>',N'!=')
+                                BEGIN SET @op=CASE WHEN SUBSTRING(@Body,@k,2)=N'!=' THEN '<>' ELSE SUBSTRING(@Body,@k,2) END COLLATE DATABASE_DEFAULT; SET @k+=2; END
+                                ELSE IF @kc=N'=' BEGIN SET @op='='; SET @k+=1; END
+                                ELSE IF @kc=N'<' BEGIN SET @op='<'; SET @k+=1; END
+                                ELSE IF @kc=N'>' BEGIN SET @op='>'; SET @k+=1; END
+                                ELSE
+                                BEGIN
+                                    SET @w=N''; WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[A-Za-z]' BEGIN SET @w+=SUBSTRING(@Body,@k,1); SET @k+=1; END; SET @w=UPPER(@w);
+                                    IF @w=N'IS' BEGIN WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1; SET @w2=N''; WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[A-Za-z]' BEGIN SET @w2+=SUBSTRING(@Body,@k,1); SET @k+=1; END; SET @w2=UPPER(@w2); IF @w2=N'NULL' SET @op='ISNULL'; END
+                                    ELSE IF @w=N'IN' SET @op='IN';
+                                    ELSE IF @w=N'BETWEEN' SET @op='BETWEEN';
+                                    ELSE IF @w=N'LIKE' SET @op='LIKE';
+                                END;
+                                IF @op IN ('=','<','>','<=','>=','<>','LIKE','IN','BETWEEN')
+                                BEGIN
+                                    IF @op='IN' BEGIN WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1; IF SUBSTRING(@Body,@k,1)=N'(' SET @k+=1; END;
+                                    WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
+                                    SET @kc=CASE WHEN @k<=@len THEN SUBSTRING(@Body,@k,1) ELSE N'' END;
+                                    IF @kc=N'''' BEGIN SET @operand=N''''; SET @k+=1; WHILE @k<=@len BEGIN SET @kc=SUBSTRING(@Body,@k,1); IF @kc=N'''' AND SUBSTRING(@Body,@k+1,1)=N'''' BEGIN SET @operand+=N''''''; SET @k+=2; CONTINUE; END; SET @operand+=@kc; SET @k+=1; IF @kc=N'''' BREAK; END; END
+                                    ELSE IF @kc LIKE N'[0-9]' OR (@kc IN (N'-',N'+',N'.') AND SUBSTRING(@Body,@k+1,1) LIKE N'[0-9]') BEGIN SET @operand=N''; IF @kc IN (N'-',N'+') BEGIN SET @operand+=@kc; SET @k+=1; END; WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[0-9.]' BEGIN SET @operand+=SUBSTRING(@Body,@k,1); SET @k+=1; END; END;
+                                    IF @op='LIKE' AND @operand IS NOT NULL BEGIN SET @operand=REPLACE(REPLACE(@operand,N'%',N''),N'_',N''); IF @operand=N'''''' SET @operand=NULL; END;
+                                END;
+                                IF @op='ISNULL' INSERT @leaf(ParamName,SeedLiteral) VALUES(@tok,N'NULL');
+                                ELSE IF @op IS NOT NULL AND @operand IS NOT NULL BEGIN SET @seed=TestGen.SeedFromLeaf(@op,@operand); IF @seed IS NOT NULL INSERT @leaf(ParamName,SeedLiteral) VALUES(@tok,@seed); END;
+                                SET @i=@k; CONTINUE;
                             END;
-                        END
-                        ELSE IF @kc LIKE N'[0-9]' OR (@kc IN (N'-',N'+',N'.') AND SUBSTRING(@Body,@k+1,1) LIKE N'[0-9]')
-                        BEGIN
-                            SET @operand=N'';
-                            IF @kc IN (N'-',N'+') BEGIN SET @operand+=@kc; SET @k+=1; END;
-                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[0-9.]' BEGIN SET @operand+=SUBSTRING(@Body,@k,1); SET @k+=1; END;
+                            SET @i=@k; CONTINUE;
                         END;
-
-                        IF @op='LIKE' AND @operand IS NOT NULL
+                        IF @ch LIKE N'[A-Za-z]'
                         BEGIN
-                            SET @operand = REPLACE(REPLACE(@operand, N'%', N''), N'_', N'');
-                            IF @operand = N'''''' SET @operand = NULL;
+                            SET @w=N''; SET @k=@i;
+                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[A-Za-z]' BEGIN SET @w+=SUBSTRING(@Body,@k,1); SET @k+=1; END;
+                            SET @w=UPPER(@w);
+                            IF @w IN (N'RETURN',N'SET',N'SELECT',N'INSERT',N'UPDATE',N'DELETE',N'PRINT',N'EXEC',N'EXECUTE',N'THROW',N'RAISERROR',N'BREAK',N'CONTINUE',N'WAITFOR',N'GOTO',N'DECLARE',N'MERGE',N'COMMIT',N'ROLLBACK',N'TRUNCATE')
+                            BEGIN SET @stop=1; CONTINUE; END;
+                            SET @i=@k; CONTINUE;
                         END;
                     END;
-
-                    IF @op='ISNULL'
-                        INSERT @seeds(ParamName,SeedLiteral) VALUES(@tok, N'NULL');
-                    ELSE IF @op IS NOT NULL AND @operand IS NOT NULL
-                    BEGIN
-                        SET @seed = TestGen.SeedFromLeaf(@op, @operand);
-                        IF @seed IS NOT NULL
-                            INSERT @seeds(ParamName,SeedLiteral) VALUES(@tok, @seed);
-                    END;
-
-                    SET @i = @k; SET @prevWord=N''; CONTINUE;
+                    SET @i+=1;
                 END;
-                SET @i = @k; SET @prevWord=N''; CONTINUE;
+
+                IF EXISTS (SELECT 1 FROM @leaf)
+                BEGIN
+                    SET @branch += 1;
+                    INSERT @seeds (BranchId,ParamName,SeedLiteral) SELECT @branch,ParamName,SeedLiteral FROM @leaf;
+                    INSERT @seeds (BranchId,ParamName,SeedLiteral)
+                    SELECT @branch, a.ParamName, a.SeedLiteral
+                    FROM @anc a
+                    WHERE a.AtDepth = (SELECT MAX(a2.AtDepth) FROM @anc a2 WHERE UPPER(a2.ParamName)=UPPER(a.ParamName))
+                      AND NOT EXISTS (SELECT 1 FROM @leaf l WHERE UPPER(l.ParamName)=UPPER(a.ParamName));
+                END;
+
+                IF @bodyIsBegin=1 AND EXISTS (SELECT 1 FROM @leaf)
+                BEGIN DELETE FROM @pend; INSERT @pend SELECT ParamName,SeedLiteral FROM @leaf; SET @hasPending=1; END
+                ELSE SET @hasPending=0;
+                CONTINUE;
             END;
         END;
 
@@ -1330,17 +1364,20 @@ BEGIN
         DECLARE @paramCsv NVARCHAR(MAX)=N'';
         SELECT @paramCsv=@paramCsv+name+N',' FROM @ph ORDER BY ord;
         DECLARE @retClause NVARCHAR(120)=CASE WHEN @ret=N'' THEN N'' ELSE N', '+@ret END;
-        ;WITH leaf AS (SELECT DISTINCT ParamName, SeedLiteral FROM TestGen.ExtractBranchSeeds(@fnbody,@paramCsv))
+        ;WITH raw AS (SELECT BranchId, ParamName, SeedLiteral FROM TestGen.ExtractBranchSeeds(@fnbody,@paramCsv)),
+              asg AS (SELECT BranchId, ParamName, MAX(SeedLiteral) AS SeedLiteral FROM raw GROUP BY BranchId, ParamName)
         SELECT @execSeeds = @execSeeds
              + N'    BEGIN TRY EXEC '+@shadowFull+N' '+ z.args + @retClause + N'; END TRY BEGIN CATCH END CATCH;'+@CRLF,
                @seedCount = @seedCount + 1
         FROM (
-            SELECT l.ParamName, l.SeedLiteral,
+            SELECT b.BranchId,
                    STRING_AGG(CONVERT(NVARCHAR(MAX),
-                        p.name + N'=' + CASE WHEN UPPER(p.name)=UPPER(l.ParamName) THEN l.SeedLiteral ELSE p.happyLit END),
+                        p.name + N'=' + ISNULL(a.SeedLiteral, p.happyLit)),
                         N', ') WITHIN GROUP (ORDER BY p.ord) AS args
-            FROM leaf l CROSS JOIN @ph p
-            GROUP BY l.ParamName, l.SeedLiteral
+            FROM (SELECT DISTINCT BranchId FROM asg) b
+            CROSS JOIN @ph p
+            LEFT JOIN asg a ON a.BranchId=b.BranchId AND UPPER(a.ParamName)=UPPER(p.name)
+            GROUP BY b.BranchId
         ) z;
     END TRY
     BEGIN CATCH
@@ -1360,7 +1397,7 @@ BEGIN
         N'    EXEC tSQLt.AssertEquals 1, 1; -- driver: execution drives coverage'+@CRLF+
         N'END;'+@CRLF+N'GO'+@CRLF;
     EXEC TestGen.ExecuteBatchedScript @drv;
-    IF @seedCount > 0 PRINT 'RunCoverageForFunction: '+CAST(@seedCount AS VARCHAR)+' predicate-inversion seed(s) added for '+@SchemaName+'.'+@FunctionName+'.';
+    IF @seedCount > 0 PRINT 'RunCoverageForFunction: '+CAST(@seedCount AS VARCHAR)+' branch-seed driver call(s) added for '+@SchemaName+'.'+@FunctionName+'.';
 
     -- 3. measure coverage on the shadow, capturing test outcomes so we can
     --    persist a CoverageResult row keyed by the FUNCTION (the shadow is an
@@ -1376,6 +1413,32 @@ BEGIN
     BEGIN CATCH
         PRINT 'RunCoverageForFunction: RunCoverage on shadow failed: '+ERROR_MESSAGE();
     END CATCH;
+
+    -- A (honest-deferred): if the instrumented shadow copy never compiled,
+    -- RunCoverage measured nothing - the 0 hits mean "the instrumented copy did
+    -- not run", NOT "this code is uncovered".  Detect the absent _cov and record
+    -- COVERAGE DEFERRED instead of a misleading GenSucceeded=1 / 0% row.  With
+    -- the v5.3 wrap-close fix this is rare; it is the residual-case net for
+    -- shadow bodies the line-walker still cannot wrap into compilable SQL.
+    DECLARE @covChk NVARCHAR(400) = QUOTENAME(@SchemaName)+N'.'+QUOTENAME(@shadow+N'_cov');
+    DECLARE @deferred BIT = CASE WHEN OBJECT_ID(@covChk,'P') IS NULL THEN 1 ELSE 0 END;
+    IF @deferred = 1
+    BEGIN
+        PRINT '=============================================================';
+        PRINT ' COVERAGE DEFERRED: '+@SchemaName+'.'+@FunctionName;
+        PRINT ' The instrumented shadow copy ('+@shadow+'_cov) did not compile,';
+        PRINT ' so no coverage could be measured.  Reported DEFERRED, not 0%';
+        PRINT ' (instrumenter limitation - please report this function body).';
+        PRINT '=============================================================';
+        IF @BatchId IS NOT NULL
+            INSERT TestGen.CoverageResult
+                (BatchId,SchemaName,ProcName,GenSucceeded,TotalLines,CoveredLines,LinePct,
+                 TotalBranches,CoveredBranches,BranchPct,TestsRun,TestsPassed,TestsFailed,
+                 TestsErrored,TestsSkipped,TestsPreserved,ErrorText,Testability,NotTestableReason,RunAt)
+            VALUES (@BatchId,@SchemaName,@FunctionName,0,NULL,NULL,NULL,NULL,NULL,NULL,0,0,0,0,0,0,
+                 N'instrumented _cov failed to compile',N'NOT_TESTABLE',
+                 N'coverage deferred: instrumenter could not produce a compiling _cov',SYSUTCDATETIME());
+    END;
 
     -- 4. compute coverage from the shadow's line catalogue + hits (same rule as
     --    GenerateAndCoverDatabase) and persist a CoverageResult row under the
@@ -1422,6 +1485,7 @@ BEGIN
                    @skip=ISNULL(SUM(CASE WHEN Result IN ('Skipped','Skip','Ignored') THEN 1 ELSE 0 END),0)
             FROM tSQLt.TestResult WHERE Class=@asclass;
     END;
+    IF @deferred = 0
     BEGIN TRY
         INSERT TestGen.CoverageResult
             (BatchId,SchemaName,ProcName,GenSucceeded,TotalLines,CoveredLines,LinePct,
@@ -1485,6 +1549,7 @@ BEGIN
     DECLARE @lp DECIMAL(5,1), @bp DECIMAL(5,1);
     DECLARE @testability VARCHAR(20), @reason NVARCHAR(400);   -- v9.4.3 testability gate
     DECLARE @pres INT;                                          -- v9.4.4 preservation count from GenerateTestsForProcedure
+    DECLARE @resync INT;   -- v11.x: connection-recovery resync probe (see loop)
 
     -- v11: enumerate stored procedures AND user functions (FN/IF/TF).
     DECLARE @work TABLE (Seq INT IDENTITY(1,1), s SYSNAME, p SYSNAME, k CHAR(2));
@@ -1521,6 +1586,14 @@ BEGIN
         SET @run=0; SET @pass=0; SET @fail=0; SET @errc=0; SET @skip=0;
         SET @tot=0; SET @cov=0; SET @tb=0; SET @cb=0;
         SET @pres=0;   -- v9.4.4: preservation count reset per iteration
+        -- v11.x resilience: a transient connection-recovery during this long
+        -- multi-object run leaves @@ROWCOUNT unusable ("the connection was
+        -- recovered ... execute another query to get a valid rowcount"), which
+        -- otherwise CASCADES - every remaining object then fails generation with
+        -- that same message (2026-05-31: all 8 procs after the functions failed
+        -- in 0.37s total).  A trivial query each iteration re-syncs the session
+        -- so a recovery on a prior object cannot poison this one.
+        SELECT @resync = 1;
 
         PRINT '  [' + CAST(@Seq AS VARCHAR) + '/' + CAST(@Total AS VARCHAR) + '] ' + @s + '.' + @p;
 
@@ -1580,7 +1653,23 @@ BEGIN
                  @TestsPreservedCount=@pres OUTPUT;
             SET @genOK=1;
         END TRY
-        BEGIN CATCH SET @err=N'GEN: '+ERROR_MESSAGE(); END CATCH
+        BEGIN CATCH
+            SET @err=N'GEN: '+ERROR_MESSAGE();
+            -- v11.x resilience: if generation tripped a transient connection-recovery
+            -- (rowcount unavailable), re-sync and retry ONCE - the generator is
+            -- deterministic and succeeds on a clean session, so one blip never costs
+            -- the object (it used to cost every REMAINING object in the sweep).
+            IF @err LIKE N'%connection was recovered%' OR @err LIKE N'%valid rowcount%'
+            BEGIN
+                SELECT @resync = 1;
+                BEGIN TRY
+                    EXEC TestGen.GenerateTestsForProcedure @SchemaName=@s, @ProcName=@p, @ExecuteScript=1,
+                         @TestsPreservedCount=@pres OUTPUT;
+                    SET @genOK=1; SET @err=NULL;
+                END TRY
+                BEGIN CATCH SET @err=N'GEN: '+ERROR_MESSAGE(); END CATCH
+            END;
+        END CATCH
 
         IF @genOK = 1
         BEGIN

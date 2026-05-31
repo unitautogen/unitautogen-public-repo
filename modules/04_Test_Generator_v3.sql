@@ -59,7 +59,7 @@ CREATE PROCEDURE TestGen.GenerateTestsForProcedure
     @ProcName                      SYSNAME,
     @TestClassName                 SYSNAME       = NULL,
     @ExecuteScript                 BIT           = 1,
-    @CaptureRows                   BIT           = 0,    -- when 1, also emit a golden-row baseline test
+    @CaptureRows                   BIT           = 1,    -- golden-row baseline ON: matched key args now align with the seed (procs return rows), so the captured baseline is meaningful (validated: CustOrderHist -> 1 row on Northwind).
     @EmitNegativeTests             BIT           = 1,    -- when 1, scan source for RAISERROR/THROW and emit ExpectException tests
     @AssertExceptionOnInvalidInputs BIT          = 1,    -- when 1, boundary + NULL-for-matched-param tests expect an exception (only if the proc has detected error paths)
     @EmitNullChecks                BIT           = 1,    -- when 0, do not emit the NULL-rejection tests
@@ -867,6 +867,7 @@ BEGIN
         -- and subsequent loop iterations keep the prior value.
         DECLARE @matched  BIT;
         DECLARE @happyVal NVARCHAR(400);
+        DECLARE @mCharLen INT, @mTarget INT, @mRaw NVARCHAR(220);   -- v11.x: matched-key arg row-1 seed value
 
         DECLARE pcur CURSOR LOCAL FAST_FORWARD FOR
             SELECT ParamId, ParamName, SqlTypeName, MaxLength, [Precision], Scale, IsOutput, IsNullable
@@ -894,12 +895,28 @@ BEGIN
 
                 IF @matched = 1
                 BEGIN
-                    -- Pin to "1" - the first seeded integer value. For strings
-                    -- the seeder writes 'SampleText_1' / 'Sa1' / etc.; for now
-                    -- we only override int-like params because string-key
-                    -- matching is much rarer and trickier.
+                    -- v11.x: line the happy arg up with the SEEDER's ROW-1 value for
+                    -- this matched key column, so  WHERE col = @param  matches a seeded
+                    -- row and the proc returns rows.  Previously string keys fell back
+                    -- to the generic 'Sam', which never matched the seed 'Samp1' (=> 0
+                    -- rows).  The formula here mirrors the seeder's row-1 logic exactly.
                     IF LOWER(@ptype) IN ('int','bigint','smallint','tinyint')
                         SET @happyVal = N'1';
+                    ELSE IF LOWER(@ptype) IN ('char','varchar','nchar','nvarchar')
+                    BEGIN
+                        SET @mCharLen = CASE WHEN @pmax = -1 THEN 200
+                                             WHEN LOWER(@ptype) IN ('nchar','nvarchar') THEN @pmax / 2
+                                             ELSE @pmax END;
+                        IF @mCharLen IS NULL OR @mCharLen < 1 SET @mCharLen = 1;
+                        IF @mCharLen >= 3
+                        BEGIN
+                            SET @mTarget = CASE WHEN @mCharLen > 12 THEN 12 ELSE @mCharLen END;
+                            SET @mRaw = STUFF(LEFT(N'SampleText_1' + REPLICATE(N'X', @mTarget), @mTarget), @mTarget, 1, N'1');
+                        END
+                        ELSE
+                            SET @mRaw = RIGHT(REPLICATE(N'0', @mCharLen) + N'1', @mCharLen);
+                        SET @happyVal = N'''' + @mRaw + N'''';
+                    END
                     ELSE
                         SET @happyVal = TestGen.GetSampleValueLiteral(@ptype, @pmax, @pprec, @pscale, 0);
                 END
@@ -1281,6 +1298,40 @@ BEGIN
         DECLARE @TC SYSNAME = @TestClassName;
         DECLARE @S NVARCHAR(MAX) = N'';
 
+        -- v11.x: a procedure that NEVER changes row counts (read-only OR UPDATE-only
+        -- - an UPDATE rewrites existing rows, it adds/removes none) is "count-stable".
+        -- Only INSERT/DELETE/MERGE change counts.  Every per-input test of a count-
+        -- stable proc captures each faked table's row count before and after the EXEC
+        -- and asserts they are EQUAL - replacing the old trivial 1=1 placeholder with a
+        -- real before/after check that FAILS if the proc adds or removes rows.
+        DECLARE @v94CountStable BIT =
+            CASE WHEN N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]INSERT[^A-Z0-9_]%'
+                   OR N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]DELETE[^A-Z0-9_]%'
+                   OR N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]MERGE[^A-Z0-9_]%'
+                 THEN 0 ELSE 1 END;
+        DECLARE @PreCnt  NVARCHAR(MAX) = N'';
+        DECLARE @PostCnt NVARCHAR(MAX) = N'';
+        IF @v94CountStable = 1 AND EXISTS (SELECT 1 FROM @Deps WHERE DepKind IN ('TABLE','VIEW'))
+        BEGIN
+            SET @PreCnt  = N'    -- Before/after row-count guard (count-stable proc: adds/removes no rows)' + @CRLF
+                         + N'    CREATE TABLE #rcB (TableName SYSNAME, [RowCount] INT);' + @CRLF
+                         + N'    CREATE TABLE #rcA (TableName SYSNAME, [RowCount] INT);' + @CRLF;
+            DECLARE @cgs SYSNAME, @cgn SYSNAME, @cgf NVARCHAR(300);
+            DECLARE cgcur CURSOR LOCAL FAST_FORWARD FOR
+                SELECT SchemaName, ObjectName FROM @Deps WHERE DepKind IN ('TABLE','VIEW');
+            OPEN cgcur;
+            FETCH NEXT FROM cgcur INTO @cgs, @cgn;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                SET @cgf = QUOTENAME(@cgs) + N'.' + QUOTENAME(@cgn);
+                SET @PreCnt  = @PreCnt  + N'    INSERT #rcB SELECT ''' + @cgn + N''', COUNT(*) FROM ' + @cgf + N';' + @CRLF;
+                SET @PostCnt = @PostCnt + N'    INSERT #rcA SELECT ''' + @cgn + N''', COUNT(*) FROM ' + @cgf + N';' + @CRLF;
+                FETCH NEXT FROM cgcur INTO @cgs, @cgn;
+            END;
+            CLOSE cgcur; DEALLOCATE cgcur;
+            SET @PostCnt = @PostCnt + N'    EXEC tSQLt.AssertEqualsTable ''#rcB'', ''#rcA'';' + @CRLF;
+        END;
+
         SET @S = @S + N'/* ======================================================================' + @CRLF;
         SET @S = @S + N' * Auto-generated tSQLt test class for ' + @FullProc + @CRLF;
         SET @S = @S + N' * Generated on ' + CONVERT(VARCHAR(30), SYSUTCDATETIME(), 126) + N' UTC' + @CRLF;
@@ -1298,13 +1349,21 @@ BEGIN
         SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF;
         SET @S = @S + N'    -- Arrange' + @CRLF + @MockBlock + @CRLF;
         SET @S = @S + ISNULL(@OutputDecls, N'');
-        SET @S = @S + N'    -- Act' + @CRLF;
-        SET @S = @S + N'    EXEC ' + @FullProc;
+        SET @S = @S + @PreCnt;
+        SET @S = @S + N'    -- Act + Assert: run under faked + seeded deps.  A throw fails the test;' + @CRLF;
+        SET @S = @S + N'    -- for a count-stable proc the before/after row-count guard then asserts' + @CRLF;
+        SET @S = @S + N'    -- no rows were added or removed.' + @CRLF;
+        SET @S = @S + N'    BEGIN TRY' + @CRLF;
+        SET @S = @S + N'        EXEC ' + @FullProc;
         IF LEN(@ArgListHappy) > 0
             SET @S = @S + N' ' + @ArgListHappy;
-        SET @S = @S + N';' + @CRLF + @CRLF;
-        SET @S = @S + N'    -- Assert (smoke - did not throw)' + @CRLF;
-        SET @S = @S + N'    EXEC tSQLt.AssertEquals 1, 1, ''Procedure executed without error.'';' + @CRLF;
+        SET @S = @S + N';' + @CRLF;
+        SET @S = @S + N'    END TRY' + @CRLF;
+        SET @S = @S + N'    BEGIN CATCH' + @CRLF;
+        SET @S = @S + N'        DECLARE @failMsg NVARCHAR(MAX) = N''Procedure raised an error on valid inputs: '' + ERROR_MESSAGE();' + @CRLF;
+        SET @S = @S + N'        EXEC tSQLt.Fail @failMsg;' + @CRLF;
+        SET @S = @S + N'    END CATCH;' + @CRLF;
+        SET @S = @S + @PostCnt;
         SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
 
         /* -- Test 2: low / high boundary -------------------------------- */
@@ -1323,11 +1382,23 @@ BEGIN
                        + N' low boundary values]' + @CRLF;
             SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF + @MockBlock + ISNULL(@OutputDecls, N'');
             IF @UseExpectExceptionForInvalid = 1
-                SET @S = @S + N'    -- Proc has input validation; boundary values are expected to be rejected.' + @CRLF
-                            + N'    EXEC tSQLt.ExpectException;' + @CRLF;
-            SET @S = @S + N'    EXEC ' + @FullProc + N' ' + @ArgListBoundary + N';' + @CRLF;
-            IF @UseExpectExceptionForInvalid = 0
-                SET @S = @S + N'    EXEC tSQLt.AssertEquals 1, 1;' + @CRLF;
+            BEGIN
+                SET @S = @S + N'    -- Proc has input validation; boundary values are expected to be rejected.' + @CRLF;
+                SET @S = @S + N'    EXEC tSQLt.ExpectException;' + @CRLF;
+                SET @S = @S + N'    EXEC ' + @FullProc + N' ' + @ArgListBoundary + N';' + @CRLF;
+            END
+            ELSE
+            BEGIN
+                SET @S = @S + @PreCnt;
+                SET @S = @S + N'    BEGIN TRY' + @CRLF;
+                SET @S = @S + N'        EXEC ' + @FullProc + N' ' + @ArgListBoundary + N';' + @CRLF;
+                SET @S = @S + N'    END TRY' + @CRLF;
+                SET @S = @S + N'    BEGIN CATCH' + @CRLF;
+                SET @S = @S + N'        DECLARE @failMsg NVARCHAR(MAX) = N''Procedure raised an error on low-boundary inputs: '' + ERROR_MESSAGE();' + @CRLF;
+                SET @S = @S + N'        EXEC tSQLt.Fail @failMsg;' + @CRLF;
+                SET @S = @S + N'    END CATCH;' + @CRLF;
+                SET @S = @S + @PostCnt;
+            END;
             SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
 
             -- Test 2b: high boundary
@@ -1336,11 +1407,23 @@ BEGIN
                        + N' high boundary values]' + @CRLF;
             SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF + @MockBlock + ISNULL(@OutputDecls, N'');
             IF @UseExpectExceptionForInvalid = 1
-                SET @S = @S + N'    -- Proc has input validation; boundary values are expected to be rejected.' + @CRLF
-                            + N'    EXEC tSQLt.ExpectException;' + @CRLF;
-            SET @S = @S + N'    EXEC ' + @FullProc + N' ' + @ArgListHighBnd + N';' + @CRLF;
-            IF @UseExpectExceptionForInvalid = 0
-                SET @S = @S + N'    EXEC tSQLt.AssertEquals 1, 1;' + @CRLF;
+            BEGIN
+                SET @S = @S + N'    -- Proc has input validation; boundary values are expected to be rejected.' + @CRLF;
+                SET @S = @S + N'    EXEC tSQLt.ExpectException;' + @CRLF;
+                SET @S = @S + N'    EXEC ' + @FullProc + N' ' + @ArgListHighBnd + N';' + @CRLF;
+            END
+            ELSE
+            BEGIN
+                SET @S = @S + @PreCnt;
+                SET @S = @S + N'    BEGIN TRY' + @CRLF;
+                SET @S = @S + N'        EXEC ' + @FullProc + N' ' + @ArgListHighBnd + N';' + @CRLF;
+                SET @S = @S + N'    END TRY' + @CRLF;
+                SET @S = @S + N'    BEGIN CATCH' + @CRLF;
+                SET @S = @S + N'        DECLARE @failMsg NVARCHAR(MAX) = N''Procedure raised an error on high-boundary inputs: '' + ERROR_MESSAGE();' + @CRLF;
+                SET @S = @S + N'        EXEC tSQLt.Fail @failMsg;' + @CRLF;
+                SET @S = @S + N'    END CATCH;' + @CRLF;
+                SET @S = @S + @PostCnt;
+            END;
             SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
         END;
 
@@ -1521,11 +1604,18 @@ BEGIN
             END
             ELSE
             BEGIN
-                SET @S = @S + N'    -- This parameter is not one the procedure is known to' + @CRLF;
-                SET @S = @S + N'    -- validate, so a NULL is not expected to raise; this is a' + @CRLF;
-                SET @S = @S + N'    -- smoke test that the procedure still runs cleanly.' + @CRLF;
-                SET @S = @S + N'    EXEC ' + @FullProc + N' ' + @ArgsNull + N';' + @CRLF;
-                SET @S = @S + N'    EXEC tSQLt.AssertEquals 1, 1;' + @CRLF;
+                SET @S = @S + N'    -- This parameter is not one the procedure is known to validate,' + @CRLF;
+                SET @S = @S + N'    -- so a NULL is not expected to raise.  Run it; the before/after' + @CRLF;
+                SET @S = @S + N'    -- row-count guard asserts no rows were added or removed.' + @CRLF;
+                SET @S = @S + @PreCnt;
+                SET @S = @S + N'    BEGIN TRY' + @CRLF;
+                SET @S = @S + N'        EXEC ' + @FullProc + N' ' + @ArgsNull + N';' + @CRLF;
+                SET @S = @S + N'    END TRY' + @CRLF;
+                SET @S = @S + N'    BEGIN CATCH' + @CRLF;
+                SET @S = @S + N'        DECLARE @failMsg NVARCHAR(MAX) = N''Procedure raised an error on a NULL parameter: '' + ERROR_MESSAGE();' + @CRLF;
+                SET @S = @S + N'        EXEC tSQLt.Fail @failMsg;' + @CRLF;
+                SET @S = @S + N'    END CATCH;' + @CRLF;
+                SET @S = @S + @PostCnt;
             END;
 
             SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
@@ -1537,24 +1627,39 @@ BEGIN
         /* -- Test 4: side-effect isolation on referenced tables --------- */
         IF EXISTS (SELECT 1 FROM @Deps WHERE DepKind IN ('TABLE','VIEW'))
         BEGIN
-            DECLARE @v94IsReadOnly BIT;
-            SET @v94IsReadOnly =
-                CASE WHEN N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]INSERT[^A-Z0-9_]%'
-                       OR N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]UPDATE[^A-Z0-9_]%'
-                       OR N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]DELETE[^A-Z0-9_]%'
-                       OR N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]MERGE[^A-Z0-9_]%'
-                     THEN 0 ELSE 1 END;
-            -- This is an isolation test.  A read-only procedure additionally gets a
-            -- strong per-table "row counts unchanged" assertion below; a DML
-            -- procedure legitimately changes its (faked) tables, so for it this is
-            -- an isolation smoke test - it must run cleanly against faked + seeded
-            -- copies of every dependency (the EXEC below is TRY/CATCH-guarded).
+            -- v11.x: a procedure that NEVER changes row counts (read-only OR
+            -- UPDATE-only - an UPDATE rewrites existing rows, it does not add or
+            -- remove any) gets the strong before/after row-count assertion below.
+            -- Only INSERT / DELETE / MERGE change counts by design, so ONLY those
+            -- are excluded.  (Previously UPDATE was wrongly grouped with them,
+            -- which silently dropped the assertion from every UPDATE proc's test.)
+            -- @v94CountStable is computed once near the top of this procedure.
+            -- v11.x: an UPDATE-only proc additionally asserts that content actually
+            -- CHANGED (count held is necessary but not sufficient).  A hash of each
+            -- directly-referenced table's comparable columns is captured before and
+            -- after; at least one must differ.
+            DECLARE @v94HasUpdate BIT =
+                CASE WHEN @v94CountStable = 1
+                      AND N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]UPDATE[^A-Z0-9_]%'
+                     THEN 1 ELSE 0 END;
+            DECLARE @v94CcCols NVARCHAR(MAX);
+            -- This is an isolation test.  A count-stable procedure (read-only or
+            -- UPDATE-only) additionally gets a strong per-table "row counts held"
+            -- assertion below; an INSERT/DELETE/MERGE procedure legitimately
+            -- changes its (faked) tables' counts, so for it this is an isolation
+            -- smoke test - it must run cleanly against faked + seeded copies of
+            -- every dependency (the EXEC below is TRY/CATCH-guarded).
             SET @S = @S + N'CREATE PROCEDURE ' + QUOTENAME(@TC)
                        + N'.[test ' + @ProcName + N' touches only mocked tables]' + @CRLF;
             SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF + @MockBlock + ISNULL(@OutputDecls, N'');
             SET @S = @S + N'    -- Capture row counts before execution' + @CRLF;
             SET @S = @S + N'    CREATE TABLE #v94_RcBefore (TableName SYSNAME, [RowCount] INT);' + @CRLF;
             SET @S = @S + N'    CREATE TABLE #v94_RcAfter  (TableName SYSNAME, [RowCount] INT);' + @CRLF;
+            IF @v94HasUpdate = 1
+            BEGIN
+                SET @S = @S + N'    CREATE TABLE #v94_HashBefore (TableName SYSNAME, ContentHash INT);' + @CRLF;
+                SET @S = @S + N'    CREATE TABLE #v94_HashAfter  (TableName SYSNAME, ContentHash INT);' + @CRLF;
+            END;
             
             -- Build row count capture for each table dependency
             DECLARE @TableSchema SYSNAME, @TableName SYSNAME, @FullTable NVARCHAR(300);
@@ -1569,6 +1674,20 @@ BEGIN
             BEGIN
                 SET @FullTable = QUOTENAME(@TableSchema) + N'.' + QUOTENAME(@TableName);
                 SET @S = @S + N'    INSERT #v94_RcBefore SELECT ''' + @TableName + N''', COUNT(*) FROM ' + @FullTable + N';' + @CRLF;
+                IF @v94HasUpdate = 1
+                BEGIN
+                    SET @v94CcCols = N'';
+                    SELECT @v94CcCols = @v94CcCols + N', ' + QUOTENAME(c.name)
+                    FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id
+                    WHERE c.object_id = OBJECT_ID(@FullTable)
+                      AND t.name NOT IN ('xml','text','ntext','image','geography','geometry','hierarchyid')
+                    ORDER BY c.column_id;
+                    IF LEN(ISNULL(@v94CcCols,N'')) > 0
+                    BEGIN
+                        SET @v94CcCols = STUFF(@v94CcCols,1,2,N'');
+                        SET @S = @S + N'    INSERT #v94_HashBefore SELECT ''' + @TableName + N''', CHECKSUM_AGG(BINARY_CHECKSUM(' + @v94CcCols + N')) FROM ' + @FullTable + N';' + @CRLF;
+                    END;
+                END;
                 FETCH NEXT FROM tcur INTO @TableSchema, @TableName;
             END;
             CLOSE tcur;
@@ -1595,6 +1714,20 @@ BEGIN
             BEGIN
                 SET @FullTable = QUOTENAME(@TableSchema) + N'.' + QUOTENAME(@TableName);
                 SET @S = @S + N'    INSERT #v94_RcAfter SELECT ''' + @TableName + N''', COUNT(*) FROM ' + @FullTable + N';' + @CRLF;
+                IF @v94HasUpdate = 1
+                BEGIN
+                    SET @v94CcCols = N'';
+                    SELECT @v94CcCols = @v94CcCols + N', ' + QUOTENAME(c.name)
+                    FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id
+                    WHERE c.object_id = OBJECT_ID(@FullTable)
+                      AND t.name NOT IN ('xml','text','ntext','image','geography','geometry','hierarchyid')
+                    ORDER BY c.column_id;
+                    IF LEN(ISNULL(@v94CcCols,N'')) > 0
+                    BEGIN
+                        SET @v94CcCols = STUFF(@v94CcCols,1,2,N'');
+                        SET @S = @S + N'    INSERT #v94_HashAfter SELECT ''' + @TableName + N''', CHECKSUM_AGG(BINARY_CHECKSUM(' + @v94CcCols + N')) FROM ' + @FullTable + N';' + @CRLF;
+                    END;
+                END;
                 FETCH NEXT FROM tcur INTO @TableSchema, @TableName;
             END;
             CLOSE tcur;
@@ -1603,20 +1736,44 @@ BEGIN
             SET @S = @S + N'' + @CRLF;
             SET @S = @S + N'    -- v9.4.2: per-table isolation check (was a cross-table SUM,' + @CRLF;
             SET @S = @S + N'    --         which hid offsetting changes and was never asserted).' + @CRLF;
-            IF @v94IsReadOnly = 1
+            IF @v94CountStable = 1
             BEGIN
-                SET @S = @S + N'    -- Read-only procedure: every faked table''s row count must be' + @CRLF;
-                SET @S = @S + N'    -- identical before and after.  AssertEqualsTable compares the two' + @CRLF;
-                SET @S = @S + N'    -- capture tables row-for-row, so a change in ANY single table is' + @CRLF;
-                SET @S = @S + N'    -- caught - a cross-table sum would hide offsetting changes.' + @CRLF;
+                SET @S = @S + N'    -- Count-stable procedure (read-only or UPDATE-only): an UPDATE' + @CRLF;
+                SET @S = @S + N'    -- rewrites existing rows, it never adds or removes any, so every' + @CRLF;
+                SET @S = @S + N'    -- faked table''s row count must be identical before and after.' + @CRLF;
+                SET @S = @S + N'    -- AssertEqualsTable compares the two capture tables row-for-row,' + @CRLF;
+                SET @S = @S + N'    -- so a change in ANY single table is caught.' + @CRLF;
                 SET @S = @S + N'    EXEC tSQLt.AssertEqualsTable ''#v94_RcBefore'', ''#v94_RcAfter'';' + @CRLF;
+                IF @v94HasUpdate = 1
+                BEGIN
+                    SET @S = @S + N'    -- UPDATE procedure: count held above is necessary but not sufficient;' + @CRLF;
+                    SET @S = @S + N'    -- the proc must also MODIFY content - at least one referenced table''s' + @CRLF;
+                    SET @S = @S + N'    -- comparable-column hash must differ before vs after.  (The seed is' + @CRLF;
+                    SET @S = @S + N'    -- arranged so the UPDATE''s WHERE matches and its SET changes a value;' + @CRLF;
+                    SET @S = @S + N'    -- CLR / LOB columns are excluded from the hash.)' + @CRLF;
+                    SET @S = @S + N'    IF EXISTS (SELECT 1 FROM #v94_HashBefore)' + @CRLF;
+                    SET @S = @S + N'    BEGIN' + @CRLF;
+                    SET @S = @S + N'        DECLARE @v94ContentChanged INT =' + @CRLF;
+                    SET @S = @S + N'            (SELECT COUNT(*) FROM #v94_HashBefore b' + @CRLF;
+                    SET @S = @S + N'             JOIN #v94_HashAfter a ON a.TableName = b.TableName' + @CRLF;
+                    SET @S = @S + N'             WHERE ISNULL(a.ContentHash, -2147483648) <> ISNULL(b.ContentHash, -2147483648));' + @CRLF;
+                    -- v9.4.3: a CASE expression is NOT a legal EXEC parameter value
+                    -- (raises 'Incorrect syntax near CASE'); compute it into a BIT
+                    -- variable first, then pass the variable to AssertEquals.
+                    SET @S = @S + N'        DECLARE @v94Changed INT = CASE WHEN @v94ContentChanged > 0 THEN 1 ELSE 0 END;' + @CRLF;
+                    SET @S = @S + N'        EXEC tSQLt.AssertEquals' + @CRLF;
+                    SET @S = @S + N'             @Expected = 1,' + @CRLF;
+                    SET @S = @S + N'             @Actual   = @v94Changed,' + @CRLF;
+                    SET @S = @S + N'             @Message  = ''UPDATE procedure must modify row content in at least one faked table (before <> after).'';' + @CRLF;
+                    SET @S = @S + N'    END;' + @CRLF;
+                END;
             END
             ELSE
             BEGIN
-                SET @S = @S + N'    -- DML procedure: per-table counts change by design, so there is no' + @CRLF;
-                SET @S = @S + N'    -- counts-unchanged assertion.  The isolation assertion is the' + @CRLF;
-                SET @S = @S + N'    -- TRY/CATCH around the EXEC above; the per-table delta below is' + @CRLF;
-                SET @S = @S + N'    -- printed for reference (specific table effects: see branch tests).' + @CRLF;
+                SET @S = @S + N'    -- INSERT/DELETE/MERGE procedure: row counts change by design, so a' + @CRLF;
+                SET @S = @S + N'    -- counts-held assertion would false-fail.  The isolation assertion is' + @CRLF;
+                SET @S = @S + N'    -- the TRY/CATCH around the EXEC above; the per-table delta below is' + @CRLF;
+                SET @S = @S + N'    -- printed for reference (exact content effect: see characterization scaffold).' + @CRLF;
                 SET @S = @S + N'    DECLARE @v94IsoMsg NVARCHAR(MAX) = N'''';' + @CRLF;
                 SET @S = @S + N'    SELECT @v94IsoMsg = @v94IsoMsg + b.TableName + N'': '' + CAST(b.[RowCount] AS NVARCHAR(12))' + @CRLF;
                 SET @S = @S + N'                       + N'' -> '' + CAST(a.[RowCount] AS NVARCHAR(12)) + N''    ''' + @CRLF;
@@ -1739,9 +1896,16 @@ BEGIN
             SET @S = @S + N'CREATE PROCEDURE ' + QUOTENAME(@TC)
                        + N'.[test ' + @ProcName + N' assigns its OUTPUT parameters]' + @CRLF;
             SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF + @MockBlock + ISNULL(@OutputDecls, N'');
-            SET @S = @S + N'    EXEC ' + @FullProc + N' ' + @ArgListHappy + N';' + @CRLF;
-            SET @S = @S + N'    -- TODO: replace below with type-appropriate AssertEquals checks per OUTPUT param.' + @CRLF;
-            SET @S = @S + N'    EXEC tSQLt.AssertEquals 1, 1;' + @CRLF;
+            SET @S = @S + @PreCnt;
+            SET @S = @S + N'    BEGIN TRY' + @CRLF;
+            SET @S = @S + N'        EXEC ' + @FullProc + N' ' + @ArgListHappy + N';' + @CRLF;
+            SET @S = @S + N'    END TRY' + @CRLF;
+            SET @S = @S + N'    BEGIN CATCH' + @CRLF;
+            SET @S = @S + N'        DECLARE @failMsg NVARCHAR(MAX) = N''Procedure raised an error on valid inputs: '' + ERROR_MESSAGE();' + @CRLF;
+            SET @S = @S + N'        EXEC tSQLt.Fail @failMsg;' + @CRLF;
+            SET @S = @S + N'    END CATCH;' + @CRLF;
+            SET @S = @S + @PostCnt;
+            SET @S = @S + N'    -- TODO: add type-appropriate AssertEquals checks per OUTPUT parameter value.' + @CRLF;
             SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
         END;
 
@@ -1871,7 +2035,23 @@ BEGIN
             SET @S = @S + N'    EXEC TestGen.AssertResultShape @TestClass = ''' + @TC + N''', @ExecSql = @cmd;' + @CRLF;
             SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
 
-            IF @CaptureRows = 1
+            -- v11.x: a golden-master ROW baseline only makes sense for a
+            -- DETERMINISTIC result.  A proc whose output embeds GETDATE/NEWID/
+            -- RAND drifts between the capture run and later runs, so its baseline
+            -- assertion would flap.  Emit the row-baseline test only when the proc
+            -- body has no such non-deterministic source (the shape test + the
+            -- characterization scaffold still apply to non-deterministic procs).
+            DECLARE @v94Deterministic BIT =
+                CASE WHEN UPPER(@ProcSource) LIKE N'%GETDATE%'
+                       OR UPPER(@ProcSource) LIKE N'%SYSDATETIME%'
+                       OR UPPER(@ProcSource) LIKE N'%SYSUTCDATETIME%'
+                       OR UPPER(@ProcSource) LIKE N'%GETUTCDATE%'
+                       OR UPPER(@ProcSource) LIKE N'%CURRENT_TIMESTAMP%'
+                       OR UPPER(@ProcSource) LIKE N'%NEWID%'
+                       OR UPPER(@ProcSource) LIKE N'%NEWSEQUENTIALID%'
+                       OR UPPER(@ProcSource) LIKE N'%RAND(%'
+                     THEN 0 ELSE 1 END;
+            IF @CaptureRows = 1 AND @v94Deterministic = 1
             BEGIN
                 -- Test 8: golden rows.
                 -- Build the #ActualResult column list from the captured shape.
@@ -1895,6 +2075,15 @@ BEGIN
                 SET @S = @S + N'        PRINT ''NOTE: result set is EMPTY for the generated seed/args - the baseline comparison is trivial; design a seed that returns rows.'';' + @CRLF;
                 SET @S = @S + N'    EXEC TestGen.AssertResultRowsMatchBaseline @TestClass = ''' + @TC + N''';' + @CRLF;
                 SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
+
+                -- v11.x: persist the EXPECTED baseline NOW (generation time, outside
+                -- any tSQLt rollback) so the row-baseline test above ASSERTS the proc's
+                -- seeded output instead of capturing-and-passing (the in-test capture
+                -- is undone by tSQLt's per-test rollback).
+                IF @ExecuteScript = 1
+                BEGIN TRY
+                    EXEC TestGen.CaptureResultBaseline @TestClass = @TC, @MockSql = @MockBlock, @ExecSql = @describeSql;
+                END TRY BEGIN CATCH PRINT 'CaptureResultBaseline skipped for ' + @TC + ': ' + ERROR_MESSAGE(); END CATCH;
             END;
 
             IF @EmitScaffold = 1
@@ -3712,7 +3901,7 @@ GO
 CREATE PROCEDURE TestGen.GenerateAndRunCoverage
     @SchemaName                    SYSNAME,
     @ProcName                      SYSNAME,
-    @CaptureRows                   BIT           = 0,
+    @CaptureRows                   BIT           = 1,
     @EmitNegativeTests             BIT           = 1,
     @AssertExceptionOnInvalidInputs BIT          = 1,
     @EmitNullChecks                BIT           = 1,

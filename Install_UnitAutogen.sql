@@ -1408,8 +1408,15 @@ BEGIN
     WHERE TestClass = @TestClass;
 
     INSERT #ActualShape (ColumnOrdinal, ColumnName, SqlTypeName, MaxLength, [Precision], Scale, IsNullable)
-    SELECT column_ordinal, name, system_type_name, max_length,
-           [precision], scale, is_nullable
+    SELECT column_ordinal, name,
+           -- v9.4.3: compare the BARE type name to match the baseline, which
+           -- stores TYPE_NAME() with no length/precision suffix.  dm_exec_describe
+           -- returns the full form such as nvarchar followed by (40); strip from
+           -- the open paren CHAR(40) onward so only the type name is compared.
+           -- Size is still asserted via MaxLength/Precision/Scale, nothing lost.
+           LEFT(system_type_name,
+                ISNULL(NULLIF(CHARINDEX(CHAR(40), system_type_name), 0) - 1, LEN(system_type_name))),
+           max_length, [precision], scale, is_nullable
     FROM sys.dm_exec_describe_first_result_set(@ExecSql, NULL, 0);
 
     DECLARE @msg NVARCHAR(400) =
@@ -1679,6 +1686,75 @@ END;
 GO
 
 PRINT 'TestGen.BlessBaseline installed.';
+GO
+
+
+/* === Result-baseline persistent capture (v11.x) === */
+GO
+CREATE OR ALTER PROCEDURE TestGen.CaptureResultBaseline
+    @TestClass SYSNAME,
+    @MockSql   NVARCHAR(MAX),    -- the FakeTable + seed block (same the test uses)
+    @ExecSql   NVARCHAR(MAX)     -- e.g. N'EXEC dbo.MyProc @p = 1'
+AS
+BEGIN
+    -- Persist the EXPECTED result baseline OUTSIDE any tSQLt per-test rollback, so
+    -- the generated 'returns rows matching baseline' test ASSERTS instead of
+    -- capturing-and-passing.  Fakes + seeds inside a savepoint, runs the proc,
+    -- copies the rows into TABLE VARIABLES (which survive the rollback), rolls the
+    -- faking back, then persists.  The real tables are never modified.
+    SET NOCOUNT ON;
+    DECLARE @ddl NVARCHAR(MAX) = N'';
+    SELECT @ddl = @ddl + N', ' + QUOTENAME(ISNULL(name, N'Col'+CAST(column_ordinal AS NVARCHAR(5)))) + N' ' + system_type_name
+    FROM sys.dm_exec_describe_first_result_set(@ExecSql, NULL, 0)
+    WHERE name IS NOT NULL OR system_type_name IS NOT NULL
+    ORDER BY column_ordinal;
+    IF LEN(ISNULL(@ddl,N'')) = 0 BEGIN PRINT 'CaptureResultBaseline: no result set for ' + @TestClass; RETURN; END;
+    SET @ddl = STUFF(@ddl,1,2,N'');
+
+    IF OBJECT_ID('tempdb..##tgbase') IS NOT NULL DROP TABLE ##tgbase;
+    IF OBJECT_ID('tempdb..##tgjson') IS NOT NULL DROP TABLE ##tgjson;
+    EXEC('CREATE TABLE ##tgbase (' + @ddl + ');');
+    CREATE TABLE ##tgjson (RowOrdinal INT, RowJson NVARCHAR(MAX));
+
+    DECLARE @rows  TABLE (RowOrdinal INT, RowJson NVARCHAR(MAX));
+    DECLARE @shape TABLE (ColumnOrdinal INT, ColumnName SYSNAME NULL, SqlTypeName SYSNAME, MaxLength SMALLINT, Prec TINYINT, Scal TINYINT, IsNullable BIT);
+    DECLARE @started BIT = 0;
+    BEGIN TRY
+        IF @@TRANCOUNT = 0 BEGIN BEGIN TRANSACTION; SET @started = 1; END;
+        SAVE TRANSACTION tgcap;
+        EXEC sys.sp_executesql @MockSql;
+        EXEC('INSERT ##tgbase ' + @ExecSql);
+        EXEC sys.sp_executesql N'INSERT ##tgjson (RowOrdinal, RowJson)
+            SELECT ROW_NUMBER() OVER (ORDER BY (SELECT 1)),
+                   (SELECT x.* FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES)
+            FROM ##tgbase x;';
+        INSERT @rows (RowOrdinal, RowJson) SELECT RowOrdinal, RowJson FROM ##tgjson;
+        INSERT @shape (ColumnOrdinal, ColumnName, SqlTypeName, MaxLength, Prec, Scal, IsNullable)
+            SELECT c.column_id, c.name, TYPE_NAME(c.user_type_id), c.max_length, c.precision, c.scale, c.is_nullable
+            FROM tempdb.sys.columns c WHERE c.object_id = OBJECT_ID('tempdb..##tgbase') ORDER BY c.column_id;
+        ROLLBACK TRANSACTION tgcap;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() = -1 ROLLBACK TRANSACTION;
+        ELSE IF XACT_STATE() = 1 ROLLBACK TRANSACTION tgcap;
+        PRINT 'CaptureResultBaseline failed for ' + @TestClass + ': ' + ERROR_MESSAGE();
+    END CATCH;
+    IF @started = 1 AND @@TRANCOUNT > 0 COMMIT;
+    IF OBJECT_ID('tempdb..##tgbase') IS NOT NULL DROP TABLE ##tgbase;
+    IF OBJECT_ID('tempdb..##tgjson') IS NOT NULL DROP TABLE ##tgjson;
+
+    DELETE FROM TestGenLog.ResultShapeBaseline WHERE TestClass = @TestClass;
+    INSERT TestGenLog.ResultShapeBaseline (TestClass, ColumnOrdinal, ColumnName, SqlTypeName, MaxLength, [Precision], Scale, IsNullable)
+        SELECT @TestClass, ColumnOrdinal, ColumnName, SqlTypeName, MaxLength, Prec, Scal, IsNullable FROM @shape;
+    DELETE FROM TestGenLog.ResultRowsBaseline WHERE TestClass = @TestClass;
+    INSERT TestGenLog.ResultRowsBaseline (TestClass, RowOrdinal, RowJson)
+        SELECT @TestClass, RowOrdinal, RowJson FROM @rows;
+    DECLARE @nc INT = (SELECT COUNT(*) FROM @shape);
+    DECLARE @nr INT = (SELECT COUNT(*) FROM @rows);
+    PRINT 'CaptureResultBaseline: ' + @TestClass + ' captured ' + CAST(@nc AS VARCHAR) + ' col(s), ' + CAST(@nr AS VARCHAR) + ' row(s).';
+END;
+GO
+PRINT 'TestGen.CaptureResultBaseline installed.';
 GO
 
 
@@ -3751,7 +3827,7 @@ CREATE PROCEDURE TestGen.GenerateTestsForProcedure
     @ProcName                      SYSNAME,
     @TestClassName                 SYSNAME       = NULL,
     @ExecuteScript                 BIT           = 1,
-    @CaptureRows                   BIT           = 0,    -- when 1, also emit a golden-row baseline test
+    @CaptureRows                   BIT           = 1,    -- golden-row baseline ON: matched key args now align with the seed (procs return rows), so the captured baseline is meaningful (validated: CustOrderHist -> 1 row on Northwind).
     @EmitNegativeTests             BIT           = 1,    -- when 1, scan source for RAISERROR/THROW and emit ExpectException tests
     @AssertExceptionOnInvalidInputs BIT          = 1,    -- when 1, boundary + NULL-for-matched-param tests expect an exception (only if the proc has detected error paths)
     @EmitNullChecks                BIT           = 1,    -- when 0, do not emit the NULL-rejection tests
@@ -4559,6 +4635,7 @@ BEGIN
         -- and subsequent loop iterations keep the prior value.
         DECLARE @matched  BIT;
         DECLARE @happyVal NVARCHAR(400);
+        DECLARE @mCharLen INT, @mTarget INT, @mRaw NVARCHAR(220);   -- v11.x: matched-key arg row-1 seed value
 
         DECLARE pcur CURSOR LOCAL FAST_FORWARD FOR
             SELECT ParamId, ParamName, SqlTypeName, MaxLength, [Precision], Scale, IsOutput, IsNullable
@@ -4586,12 +4663,28 @@ BEGIN
 
                 IF @matched = 1
                 BEGIN
-                    -- Pin to "1" - the first seeded integer value. For strings
-                    -- the seeder writes 'SampleText_1' / 'Sa1' / etc.; for now
-                    -- we only override int-like params because string-key
-                    -- matching is much rarer and trickier.
+                    -- v11.x: line the happy arg up with the SEEDER's ROW-1 value for
+                    -- this matched key column, so  WHERE col = @param  matches a seeded
+                    -- row and the proc returns rows.  Previously string keys fell back
+                    -- to the generic 'Sam', which never matched the seed 'Samp1' (=> 0
+                    -- rows).  The formula here mirrors the seeder's row-1 logic exactly.
                     IF LOWER(@ptype) IN ('int','bigint','smallint','tinyint')
                         SET @happyVal = N'1';
+                    ELSE IF LOWER(@ptype) IN ('char','varchar','nchar','nvarchar')
+                    BEGIN
+                        SET @mCharLen = CASE WHEN @pmax = -1 THEN 200
+                                             WHEN LOWER(@ptype) IN ('nchar','nvarchar') THEN @pmax / 2
+                                             ELSE @pmax END;
+                        IF @mCharLen IS NULL OR @mCharLen < 1 SET @mCharLen = 1;
+                        IF @mCharLen >= 3
+                        BEGIN
+                            SET @mTarget = CASE WHEN @mCharLen > 12 THEN 12 ELSE @mCharLen END;
+                            SET @mRaw = STUFF(LEFT(N'SampleText_1' + REPLICATE(N'X', @mTarget), @mTarget), @mTarget, 1, N'1');
+                        END
+                        ELSE
+                            SET @mRaw = RIGHT(REPLICATE(N'0', @mCharLen) + N'1', @mCharLen);
+                        SET @happyVal = N'''' + @mRaw + N'''';
+                    END
                     ELSE
                         SET @happyVal = TestGen.GetSampleValueLiteral(@ptype, @pmax, @pprec, @pscale, 0);
                 END
@@ -4973,6 +5066,40 @@ BEGIN
         DECLARE @TC SYSNAME = @TestClassName;
         DECLARE @S NVARCHAR(MAX) = N'';
 
+        -- v11.x: a procedure that NEVER changes row counts (read-only OR UPDATE-only
+        -- - an UPDATE rewrites existing rows, it adds/removes none) is "count-stable".
+        -- Only INSERT/DELETE/MERGE change counts.  Every per-input test of a count-
+        -- stable proc captures each faked table's row count before and after the EXEC
+        -- and asserts they are EQUAL - replacing the old trivial 1=1 placeholder with a
+        -- real before/after check that FAILS if the proc adds or removes rows.
+        DECLARE @v94CountStable BIT =
+            CASE WHEN N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]INSERT[^A-Z0-9_]%'
+                   OR N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]DELETE[^A-Z0-9_]%'
+                   OR N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]MERGE[^A-Z0-9_]%'
+                 THEN 0 ELSE 1 END;
+        DECLARE @PreCnt  NVARCHAR(MAX) = N'';
+        DECLARE @PostCnt NVARCHAR(MAX) = N'';
+        IF @v94CountStable = 1 AND EXISTS (SELECT 1 FROM @Deps WHERE DepKind IN ('TABLE','VIEW'))
+        BEGIN
+            SET @PreCnt  = N'    -- Before/after row-count guard (count-stable proc: adds/removes no rows)' + @CRLF
+                         + N'    CREATE TABLE #rcB (TableName SYSNAME, [RowCount] INT);' + @CRLF
+                         + N'    CREATE TABLE #rcA (TableName SYSNAME, [RowCount] INT);' + @CRLF;
+            DECLARE @cgs SYSNAME, @cgn SYSNAME, @cgf NVARCHAR(300);
+            DECLARE cgcur CURSOR LOCAL FAST_FORWARD FOR
+                SELECT SchemaName, ObjectName FROM @Deps WHERE DepKind IN ('TABLE','VIEW');
+            OPEN cgcur;
+            FETCH NEXT FROM cgcur INTO @cgs, @cgn;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                SET @cgf = QUOTENAME(@cgs) + N'.' + QUOTENAME(@cgn);
+                SET @PreCnt  = @PreCnt  + N'    INSERT #rcB SELECT ''' + @cgn + N''', COUNT(*) FROM ' + @cgf + N';' + @CRLF;
+                SET @PostCnt = @PostCnt + N'    INSERT #rcA SELECT ''' + @cgn + N''', COUNT(*) FROM ' + @cgf + N';' + @CRLF;
+                FETCH NEXT FROM cgcur INTO @cgs, @cgn;
+            END;
+            CLOSE cgcur; DEALLOCATE cgcur;
+            SET @PostCnt = @PostCnt + N'    EXEC tSQLt.AssertEqualsTable ''#rcB'', ''#rcA'';' + @CRLF;
+        END;
+
         SET @S = @S + N'/* ======================================================================' + @CRLF;
         SET @S = @S + N' * Auto-generated tSQLt test class for ' + @FullProc + @CRLF;
         SET @S = @S + N' * Generated on ' + CONVERT(VARCHAR(30), SYSUTCDATETIME(), 126) + N' UTC' + @CRLF;
@@ -4990,13 +5117,21 @@ BEGIN
         SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF;
         SET @S = @S + N'    -- Arrange' + @CRLF + @MockBlock + @CRLF;
         SET @S = @S + ISNULL(@OutputDecls, N'');
-        SET @S = @S + N'    -- Act' + @CRLF;
-        SET @S = @S + N'    EXEC ' + @FullProc;
+        SET @S = @S + @PreCnt;
+        SET @S = @S + N'    -- Act + Assert: run under faked + seeded deps.  A throw fails the test;' + @CRLF;
+        SET @S = @S + N'    -- for a count-stable proc the before/after row-count guard then asserts' + @CRLF;
+        SET @S = @S + N'    -- no rows were added or removed.' + @CRLF;
+        SET @S = @S + N'    BEGIN TRY' + @CRLF;
+        SET @S = @S + N'        EXEC ' + @FullProc;
         IF LEN(@ArgListHappy) > 0
             SET @S = @S + N' ' + @ArgListHappy;
-        SET @S = @S + N';' + @CRLF + @CRLF;
-        SET @S = @S + N'    -- Assert (smoke - did not throw)' + @CRLF;
-        SET @S = @S + N'    EXEC tSQLt.AssertEquals 1, 1, ''Procedure executed without error.'';' + @CRLF;
+        SET @S = @S + N';' + @CRLF;
+        SET @S = @S + N'    END TRY' + @CRLF;
+        SET @S = @S + N'    BEGIN CATCH' + @CRLF;
+        SET @S = @S + N'        DECLARE @failMsg NVARCHAR(MAX) = N''Procedure raised an error on valid inputs: '' + ERROR_MESSAGE();' + @CRLF;
+        SET @S = @S + N'        EXEC tSQLt.Fail @failMsg;' + @CRLF;
+        SET @S = @S + N'    END CATCH;' + @CRLF;
+        SET @S = @S + @PostCnt;
         SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
 
         /* -- Test 2: low / high boundary -------------------------------- */
@@ -5015,11 +5150,23 @@ BEGIN
                        + N' low boundary values]' + @CRLF;
             SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF + @MockBlock + ISNULL(@OutputDecls, N'');
             IF @UseExpectExceptionForInvalid = 1
-                SET @S = @S + N'    -- Proc has input validation; boundary values are expected to be rejected.' + @CRLF
-                            + N'    EXEC tSQLt.ExpectException;' + @CRLF;
-            SET @S = @S + N'    EXEC ' + @FullProc + N' ' + @ArgListBoundary + N';' + @CRLF;
-            IF @UseExpectExceptionForInvalid = 0
-                SET @S = @S + N'    EXEC tSQLt.AssertEquals 1, 1;' + @CRLF;
+            BEGIN
+                SET @S = @S + N'    -- Proc has input validation; boundary values are expected to be rejected.' + @CRLF;
+                SET @S = @S + N'    EXEC tSQLt.ExpectException;' + @CRLF;
+                SET @S = @S + N'    EXEC ' + @FullProc + N' ' + @ArgListBoundary + N';' + @CRLF;
+            END
+            ELSE
+            BEGIN
+                SET @S = @S + @PreCnt;
+                SET @S = @S + N'    BEGIN TRY' + @CRLF;
+                SET @S = @S + N'        EXEC ' + @FullProc + N' ' + @ArgListBoundary + N';' + @CRLF;
+                SET @S = @S + N'    END TRY' + @CRLF;
+                SET @S = @S + N'    BEGIN CATCH' + @CRLF;
+                SET @S = @S + N'        DECLARE @failMsg NVARCHAR(MAX) = N''Procedure raised an error on low-boundary inputs: '' + ERROR_MESSAGE();' + @CRLF;
+                SET @S = @S + N'        EXEC tSQLt.Fail @failMsg;' + @CRLF;
+                SET @S = @S + N'    END CATCH;' + @CRLF;
+                SET @S = @S + @PostCnt;
+            END;
             SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
 
             -- Test 2b: high boundary
@@ -5028,11 +5175,23 @@ BEGIN
                        + N' high boundary values]' + @CRLF;
             SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF + @MockBlock + ISNULL(@OutputDecls, N'');
             IF @UseExpectExceptionForInvalid = 1
-                SET @S = @S + N'    -- Proc has input validation; boundary values are expected to be rejected.' + @CRLF
-                            + N'    EXEC tSQLt.ExpectException;' + @CRLF;
-            SET @S = @S + N'    EXEC ' + @FullProc + N' ' + @ArgListHighBnd + N';' + @CRLF;
-            IF @UseExpectExceptionForInvalid = 0
-                SET @S = @S + N'    EXEC tSQLt.AssertEquals 1, 1;' + @CRLF;
+            BEGIN
+                SET @S = @S + N'    -- Proc has input validation; boundary values are expected to be rejected.' + @CRLF;
+                SET @S = @S + N'    EXEC tSQLt.ExpectException;' + @CRLF;
+                SET @S = @S + N'    EXEC ' + @FullProc + N' ' + @ArgListHighBnd + N';' + @CRLF;
+            END
+            ELSE
+            BEGIN
+                SET @S = @S + @PreCnt;
+                SET @S = @S + N'    BEGIN TRY' + @CRLF;
+                SET @S = @S + N'        EXEC ' + @FullProc + N' ' + @ArgListHighBnd + N';' + @CRLF;
+                SET @S = @S + N'    END TRY' + @CRLF;
+                SET @S = @S + N'    BEGIN CATCH' + @CRLF;
+                SET @S = @S + N'        DECLARE @failMsg NVARCHAR(MAX) = N''Procedure raised an error on high-boundary inputs: '' + ERROR_MESSAGE();' + @CRLF;
+                SET @S = @S + N'        EXEC tSQLt.Fail @failMsg;' + @CRLF;
+                SET @S = @S + N'    END CATCH;' + @CRLF;
+                SET @S = @S + @PostCnt;
+            END;
             SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
         END;
 
@@ -5213,11 +5372,18 @@ BEGIN
             END
             ELSE
             BEGIN
-                SET @S = @S + N'    -- This parameter is not one the procedure is known to' + @CRLF;
-                SET @S = @S + N'    -- validate, so a NULL is not expected to raise; this is a' + @CRLF;
-                SET @S = @S + N'    -- smoke test that the procedure still runs cleanly.' + @CRLF;
-                SET @S = @S + N'    EXEC ' + @FullProc + N' ' + @ArgsNull + N';' + @CRLF;
-                SET @S = @S + N'    EXEC tSQLt.AssertEquals 1, 1;' + @CRLF;
+                SET @S = @S + N'    -- This parameter is not one the procedure is known to validate,' + @CRLF;
+                SET @S = @S + N'    -- so a NULL is not expected to raise.  Run it; the before/after' + @CRLF;
+                SET @S = @S + N'    -- row-count guard asserts no rows were added or removed.' + @CRLF;
+                SET @S = @S + @PreCnt;
+                SET @S = @S + N'    BEGIN TRY' + @CRLF;
+                SET @S = @S + N'        EXEC ' + @FullProc + N' ' + @ArgsNull + N';' + @CRLF;
+                SET @S = @S + N'    END TRY' + @CRLF;
+                SET @S = @S + N'    BEGIN CATCH' + @CRLF;
+                SET @S = @S + N'        DECLARE @failMsg NVARCHAR(MAX) = N''Procedure raised an error on a NULL parameter: '' + ERROR_MESSAGE();' + @CRLF;
+                SET @S = @S + N'        EXEC tSQLt.Fail @failMsg;' + @CRLF;
+                SET @S = @S + N'    END CATCH;' + @CRLF;
+                SET @S = @S + @PostCnt;
             END;
 
             SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
@@ -5229,24 +5395,39 @@ BEGIN
         /* -- Test 4: side-effect isolation on referenced tables --------- */
         IF EXISTS (SELECT 1 FROM @Deps WHERE DepKind IN ('TABLE','VIEW'))
         BEGIN
-            DECLARE @v94IsReadOnly BIT;
-            SET @v94IsReadOnly =
-                CASE WHEN N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]INSERT[^A-Z0-9_]%'
-                       OR N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]UPDATE[^A-Z0-9_]%'
-                       OR N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]DELETE[^A-Z0-9_]%'
-                       OR N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]MERGE[^A-Z0-9_]%'
-                     THEN 0 ELSE 1 END;
-            -- This is an isolation test.  A read-only procedure additionally gets a
-            -- strong per-table "row counts unchanged" assertion below; a DML
-            -- procedure legitimately changes its (faked) tables, so for it this is
-            -- an isolation smoke test - it must run cleanly against faked + seeded
-            -- copies of every dependency (the EXEC below is TRY/CATCH-guarded).
+            -- v11.x: a procedure that NEVER changes row counts (read-only OR
+            -- UPDATE-only - an UPDATE rewrites existing rows, it does not add or
+            -- remove any) gets the strong before/after row-count assertion below.
+            -- Only INSERT / DELETE / MERGE change counts by design, so ONLY those
+            -- are excluded.  (Previously UPDATE was wrongly grouped with them,
+            -- which silently dropped the assertion from every UPDATE proc's test.)
+            -- @v94CountStable is computed once near the top of this procedure.
+            -- v11.x: an UPDATE-only proc additionally asserts that content actually
+            -- CHANGED (count held is necessary but not sufficient).  A hash of each
+            -- directly-referenced table's comparable columns is captured before and
+            -- after; at least one must differ.
+            DECLARE @v94HasUpdate BIT =
+                CASE WHEN @v94CountStable = 1
+                      AND N' ' + UPPER(@ProcSource) + N' ' LIKE N'%[^A-Z0-9_]UPDATE[^A-Z0-9_]%'
+                     THEN 1 ELSE 0 END;
+            DECLARE @v94CcCols NVARCHAR(MAX);
+            -- This is an isolation test.  A count-stable procedure (read-only or
+            -- UPDATE-only) additionally gets a strong per-table "row counts held"
+            -- assertion below; an INSERT/DELETE/MERGE procedure legitimately
+            -- changes its (faked) tables' counts, so for it this is an isolation
+            -- smoke test - it must run cleanly against faked + seeded copies of
+            -- every dependency (the EXEC below is TRY/CATCH-guarded).
             SET @S = @S + N'CREATE PROCEDURE ' + QUOTENAME(@TC)
                        + N'.[test ' + @ProcName + N' touches only mocked tables]' + @CRLF;
             SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF + @MockBlock + ISNULL(@OutputDecls, N'');
             SET @S = @S + N'    -- Capture row counts before execution' + @CRLF;
             SET @S = @S + N'    CREATE TABLE #v94_RcBefore (TableName SYSNAME, [RowCount] INT);' + @CRLF;
             SET @S = @S + N'    CREATE TABLE #v94_RcAfter  (TableName SYSNAME, [RowCount] INT);' + @CRLF;
+            IF @v94HasUpdate = 1
+            BEGIN
+                SET @S = @S + N'    CREATE TABLE #v94_HashBefore (TableName SYSNAME, ContentHash INT);' + @CRLF;
+                SET @S = @S + N'    CREATE TABLE #v94_HashAfter  (TableName SYSNAME, ContentHash INT);' + @CRLF;
+            END;
             
             -- Build row count capture for each table dependency
             DECLARE @TableSchema SYSNAME, @TableName SYSNAME, @FullTable NVARCHAR(300);
@@ -5261,6 +5442,20 @@ BEGIN
             BEGIN
                 SET @FullTable = QUOTENAME(@TableSchema) + N'.' + QUOTENAME(@TableName);
                 SET @S = @S + N'    INSERT #v94_RcBefore SELECT ''' + @TableName + N''', COUNT(*) FROM ' + @FullTable + N';' + @CRLF;
+                IF @v94HasUpdate = 1
+                BEGIN
+                    SET @v94CcCols = N'';
+                    SELECT @v94CcCols = @v94CcCols + N', ' + QUOTENAME(c.name)
+                    FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id
+                    WHERE c.object_id = OBJECT_ID(@FullTable)
+                      AND t.name NOT IN ('xml','text','ntext','image','geography','geometry','hierarchyid')
+                    ORDER BY c.column_id;
+                    IF LEN(ISNULL(@v94CcCols,N'')) > 0
+                    BEGIN
+                        SET @v94CcCols = STUFF(@v94CcCols,1,2,N'');
+                        SET @S = @S + N'    INSERT #v94_HashBefore SELECT ''' + @TableName + N''', CHECKSUM_AGG(BINARY_CHECKSUM(' + @v94CcCols + N')) FROM ' + @FullTable + N';' + @CRLF;
+                    END;
+                END;
                 FETCH NEXT FROM tcur INTO @TableSchema, @TableName;
             END;
             CLOSE tcur;
@@ -5287,6 +5482,20 @@ BEGIN
             BEGIN
                 SET @FullTable = QUOTENAME(@TableSchema) + N'.' + QUOTENAME(@TableName);
                 SET @S = @S + N'    INSERT #v94_RcAfter SELECT ''' + @TableName + N''', COUNT(*) FROM ' + @FullTable + N';' + @CRLF;
+                IF @v94HasUpdate = 1
+                BEGIN
+                    SET @v94CcCols = N'';
+                    SELECT @v94CcCols = @v94CcCols + N', ' + QUOTENAME(c.name)
+                    FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id
+                    WHERE c.object_id = OBJECT_ID(@FullTable)
+                      AND t.name NOT IN ('xml','text','ntext','image','geography','geometry','hierarchyid')
+                    ORDER BY c.column_id;
+                    IF LEN(ISNULL(@v94CcCols,N'')) > 0
+                    BEGIN
+                        SET @v94CcCols = STUFF(@v94CcCols,1,2,N'');
+                        SET @S = @S + N'    INSERT #v94_HashAfter SELECT ''' + @TableName + N''', CHECKSUM_AGG(BINARY_CHECKSUM(' + @v94CcCols + N')) FROM ' + @FullTable + N';' + @CRLF;
+                    END;
+                END;
                 FETCH NEXT FROM tcur INTO @TableSchema, @TableName;
             END;
             CLOSE tcur;
@@ -5295,20 +5504,44 @@ BEGIN
             SET @S = @S + N'' + @CRLF;
             SET @S = @S + N'    -- v9.4.2: per-table isolation check (was a cross-table SUM,' + @CRLF;
             SET @S = @S + N'    --         which hid offsetting changes and was never asserted).' + @CRLF;
-            IF @v94IsReadOnly = 1
+            IF @v94CountStable = 1
             BEGIN
-                SET @S = @S + N'    -- Read-only procedure: every faked table''s row count must be' + @CRLF;
-                SET @S = @S + N'    -- identical before and after.  AssertEqualsTable compares the two' + @CRLF;
-                SET @S = @S + N'    -- capture tables row-for-row, so a change in ANY single table is' + @CRLF;
-                SET @S = @S + N'    -- caught - a cross-table sum would hide offsetting changes.' + @CRLF;
+                SET @S = @S + N'    -- Count-stable procedure (read-only or UPDATE-only): an UPDATE' + @CRLF;
+                SET @S = @S + N'    -- rewrites existing rows, it never adds or removes any, so every' + @CRLF;
+                SET @S = @S + N'    -- faked table''s row count must be identical before and after.' + @CRLF;
+                SET @S = @S + N'    -- AssertEqualsTable compares the two capture tables row-for-row,' + @CRLF;
+                SET @S = @S + N'    -- so a change in ANY single table is caught.' + @CRLF;
                 SET @S = @S + N'    EXEC tSQLt.AssertEqualsTable ''#v94_RcBefore'', ''#v94_RcAfter'';' + @CRLF;
+                IF @v94HasUpdate = 1
+                BEGIN
+                    SET @S = @S + N'    -- UPDATE procedure: count held above is necessary but not sufficient;' + @CRLF;
+                    SET @S = @S + N'    -- the proc must also MODIFY content - at least one referenced table''s' + @CRLF;
+                    SET @S = @S + N'    -- comparable-column hash must differ before vs after.  (The seed is' + @CRLF;
+                    SET @S = @S + N'    -- arranged so the UPDATE''s WHERE matches and its SET changes a value;' + @CRLF;
+                    SET @S = @S + N'    -- CLR / LOB columns are excluded from the hash.)' + @CRLF;
+                    SET @S = @S + N'    IF EXISTS (SELECT 1 FROM #v94_HashBefore)' + @CRLF;
+                    SET @S = @S + N'    BEGIN' + @CRLF;
+                    SET @S = @S + N'        DECLARE @v94ContentChanged INT =' + @CRLF;
+                    SET @S = @S + N'            (SELECT COUNT(*) FROM #v94_HashBefore b' + @CRLF;
+                    SET @S = @S + N'             JOIN #v94_HashAfter a ON a.TableName = b.TableName' + @CRLF;
+                    SET @S = @S + N'             WHERE ISNULL(a.ContentHash, -2147483648) <> ISNULL(b.ContentHash, -2147483648));' + @CRLF;
+                    -- v9.4.3: a CASE expression is NOT a legal EXEC parameter value
+                    -- (raises 'Incorrect syntax near CASE'); compute it into a BIT
+                    -- variable first, then pass the variable to AssertEquals.
+                    SET @S = @S + N'        DECLARE @v94Changed INT = CASE WHEN @v94ContentChanged > 0 THEN 1 ELSE 0 END;' + @CRLF;
+                    SET @S = @S + N'        EXEC tSQLt.AssertEquals' + @CRLF;
+                    SET @S = @S + N'             @Expected = 1,' + @CRLF;
+                    SET @S = @S + N'             @Actual   = @v94Changed,' + @CRLF;
+                    SET @S = @S + N'             @Message  = ''UPDATE procedure must modify row content in at least one faked table (before <> after).'';' + @CRLF;
+                    SET @S = @S + N'    END;' + @CRLF;
+                END;
             END
             ELSE
             BEGIN
-                SET @S = @S + N'    -- DML procedure: per-table counts change by design, so there is no' + @CRLF;
-                SET @S = @S + N'    -- counts-unchanged assertion.  The isolation assertion is the' + @CRLF;
-                SET @S = @S + N'    -- TRY/CATCH around the EXEC above; the per-table delta below is' + @CRLF;
-                SET @S = @S + N'    -- printed for reference (specific table effects: see branch tests).' + @CRLF;
+                SET @S = @S + N'    -- INSERT/DELETE/MERGE procedure: row counts change by design, so a' + @CRLF;
+                SET @S = @S + N'    -- counts-held assertion would false-fail.  The isolation assertion is' + @CRLF;
+                SET @S = @S + N'    -- the TRY/CATCH around the EXEC above; the per-table delta below is' + @CRLF;
+                SET @S = @S + N'    -- printed for reference (exact content effect: see characterization scaffold).' + @CRLF;
                 SET @S = @S + N'    DECLARE @v94IsoMsg NVARCHAR(MAX) = N'''';' + @CRLF;
                 SET @S = @S + N'    SELECT @v94IsoMsg = @v94IsoMsg + b.TableName + N'': '' + CAST(b.[RowCount] AS NVARCHAR(12))' + @CRLF;
                 SET @S = @S + N'                       + N'' -> '' + CAST(a.[RowCount] AS NVARCHAR(12)) + N''    ''' + @CRLF;
@@ -5431,9 +5664,16 @@ BEGIN
             SET @S = @S + N'CREATE PROCEDURE ' + QUOTENAME(@TC)
                        + N'.[test ' + @ProcName + N' assigns its OUTPUT parameters]' + @CRLF;
             SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF + @MockBlock + ISNULL(@OutputDecls, N'');
-            SET @S = @S + N'    EXEC ' + @FullProc + N' ' + @ArgListHappy + N';' + @CRLF;
-            SET @S = @S + N'    -- TODO: replace below with type-appropriate AssertEquals checks per OUTPUT param.' + @CRLF;
-            SET @S = @S + N'    EXEC tSQLt.AssertEquals 1, 1;' + @CRLF;
+            SET @S = @S + @PreCnt;
+            SET @S = @S + N'    BEGIN TRY' + @CRLF;
+            SET @S = @S + N'        EXEC ' + @FullProc + N' ' + @ArgListHappy + N';' + @CRLF;
+            SET @S = @S + N'    END TRY' + @CRLF;
+            SET @S = @S + N'    BEGIN CATCH' + @CRLF;
+            SET @S = @S + N'        DECLARE @failMsg NVARCHAR(MAX) = N''Procedure raised an error on valid inputs: '' + ERROR_MESSAGE();' + @CRLF;
+            SET @S = @S + N'        EXEC tSQLt.Fail @failMsg;' + @CRLF;
+            SET @S = @S + N'    END CATCH;' + @CRLF;
+            SET @S = @S + @PostCnt;
+            SET @S = @S + N'    -- TODO: add type-appropriate AssertEquals checks per OUTPUT parameter value.' + @CRLF;
             SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
         END;
 
@@ -5563,7 +5803,23 @@ BEGIN
             SET @S = @S + N'    EXEC TestGen.AssertResultShape @TestClass = ''' + @TC + N''', @ExecSql = @cmd;' + @CRLF;
             SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
 
-            IF @CaptureRows = 1
+            -- v11.x: a golden-master ROW baseline only makes sense for a
+            -- DETERMINISTIC result.  A proc whose output embeds GETDATE/NEWID/
+            -- RAND drifts between the capture run and later runs, so its baseline
+            -- assertion would flap.  Emit the row-baseline test only when the proc
+            -- body has no such non-deterministic source (the shape test + the
+            -- characterization scaffold still apply to non-deterministic procs).
+            DECLARE @v94Deterministic BIT =
+                CASE WHEN UPPER(@ProcSource) LIKE N'%GETDATE%'
+                       OR UPPER(@ProcSource) LIKE N'%SYSDATETIME%'
+                       OR UPPER(@ProcSource) LIKE N'%SYSUTCDATETIME%'
+                       OR UPPER(@ProcSource) LIKE N'%GETUTCDATE%'
+                       OR UPPER(@ProcSource) LIKE N'%CURRENT_TIMESTAMP%'
+                       OR UPPER(@ProcSource) LIKE N'%NEWID%'
+                       OR UPPER(@ProcSource) LIKE N'%NEWSEQUENTIALID%'
+                       OR UPPER(@ProcSource) LIKE N'%RAND(%'
+                     THEN 0 ELSE 1 END;
+            IF @CaptureRows = 1 AND @v94Deterministic = 1
             BEGIN
                 -- Test 8: golden rows.
                 -- Build the #ActualResult column list from the captured shape.
@@ -5587,6 +5843,15 @@ BEGIN
                 SET @S = @S + N'        PRINT ''NOTE: result set is EMPTY for the generated seed/args - the baseline comparison is trivial; design a seed that returns rows.'';' + @CRLF;
                 SET @S = @S + N'    EXEC TestGen.AssertResultRowsMatchBaseline @TestClass = ''' + @TC + N''';' + @CRLF;
                 SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
+
+                -- v11.x: persist the EXPECTED baseline NOW (generation time, outside
+                -- any tSQLt rollback) so the row-baseline test above ASSERTS the proc's
+                -- seeded output instead of capturing-and-passing (the in-test capture
+                -- is undone by tSQLt's per-test rollback).
+                IF @ExecuteScript = 1
+                BEGIN TRY
+                    EXEC TestGen.CaptureResultBaseline @TestClass = @TC, @MockSql = @MockBlock, @ExecSql = @describeSql;
+                END TRY BEGIN CATCH PRINT 'CaptureResultBaseline skipped for ' + @TC + ': ' + ERROR_MESSAGE(); END CATCH;
             END;
 
             IF @EmitScaffold = 1
@@ -7404,7 +7669,7 @@ GO
 CREATE PROCEDURE TestGen.GenerateAndRunCoverage
     @SchemaName                    SYSNAME,
     @ProcName                      SYSNAME,
-    @CaptureRows                   BIT           = 0,
+    @CaptureRows                   BIT           = 1,
     @EmitNegativeTests             BIT           = 1,
     @AssertExceptionOnInvalidInputs BIT          = 1,
     @EmitNullChecks                BIT           = 1,
@@ -8543,6 +8808,30 @@ BEGIN
                 ELSE 0
             END;
 
+            -- v5.3: close an open bare-branch wrap whose statement never reached a
+            -- ';'.  A bare branch body is a single statement, so the next structural
+            -- token - a BEGIN/END block boundary or a new branch header - ENDS it.
+            -- Inject the pending hit and the matching synthetic END here, BEFORE this
+            -- line is emitted, so the wrap stays balanced and _cov compiles.
+            -- Without this, semicolon-free AdventureWorks bodies (e.g. ufnGetStock's
+            -- "IF (@ret IS NULL) SET @ret = 0" with no ';') left the wrap open until
+            -- a later ';' fired the END inside the next block -> Msg 102.
+            IF @StmtWrap = 1 AND @StmtStart IS NOT NULL AND @StmtStart <> @LN
+               AND (@PB = 1 OR @PE = 1 OR @IsBranchHeader = 1)
+            BEGIN
+                SET @Body = @Body
+                    + N'    EXEC TestGen.RecordCoverageHit '''
+                    + REPLACE(@SchemaName,'''','''''') + N''','''
+                    + REPLACE(@ProcName  ,'''','''''') + N''','
+                    + CAST(@StmtStart AS NVARCHAR(10)) + N';' + CHAR(10)
+                    + N'    END' + CHAR(10);
+                SET @StmtStart      = NULL;
+                SET @StmtWrap       = 0;
+                SET @StmtIsTerminal = 0;
+                SET @OpenStmt       = NULL;
+                SET @InsertMode     = NULL;
+            END;
+
             IF @Blank = 0 AND @Cmnt = 0 AND @PB = 0 AND @PE = 0 AND @Noise = 0
             BEGIN
                 IF @IsBranchHeader = 1
@@ -8687,6 +8976,13 @@ BEGIN
                                 + REPLACE(@SchemaName,'''','''''') + N''','''
                                 + REPLACE(@ProcName  ,'''','''''') + N''','
                                 + CAST(@StmtStart AS NVARCHAR(10)) + N';' + CHAR(10);
+                            -- v5.3: if the statement that just ended (without ';') was
+                            -- a synthetic-wrapped bare branch body, close its wrap now.
+                            IF @StmtWrap = 1
+                            BEGIN
+                                SET @Body = @Body + N'    END' + CHAR(10);
+                                SET @StmtWrap = 0;
+                            END;
                             SET @StmtStart      = NULL;
                             SET @StmtIsTerminal = 0;
                             SET @OpenStmt       = NULL;
@@ -11624,21 +11920,29 @@ GO
 IF OBJECT_ID('TestGen.ExtractBranchSeeds','TF') IS NOT NULL
     DROP FUNCTION TestGen.ExtractBranchSeeds;
 GO
+-- v11 Step 2.1: predicate-aware + ancestor-chaining.  Tracks BEGIN/END nesting
+-- and a stack of enclosing IF/WHILE gates; each branch's seed = its own leaves
+-- PLUS every ancestor gate's satisfying assignment.  Returns BranchId so the
+-- caller drives one shadow EXEC per branch with all assigned params overridden.
+-- See DESIGN_v11_AncestorChaining.md.
 CREATE FUNCTION TestGen.ExtractBranchSeeds(@Body NVARCHAR(MAX), @ParamCsv NVARCHAR(MAX))
-RETURNS @seeds TABLE (ParamName SYSNAME, SeedLiteral NVARCHAR(500))
+RETURNS @seeds TABLE (BranchId INT, ParamName SYSNAME, SeedLiteral NVARCHAR(500))
 AS
 BEGIN
     DECLARE @pset NVARCHAR(MAX) = N'|' + UPPER(REPLACE(REPLACE(REPLACE(ISNULL(@ParamCsv,N''),N' ',N''),CHAR(13),N''),CHAR(10),N'')) + N'|';
-    SET @pset = REPLACE(@pset, N',', N'|');     -- -> |@N|@STATUS|
+    SET @pset = REPLACE(@pset, N',', N'|');
     IF @pset = N'||' RETURN;
 
-    DECLARE @len INT = LEN(@Body), @i INT = 1;
+    DECLARE @anc  TABLE (AtDepth INT, ParamName SYSNAME, SeedLiteral NVARCHAR(500));
+    DECLARE @pend TABLE (ParamName SYSNAME, SeedLiteral NVARCHAR(500));
+    DECLARE @leaf TABLE (ParamName SYSNAME, SeedLiteral NVARCHAR(500));
+
+    DECLARE @len INT = LEN(@Body), @i INT = 1, @depth INT = 0, @branch INT = 0;
     DECLARE @inLine BIT=0,@inBlk BIT=0,@inStr BIT=0,@inBr BIT=0;
-    DECLARE @ch NCHAR(1),@nx NCHAR(1),@pvc NCHAR(1);
-    DECLARE @tok NVARCHAR(200),@k INT,@kc NCHAR(1);
-    DECLARE @op VARCHAR(12),@operand NVARCHAR(500),@seed NVARCHAR(500),@w NVARCHAR(20),@w2 NVARCHAR(10);
-    DECLARE @prevWord NVARCHAR(20)=N'',@curWord NVARCHAR(40)=N'';
-    DECLARE @found BIT;
+    DECLARE @ch NCHAR(1),@nx NCHAR(1),@pvc NCHAR(1),@aft NCHAR(1);
+    DECLARE @hasPending BIT=0, @bodyIsBegin BIT, @fw VARCHAR(6);
+    DECLARE @pp INT,@psA BIT,@pcl BIT,@pbk BIT,@stop BIT;
+    DECLARE @tok NVARCHAR(200),@k INT,@kc NCHAR(1),@op VARCHAR(12),@operand NVARCHAR(500),@seed NVARCHAR(500),@w NVARCHAR(20),@w2 NVARCHAR(10);
 
     WHILE @i <= @len
     BEGIN
@@ -11649,105 +11953,131 @@ BEGIN
         IF @inBlk=1  BEGIN IF @ch=N'*' AND @nx=N'/' BEGIN SET @i+=2; SET @inBlk=0; CONTINUE; END; SET @i+=1; CONTINUE; END;
         IF @inStr=1  BEGIN IF @ch=N'''' AND @nx=N'''' BEGIN SET @i+=2; CONTINUE; END; IF @ch=N'''' SET @inStr=0; SET @i+=1; CONTINUE; END;
         IF @inBr=1   BEGIN IF @ch=N']' SET @inBr=0; SET @i+=1; CONTINUE; END;
-        IF @ch=N'-' AND @nx=N'-' BEGIN SET @i+=2; SET @inLine=1; SET @prevWord=N''; SET @curWord=N''; CONTINUE; END;
-        IF @ch=N'/' AND @nx=N'*' BEGIN SET @i+=2; SET @inBlk=1; SET @prevWord=N''; SET @curWord=N''; CONTINUE; END;
-        IF @ch=N'''' BEGIN SET @i+=1; SET @inStr=1; SET @prevWord=N''; SET @curWord=N''; CONTINUE; END;
-        IF @ch=N'['  BEGIN SET @i+=1; SET @inBr=1; SET @prevWord=N''; SET @curWord=N''; CONTINUE; END;
+        IF @ch=N'-' AND @nx=N'-' BEGIN SET @i+=2; SET @inLine=1; CONTINUE; END;
+        IF @ch=N'/' AND @nx=N'*' BEGIN SET @i+=2; SET @inBlk=1; CONTINUE; END;
+        IF @ch=N''''  BEGIN SET @i+=1; SET @inStr=1; CONTINUE; END;
+        IF @ch=N'['   BEGIN SET @i+=1; SET @inBr=1; CONTINUE; END;
 
-        IF @ch LIKE N'[A-Za-z]'
+        SET @pvc = CASE WHEN @i=1 THEN N' ' ELSE SUBSTRING(@Body,@i-1,1) END;
+        IF PATINDEX(N'%[^A-Za-z0-9_@#]%',@pvc)=1
         BEGIN
-            SET @curWord = @curWord + @ch; SET @i+=1; CONTINUE;
-        END
-        ELSE IF @curWord <> N''
-        BEGIN
-            SET @prevWord = UPPER(@curWord); SET @curWord = N'';
-        END;
-
-        IF @ch = N'@'
-        BEGIN
-            SET @pvc = CASE WHEN @i=1 THEN N' ' ELSE SUBSTRING(@Body,@i-1,1) END;
-            IF PATINDEX(N'%[^A-Za-z0-9_@#]%',@pvc)=1
+            IF UPPER(SUBSTRING(@Body,@i,5))=N'BEGIN'
+               AND PATINDEX(N'%[^A-Za-z0-9_@#]%',CASE WHEN @i+5<=@len THEN SUBSTRING(@Body,@i+5,1) ELSE N' ' END)=1
             BEGIN
-                SET @tok = N'@'; SET @k = @i+1;
-                WHILE @k<=@len
+                SET @depth += 1;
+                IF @hasPending=1
                 BEGIN
-                    SET @kc = SUBSTRING(@Body,@k,1);
-                    IF @kc LIKE N'[A-Za-z0-9_@#]' BEGIN SET @tok+=@kc; SET @k+=1; END ELSE BREAK;
+                    INSERT @anc (AtDepth,ParamName,SeedLiteral) SELECT @depth,ParamName,SeedLiteral FROM @pend;
+                    DELETE FROM @pend; SET @hasPending=0;
                 END;
-                IF CHARINDEX(N'|'+UPPER(@tok)+N'|', @pset) > 0 AND @prevWord <> N'SET'
-                BEGIN
-                    SET @op=NULL; SET @operand=NULL; SET @found=0;
-                    WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
-                    SET @kc = CASE WHEN @k<=@len THEN SUBSTRING(@Body,@k,1) ELSE N'' END;
-                    IF SUBSTRING(@Body,@k,2) IN (N'>=',N'<=',N'<>',N'!=')
-                    BEGIN SET @op=CASE WHEN SUBSTRING(@Body,@k,2)=N'!=' THEN '<>' ELSE SUBSTRING(@Body,@k,2) END COLLATE DATABASE_DEFAULT; SET @k+=2; END
-                    ELSE IF @kc=N'=' BEGIN SET @op='='; SET @k+=1; END
-                    ELSE IF @kc=N'<' BEGIN SET @op='<'; SET @k+=1; END
-                    ELSE IF @kc=N'>' BEGIN SET @op='>'; SET @k+=1; END
-                    ELSE
-                    BEGIN
-                        SET @w=N'';
-                        WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[A-Za-z]' BEGIN SET @w+=SUBSTRING(@Body,@k,1); SET @k+=1; END;
-                        SET @w=UPPER(@w);
-                        IF @w=N'IS'
-                        BEGIN
-                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
-                            SET @w2=N'';
-                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[A-Za-z]' BEGIN SET @w2+=SUBSTRING(@Body,@k,1); SET @k+=1; END;
-                            SET @w2=UPPER(@w2);
-                            IF @w2=N'NULL' SET @op='ISNULL';
-                        END
-                        ELSE IF @w=N'IN' SET @op='IN';
-                        ELSE IF @w=N'BETWEEN' SET @op='BETWEEN';
-                        ELSE IF @w=N'LIKE' SET @op='LIKE';
-                    END;
+                SET @i += 5; CONTINUE;
+            END;
+            IF UPPER(SUBSTRING(@Body,@i,3))=N'END'
+               AND PATINDEX(N'%[^A-Za-z0-9_@#]%',CASE WHEN @i+3<=@len THEN SUBSTRING(@Body,@i+3,1) ELSE N' ' END)=1
+            BEGIN
+                DELETE FROM @anc WHERE AtDepth=@depth;
+                IF @depth>0 SET @depth-=1;
+                SET @hasPending=0;
+                SET @i += 3; CONTINUE;
+            END;
+            SET @fw = NULL;
+            IF UPPER(SUBSTRING(@Body,@i,2))=N'IF'
+               AND PATINDEX(N'%[^A-Za-z0-9_@#]%',CASE WHEN @i+2<=@len THEN SUBSTRING(@Body,@i+2,1) ELSE N' ' END)=1
+                SET @fw='IF';
+            ELSE IF UPPER(SUBSTRING(@Body,@i,5))=N'WHILE'
+               AND PATINDEX(N'%[^A-Za-z0-9_@#]%',CASE WHEN @i+5<=@len THEN SUBSTRING(@Body,@i+5,1) ELSE N' ' END)=1
+                SET @fw='WHILE';
 
-                    IF @op IN ('=','<','>','<=','>=','<>','LIKE','IN','BETWEEN')
+            IF @fw IS NOT NULL
+            BEGIN
+                SET @i += CASE WHEN @fw='IF' THEN 2 ELSE 5 END;
+                DELETE FROM @leaf;
+                SET @pp=0; SET @psA=0; SET @pcl=0; SET @pbk=0; SET @stop=0; SET @bodyIsBegin=0;
+                WHILE @i<=@len AND @stop=0
+                BEGIN
+                    SET @ch=SUBSTRING(@Body,@i,1);
+                    SET @nx=CASE WHEN @i<@len THEN SUBSTRING(@Body,@i+1,1) ELSE N'' END;
+                    IF @pcl=1 BEGIN IF @ch=CHAR(10) SET @pcl=0; SET @i+=1; CONTINUE; END;
+                    IF @psA=1 BEGIN IF @ch=N'''' AND @nx=N'''' BEGIN SET @i+=2; CONTINUE; END; IF @ch=N'''' SET @psA=0; SET @i+=1; CONTINUE; END;
+                    IF @pbk=1 BEGIN IF @ch=N']' SET @pbk=0; SET @i+=1; CONTINUE; END;
+                    IF @ch=N'-' AND @nx=N'-' BEGIN SET @i+=2; SET @pcl=1; CONTINUE; END;
+                    IF @ch=N'''' BEGIN SET @i+=1; SET @psA=1; CONTINUE; END;
+                    IF @ch=N'[' BEGIN SET @i+=1; SET @pbk=1; CONTINUE; END;
+                    IF @ch=N'(' BEGIN SET @pp+=1; SET @i+=1; CONTINUE; END;
+                    IF @ch=N')' BEGIN SET @pp=CASE WHEN @pp>0 THEN @pp-1 ELSE 0 END; SET @i+=1; CONTINUE; END;
+
+                    IF @pp=0
                     BEGIN
-                        IF @op='IN'
+                        SET @pvc=CASE WHEN @i=1 THEN N' ' ELSE SUBSTRING(@Body,@i-1,1) END;
+                        IF UPPER(SUBSTRING(@Body,@i,5))=N'BEGIN' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',@pvc)=1
+                           AND PATINDEX(N'%[^A-Za-z0-9_@#]%',CASE WHEN @i+5<=@len THEN SUBSTRING(@Body,@i+5,1) ELSE N' ' END)=1
+                        BEGIN SET @bodyIsBegin=1; SET @stop=1; CONTINUE; END;
+                        IF @ch=N';' BEGIN SET @stop=1; CONTINUE; END;
+                        IF @ch=N'@' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',@pvc)=1
                         BEGIN
-                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
-                            IF SUBSTRING(@Body,@k,1)=N'(' SET @k+=1;
-                        END;
-                        WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
-                        SET @kc = CASE WHEN @k<=@len THEN SUBSTRING(@Body,@k,1) ELSE N'' END;
-                        IF @kc=N''''
-                        BEGIN
-                            SET @operand=N''''; SET @k+=1;
-                            WHILE @k<=@len
+                            SET @tok=N'@'; SET @k=@i+1;
+                            WHILE @k<=@len BEGIN SET @kc=SUBSTRING(@Body,@k,1); IF @kc LIKE N'[A-Za-z0-9_@#]' BEGIN SET @tok+=@kc; SET @k+=1; END ELSE BREAK; END;
+                            IF CHARINDEX(N'|'+UPPER(@tok)+N'|',@pset)>0
                             BEGIN
-                                SET @kc=SUBSTRING(@Body,@k,1);
-                                IF @kc=N'''' AND SUBSTRING(@Body,@k+1,1)=N'''' BEGIN SET @operand+=N''''''; SET @k+=2; CONTINUE; END;
-                                SET @operand+=@kc; SET @k+=1;
-                                IF @kc=N'''' BREAK;
+                                SET @op=NULL; SET @operand=NULL;
+                                WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
+                                SET @kc=CASE WHEN @k<=@len THEN SUBSTRING(@Body,@k,1) ELSE N'' END;
+                                IF SUBSTRING(@Body,@k,2) IN (N'>=',N'<=',N'<>',N'!=')
+                                BEGIN SET @op=CASE WHEN SUBSTRING(@Body,@k,2)=N'!=' THEN '<>' ELSE SUBSTRING(@Body,@k,2) END COLLATE DATABASE_DEFAULT; SET @k+=2; END
+                                ELSE IF @kc=N'=' BEGIN SET @op='='; SET @k+=1; END
+                                ELSE IF @kc=N'<' BEGIN SET @op='<'; SET @k+=1; END
+                                ELSE IF @kc=N'>' BEGIN SET @op='>'; SET @k+=1; END
+                                ELSE
+                                BEGIN
+                                    SET @w=N''; WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[A-Za-z]' BEGIN SET @w+=SUBSTRING(@Body,@k,1); SET @k+=1; END; SET @w=UPPER(@w);
+                                    IF @w=N'IS' BEGIN WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1; SET @w2=N''; WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[A-Za-z]' BEGIN SET @w2+=SUBSTRING(@Body,@k,1); SET @k+=1; END; SET @w2=UPPER(@w2); IF @w2=N'NULL' SET @op='ISNULL'; END
+                                    ELSE IF @w=N'IN' SET @op='IN';
+                                    ELSE IF @w=N'BETWEEN' SET @op='BETWEEN';
+                                    ELSE IF @w=N'LIKE' SET @op='LIKE';
+                                END;
+                                IF @op IN ('=','<','>','<=','>=','<>','LIKE','IN','BETWEEN')
+                                BEGIN
+                                    IF @op='IN' BEGIN WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1; IF SUBSTRING(@Body,@k,1)=N'(' SET @k+=1; END;
+                                    WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
+                                    SET @kc=CASE WHEN @k<=@len THEN SUBSTRING(@Body,@k,1) ELSE N'' END;
+                                    IF @kc=N'''' BEGIN SET @operand=N''''; SET @k+=1; WHILE @k<=@len BEGIN SET @kc=SUBSTRING(@Body,@k,1); IF @kc=N'''' AND SUBSTRING(@Body,@k+1,1)=N'''' BEGIN SET @operand+=N''''''; SET @k+=2; CONTINUE; END; SET @operand+=@kc; SET @k+=1; IF @kc=N'''' BREAK; END; END
+                                    ELSE IF @kc LIKE N'[0-9]' OR (@kc IN (N'-',N'+',N'.') AND SUBSTRING(@Body,@k+1,1) LIKE N'[0-9]') BEGIN SET @operand=N''; IF @kc IN (N'-',N'+') BEGIN SET @operand+=@kc; SET @k+=1; END; WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[0-9.]' BEGIN SET @operand+=SUBSTRING(@Body,@k,1); SET @k+=1; END; END;
+                                    IF @op='LIKE' AND @operand IS NOT NULL BEGIN SET @operand=REPLACE(REPLACE(@operand,N'%',N''),N'_',N''); IF @operand=N'''''' SET @operand=NULL; END;
+                                END;
+                                IF @op='ISNULL' INSERT @leaf(ParamName,SeedLiteral) VALUES(@tok,N'NULL');
+                                ELSE IF @op IS NOT NULL AND @operand IS NOT NULL BEGIN SET @seed=TestGen.SeedFromLeaf(@op,@operand); IF @seed IS NOT NULL INSERT @leaf(ParamName,SeedLiteral) VALUES(@tok,@seed); END;
+                                SET @i=@k; CONTINUE;
                             END;
-                        END
-                        ELSE IF @kc LIKE N'[0-9]' OR (@kc IN (N'-',N'+',N'.') AND SUBSTRING(@Body,@k+1,1) LIKE N'[0-9]')
-                        BEGIN
-                            SET @operand=N'';
-                            IF @kc IN (N'-',N'+') BEGIN SET @operand+=@kc; SET @k+=1; END;
-                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[0-9.]' BEGIN SET @operand+=SUBSTRING(@Body,@k,1); SET @k+=1; END;
+                            SET @i=@k; CONTINUE;
                         END;
-
-                        IF @op='LIKE' AND @operand IS NOT NULL
+                        IF @ch LIKE N'[A-Za-z]'
                         BEGIN
-                            SET @operand = REPLACE(REPLACE(@operand, N'%', N''), N'_', N'');
-                            IF @operand = N'''''' SET @operand = NULL;
+                            SET @w=N''; SET @k=@i;
+                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[A-Za-z]' BEGIN SET @w+=SUBSTRING(@Body,@k,1); SET @k+=1; END;
+                            SET @w=UPPER(@w);
+                            IF @w IN (N'RETURN',N'SET',N'SELECT',N'INSERT',N'UPDATE',N'DELETE',N'PRINT',N'EXEC',N'EXECUTE',N'THROW',N'RAISERROR',N'BREAK',N'CONTINUE',N'WAITFOR',N'GOTO',N'DECLARE',N'MERGE',N'COMMIT',N'ROLLBACK',N'TRUNCATE')
+                            BEGIN SET @stop=1; CONTINUE; END;
+                            SET @i=@k; CONTINUE;
                         END;
                     END;
-
-                    IF @op='ISNULL'
-                        INSERT @seeds(ParamName,SeedLiteral) VALUES(@tok, N'NULL');
-                    ELSE IF @op IS NOT NULL AND @operand IS NOT NULL
-                    BEGIN
-                        SET @seed = TestGen.SeedFromLeaf(@op, @operand);
-                        IF @seed IS NOT NULL
-                            INSERT @seeds(ParamName,SeedLiteral) VALUES(@tok, @seed);
-                    END;
-
-                    SET @i = @k; SET @prevWord=N''; CONTINUE;
+                    SET @i+=1;
                 END;
-                SET @i = @k; SET @prevWord=N''; CONTINUE;
+
+                IF EXISTS (SELECT 1 FROM @leaf)
+                BEGIN
+                    SET @branch += 1;
+                    INSERT @seeds (BranchId,ParamName,SeedLiteral) SELECT @branch,ParamName,SeedLiteral FROM @leaf;
+                    INSERT @seeds (BranchId,ParamName,SeedLiteral)
+                    SELECT @branch, a.ParamName, a.SeedLiteral
+                    FROM @anc a
+                    WHERE a.AtDepth = (SELECT MAX(a2.AtDepth) FROM @anc a2 WHERE UPPER(a2.ParamName)=UPPER(a.ParamName))
+                      AND NOT EXISTS (SELECT 1 FROM @leaf l WHERE UPPER(l.ParamName)=UPPER(a.ParamName));
+                END;
+
+                IF @bodyIsBegin=1 AND EXISTS (SELECT 1 FROM @leaf)
+                BEGIN DELETE FROM @pend; INSERT @pend SELECT ParamName,SeedLiteral FROM @leaf; SET @hasPending=1; END
+                ELSE SET @hasPending=0;
+                CONTINUE;
             END;
         END;
 
@@ -11860,17 +12190,20 @@ BEGIN
         DECLARE @paramCsv NVARCHAR(MAX)=N'';
         SELECT @paramCsv=@paramCsv+name+N',' FROM @ph ORDER BY ord;
         DECLARE @retClause NVARCHAR(120)=CASE WHEN @ret=N'' THEN N'' ELSE N', '+@ret END;
-        ;WITH leaf AS (SELECT DISTINCT ParamName, SeedLiteral FROM TestGen.ExtractBranchSeeds(@fnbody,@paramCsv))
+        ;WITH raw AS (SELECT BranchId, ParamName, SeedLiteral FROM TestGen.ExtractBranchSeeds(@fnbody,@paramCsv)),
+              asg AS (SELECT BranchId, ParamName, MAX(SeedLiteral) AS SeedLiteral FROM raw GROUP BY BranchId, ParamName)
         SELECT @execSeeds = @execSeeds
              + N'    BEGIN TRY EXEC '+@shadowFull+N' '+ z.args + @retClause + N'; END TRY BEGIN CATCH END CATCH;'+@CRLF,
                @seedCount = @seedCount + 1
         FROM (
-            SELECT l.ParamName, l.SeedLiteral,
+            SELECT b.BranchId,
                    STRING_AGG(CONVERT(NVARCHAR(MAX),
-                        p.name + N'=' + CASE WHEN UPPER(p.name)=UPPER(l.ParamName) THEN l.SeedLiteral ELSE p.happyLit END),
+                        p.name + N'=' + ISNULL(a.SeedLiteral, p.happyLit)),
                         N', ') WITHIN GROUP (ORDER BY p.ord) AS args
-            FROM leaf l CROSS JOIN @ph p
-            GROUP BY l.ParamName, l.SeedLiteral
+            FROM (SELECT DISTINCT BranchId FROM asg) b
+            CROSS JOIN @ph p
+            LEFT JOIN asg a ON a.BranchId=b.BranchId AND UPPER(a.ParamName)=UPPER(p.name)
+            GROUP BY b.BranchId
         ) z;
     END TRY
     BEGIN CATCH
@@ -11890,7 +12223,7 @@ BEGIN
         N'    EXEC tSQLt.AssertEquals 1, 1; -- driver: execution drives coverage'+@CRLF+
         N'END;'+@CRLF+N'GO'+@CRLF;
     EXEC TestGen.ExecuteBatchedScript @drv;
-    IF @seedCount > 0 PRINT 'RunCoverageForFunction: '+CAST(@seedCount AS VARCHAR)+' predicate-inversion seed(s) added for '+@SchemaName+'.'+@FunctionName+'.';
+    IF @seedCount > 0 PRINT 'RunCoverageForFunction: '+CAST(@seedCount AS VARCHAR)+' branch-seed driver call(s) added for '+@SchemaName+'.'+@FunctionName+'.';
 
     -- 3. measure coverage on the shadow, capturing test outcomes so we can
     --    persist a CoverageResult row keyed by the FUNCTION (the shadow is an
@@ -11906,6 +12239,32 @@ BEGIN
     BEGIN CATCH
         PRINT 'RunCoverageForFunction: RunCoverage on shadow failed: '+ERROR_MESSAGE();
     END CATCH;
+
+    -- A (honest-deferred): if the instrumented shadow copy never compiled,
+    -- RunCoverage measured nothing - the 0 hits mean "the instrumented copy did
+    -- not run", NOT "this code is uncovered".  Detect the absent _cov and record
+    -- COVERAGE DEFERRED instead of a misleading GenSucceeded=1 / 0% row.  With
+    -- the v5.3 wrap-close fix this is rare; it is the residual-case net for
+    -- shadow bodies the line-walker still cannot wrap into compilable SQL.
+    DECLARE @covChk NVARCHAR(400) = QUOTENAME(@SchemaName)+N'.'+QUOTENAME(@shadow+N'_cov');
+    DECLARE @deferred BIT = CASE WHEN OBJECT_ID(@covChk,'P') IS NULL THEN 1 ELSE 0 END;
+    IF @deferred = 1
+    BEGIN
+        PRINT '=============================================================';
+        PRINT ' COVERAGE DEFERRED: '+@SchemaName+'.'+@FunctionName;
+        PRINT ' The instrumented shadow copy ('+@shadow+'_cov) did not compile,';
+        PRINT ' so no coverage could be measured.  Reported DEFERRED, not 0%';
+        PRINT ' (instrumenter limitation - please report this function body).';
+        PRINT '=============================================================';
+        IF @BatchId IS NOT NULL
+            INSERT TestGen.CoverageResult
+                (BatchId,SchemaName,ProcName,GenSucceeded,TotalLines,CoveredLines,LinePct,
+                 TotalBranches,CoveredBranches,BranchPct,TestsRun,TestsPassed,TestsFailed,
+                 TestsErrored,TestsSkipped,TestsPreserved,ErrorText,Testability,NotTestableReason,RunAt)
+            VALUES (@BatchId,@SchemaName,@FunctionName,0,NULL,NULL,NULL,NULL,NULL,NULL,0,0,0,0,0,0,
+                 N'instrumented _cov failed to compile',N'NOT_TESTABLE',
+                 N'coverage deferred: instrumenter could not produce a compiling _cov',SYSUTCDATETIME());
+    END;
 
     -- 4. compute coverage from the shadow's line catalogue + hits (same rule as
     --    GenerateAndCoverDatabase) and persist a CoverageResult row under the
@@ -11952,6 +12311,7 @@ BEGIN
                    @skip=ISNULL(SUM(CASE WHEN Result IN ('Skipped','Skip','Ignored') THEN 1 ELSE 0 END),0)
             FROM tSQLt.TestResult WHERE Class=@asclass;
     END;
+    IF @deferred = 0
     BEGIN TRY
         INSERT TestGen.CoverageResult
             (BatchId,SchemaName,ProcName,GenSucceeded,TotalLines,CoveredLines,LinePct,
@@ -12015,6 +12375,7 @@ BEGIN
     DECLARE @lp DECIMAL(5,1), @bp DECIMAL(5,1);
     DECLARE @testability VARCHAR(20), @reason NVARCHAR(400);   -- v9.4.3 testability gate
     DECLARE @pres INT;                                          -- v9.4.4 preservation count from GenerateTestsForProcedure
+    DECLARE @resync INT;   -- v11.x: connection-recovery resync probe (see loop)
 
     -- v11: enumerate stored procedures AND user functions (FN/IF/TF).
     DECLARE @work TABLE (Seq INT IDENTITY(1,1), s SYSNAME, p SYSNAME, k CHAR(2));
@@ -12051,6 +12412,14 @@ BEGIN
         SET @run=0; SET @pass=0; SET @fail=0; SET @errc=0; SET @skip=0;
         SET @tot=0; SET @cov=0; SET @tb=0; SET @cb=0;
         SET @pres=0;   -- v9.4.4: preservation count reset per iteration
+        -- v11.x resilience: a transient connection-recovery during this long
+        -- multi-object run leaves @@ROWCOUNT unusable ("the connection was
+        -- recovered ... execute another query to get a valid rowcount"), which
+        -- otherwise CASCADES - every remaining object then fails generation with
+        -- that same message (2026-05-31: all 8 procs after the functions failed
+        -- in 0.37s total).  A trivial query each iteration re-syncs the session
+        -- so a recovery on a prior object cannot poison this one.
+        SELECT @resync = 1;
 
         PRINT '  [' + CAST(@Seq AS VARCHAR) + '/' + CAST(@Total AS VARCHAR) + '] ' + @s + '.' + @p;
 
@@ -12110,7 +12479,23 @@ BEGIN
                  @TestsPreservedCount=@pres OUTPUT;
             SET @genOK=1;
         END TRY
-        BEGIN CATCH SET @err=N'GEN: '+ERROR_MESSAGE(); END CATCH
+        BEGIN CATCH
+            SET @err=N'GEN: '+ERROR_MESSAGE();
+            -- v11.x resilience: if generation tripped a transient connection-recovery
+            -- (rowcount unavailable), re-sync and retry ONCE - the generator is
+            -- deterministic and succeeds on a clean session, so one blip never costs
+            -- the object (it used to cost every REMAINING object in the sweep).
+            IF @err LIKE N'%connection was recovered%' OR @err LIKE N'%valid rowcount%'
+            BEGIN
+                SELECT @resync = 1;
+                BEGIN TRY
+                    EXEC TestGen.GenerateTestsForProcedure @SchemaName=@s, @ProcName=@p, @ExecuteScript=1,
+                         @TestsPreservedCount=@pres OUTPUT;
+                    SET @genOK=1; SET @err=NULL;
+                END TRY
+                BEGIN CATCH SET @err=N'GEN: '+ERROR_MESSAGE(); END CATCH
+            END;
+        END CATCH
 
         IF @genOK = 1
         BEGIN
