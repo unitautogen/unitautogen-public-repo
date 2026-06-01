@@ -1,5 +1,5 @@
 @{
-    ModuleVersion     = '0.9.1'
+    ModuleVersion     = '0.9.2'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -34,10 +34,28 @@
                             'Cobertura', 'JUnit', 'AzureDevOps', 'Testing',
                             'UnitTest', 'CodeCoverage', 'BranchCoverage',
                             'DatabaseTesting', 'AutomatedTesting')
-            LicenseUri  = 'https://github.com/unitautogen/unitautogen/blob/main/LICENSE'
-            ProjectUri  = 'https://github.com/unitautogen/unitautogen'
-            IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen/main/docs/logo.png'
+            LicenseUri  = 'https://github.com/unitautogen/unitautogen-public-repo/blob/main/LICENSE'
+            ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
+            IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
+## v0.9.2 (beta) — 2026-06-01
+
+Fixes:
+- TVF shadow teardown: defensively drops the synonym/_cov/_orig objects
+  before rebuild, eliminating the "already an object named _covfn" failure
+  on rerun when a previous coverage run was interrupted.
+
+v11 work-in-progress (bundled SQL installer updates):
+- 30_Function_Support_v1.sql — scalar function + TVF coverage groundwork.
+- Patch_v11_SeedExtensions.sql + Verify_SeedExtensions.sql — seed
+  extension patches for branch-condition seeding.
+- Verify_ShadowTeardown.sql — verification script for the teardown fix.
+
+Examples:
+- New examples/Demo_Schema.sql for an end-to-end walkthrough.
+
+PowerShell cmdlets are unchanged from v0.9.1.
+
 ## v0.9.1 (beta)
 
 Bundled SQL framework updated — user-defined function support + branch coverage:

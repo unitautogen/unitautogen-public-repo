@@ -256,6 +256,181 @@ PRINT 'TestGen.RewriteScalarReturns installed.';
 GO
 
 /*===========================================================================
+ * v11 #11: TestGen.ExpandCaseToIf - rewrites a statement-scope SET <t> = CASE
+ * ... END;  or  RETURN CASE ... END;  into an IF / ELSE IF / ELSE chain, so each
+ * CASE arm becomes an instrumentable + seedable BRANCH (a CASE expression is
+ * atomic to the line-based instrumenter, so CASE-in-RETURN scalars otherwise
+ * report 0 branches).  Conservative: only a clean top-level SET=CASE / RETURN
+ * CASE is expanded; anything else is copied through verbatim, and a malformed
+ * expansion simply fails the shadow compile (honest deferral), never a crash.
+ * Applied to the shadow body (counting) AND the body the seeder reads (covering).
+ *==========================================================================*/
+IF OBJECT_ID('TestGen.ExpandCaseToIf','FN') IS NOT NULL
+    DROP FUNCTION TestGen.ExpandCaseToIf;
+GO
+CREATE FUNCTION TestGen.ExpandCaseToIf(@Body NVARCHAR(MAX))
+RETURNS NVARCHAR(MAX)
+AS
+BEGIN
+    DECLARE @out NVARCHAR(MAX)=N'', @len INT=LEN(@Body), @i INT=1;
+    DECLARE @ch NCHAR(1),@nx NCHAR(1);
+    DECLARE @inLine BIT=0,@inBlk BIT=0,@inStr BIT=0,@inBr BIT=0,@paren INT=0,@stmt BIT=1;
+    DECLARE @k INT,@kc NCHAR(1),@target NVARCHAR(MAX),@isRet BIT,@c0 INT;
+    DECLARE @test NVARCHAR(MAX),@searched BIT,@cd INT,@w NVARCHAR(10),@seg NVARCHAR(MAX);
+    DECLARE @arms NVARCHAR(MAX),@elseR NVARCHAR(MAX),@whenE NVARCHAR(MAX),@thenE NVARCHAR(MAX);
+    DECLARE @armN INT,@es BIT,@eb BIT,@done BIT,@assign NVARCHAR(MAX),@chain NVARCHAR(MAX);
+
+    WHILE @i <= @len
+    BEGIN
+        SET @ch = SUBSTRING(@Body,@i,1);
+        SET @nx = CASE WHEN @i<@len THEN SUBSTRING(@Body,@i+1,1) ELSE N'' END;
+        IF @inLine=1 BEGIN SET @out+=@ch; IF @ch=CHAR(10) SET @inLine=0; SET @i+=1; CONTINUE; END;
+        IF @inBlk=1  BEGIN SET @out+=@ch; IF @ch=N'*' AND @nx=N'/' BEGIN SET @out+=@nx; SET @i+=2; SET @inBlk=0; CONTINUE; END; SET @i+=1; CONTINUE; END;
+        IF @inStr=1  BEGIN SET @out+=@ch; IF @ch=N'''' AND @nx=N'''' BEGIN SET @out+=@nx; SET @i+=2; CONTINUE; END; IF @ch=N'''' SET @inStr=0; SET @i+=1; CONTINUE; END;
+        IF @inBr=1   BEGIN SET @out+=@ch; IF @ch=N']' SET @inBr=0; SET @i+=1; CONTINUE; END;
+        IF @ch=N'-' AND @nx=N'-' BEGIN SET @out+=N'--'; SET @i+=2; SET @inLine=1; CONTINUE; END;
+        IF @ch=N'/' AND @nx=N'*' BEGIN SET @out+=N'/*'; SET @i+=2; SET @inBlk=1; CONTINUE; END;
+        IF @ch=N'''' BEGIN SET @out+=@ch; SET @inStr=1; SET @i+=1; CONTINUE; END;
+        IF @ch=N'[' BEGIN SET @out+=@ch; SET @inBr=1; SET @i+=1; CONTINUE; END;
+
+        -- try a trigger only at statement start, paren depth 0, on a non-ws char
+        IF @stmt=1 AND @paren=0 AND @ch NOT IN (N' ',CHAR(9),CHAR(10),CHAR(13))
+        BEGIN
+            SET @isRet=NULL; SET @k=@i;
+            IF UPPER(SUBSTRING(@Body,@i,6))=N'RETURN' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@i+6,1))=1
+            BEGIN SET @isRet=1; SET @k=@i+6; SET @target=N''; END
+            ELSE IF UPPER(SUBSTRING(@Body,@i,3))=N'SET' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@i+3,1))=1
+            BEGIN
+                SET @k=@i+3; SET @target=N'';
+                WHILE @k<=@len AND SUBSTRING(@Body,@k,1)<>N'=' BEGIN SET @target+=SUBSTRING(@Body,@k,1); SET @k+=1; END;
+                IF @k<=@len SET @k+=1;  -- skip '='
+                SET @isRet=0;
+            END;
+            IF @isRet IS NOT NULL
+            BEGIN
+                WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(10),CHAR(13)) SET @k+=1;
+                IF UPPER(SUBSTRING(@Body,@k,4))=N'CASE' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+4,1))=1
+                BEGIN
+                    SET @c0=@k+4; SET @k=@c0;
+                    WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(10),CHAR(13)) SET @k+=1;
+                    -- simple vs searched
+                    IF UPPER(SUBSTRING(@Body,@k,4))=N'WHEN' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+4,1))=1
+                        SET @searched=1;
+                    ELSE
+                    BEGIN
+                        SET @searched=0; SET @test=N''; SET @cd=0; SET @es=0; SET @eb=0;
+                        WHILE @k<=@len
+                        BEGIN
+                            SET @kc=SUBSTRING(@Body,@k,1);
+                            IF @es=1 BEGIN SET @test+=@kc; IF @kc=N'''' AND SUBSTRING(@Body,@k+1,1)=N'''' BEGIN SET @test+=N''''; SET @k+=2; CONTINUE; END; IF @kc=N'''' SET @es=0; SET @k+=1; CONTINUE; END;
+                            IF @eb=1 BEGIN SET @test+=@kc; IF @kc=N']' SET @eb=0; SET @k+=1; CONTINUE; END;
+                            IF @kc=N'''' BEGIN SET @test+=@kc; SET @es=1; SET @k+=1; CONTINUE; END;
+                            IF @kc=N'[' BEGIN SET @test+=@kc; SET @eb=1; SET @k+=1; CONTINUE; END;
+                            IF @cd=0 AND UPPER(SUBSTRING(@Body,@k,4))=N'WHEN' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k-1,1))=1 AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+4,1))=1 BREAK;
+                            IF UPPER(SUBSTRING(@Body,@k,4))=N'CASE' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+4,1))=1 SET @cd+=1;
+                            IF UPPER(SUBSTRING(@Body,@k,3))=N'END' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+3,1))=1 AND @cd>0 SET @cd-=1;
+                            SET @test+=@kc; SET @k+=1;
+                        END;
+                        SET @test=LTRIM(RTRIM(REPLACE(REPLACE(REPLACE(@test,NCHAR(13),N' '),NCHAR(10),N' '),NCHAR(9),N' ')));
+                    END;
+                    -- read arms
+                    SET @chain=N''; SET @armN=0; SET @elseR=NULL; SET @done=0;
+                    WHILE @done=0 AND @k<=@len
+                    BEGIN
+                        WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(10),CHAR(13)) SET @k+=1;
+                        IF UPPER(SUBSTRING(@Body,@k,4))=N'WHEN' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+4,1))=1
+                        BEGIN
+                            SET @k+=4; SET @whenE=N''; SET @cd=0; SET @es=0; SET @eb=0;
+                            WHILE @k<=@len
+                            BEGIN
+                                SET @kc=SUBSTRING(@Body,@k,1);
+                                IF @es=1 BEGIN SET @whenE+=@kc; IF @kc=N'''' AND SUBSTRING(@Body,@k+1,1)=N'''' BEGIN SET @whenE+=N''''; SET @k+=2; CONTINUE; END; IF @kc=N'''' SET @es=0; SET @k+=1; CONTINUE; END;
+                                IF @eb=1 BEGIN SET @whenE+=@kc; IF @kc=N']' SET @eb=0; SET @k+=1; CONTINUE; END;
+                                IF @kc=N'''' BEGIN SET @whenE+=@kc; SET @es=1; SET @k+=1; CONTINUE; END;
+                                IF @kc=N'[' BEGIN SET @whenE+=@kc; SET @eb=1; SET @k+=1; CONTINUE; END;
+                                IF @cd=0 AND UPPER(SUBSTRING(@Body,@k,4))=N'THEN' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k-1,1))=1 AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+4,1))=1 BREAK;
+                                IF UPPER(SUBSTRING(@Body,@k,4))=N'CASE' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+4,1))=1 SET @cd+=1;
+                                IF UPPER(SUBSTRING(@Body,@k,3))=N'END' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+3,1))=1 AND @cd>0 SET @cd-=1;
+                                SET @whenE+=@kc; SET @k+=1;
+                            END;
+                            SET @k+=4;  -- past THEN
+                            SET @thenE=N''; SET @cd=0; SET @es=0; SET @eb=0;
+                            WHILE @k<=@len
+                            BEGIN
+                                SET @kc=SUBSTRING(@Body,@k,1);
+                                IF @es=1 BEGIN SET @thenE+=@kc; IF @kc=N'''' AND SUBSTRING(@Body,@k+1,1)=N'''' BEGIN SET @thenE+=N''''; SET @k+=2; CONTINUE; END; IF @kc=N'''' SET @es=0; SET @k+=1; CONTINUE; END;
+                                IF @eb=1 BEGIN SET @thenE+=@kc; IF @kc=N']' SET @eb=0; SET @k+=1; CONTINUE; END;
+                                IF @kc=N'''' BEGIN SET @thenE+=@kc; SET @es=1; SET @k+=1; CONTINUE; END;
+                                IF @kc=N'[' BEGIN SET @thenE+=@kc; SET @eb=1; SET @k+=1; CONTINUE; END;
+                                IF @cd=0 AND ((UPPER(SUBSTRING(@Body,@k,4))=N'WHEN' OR UPPER(SUBSTRING(@Body,@k,4))=N'ELSE') AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k-1,1))=1 AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+4,1))=1) BREAK;
+                                IF @cd=0 AND UPPER(SUBSTRING(@Body,@k,3))=N'END' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k-1,1))=1 AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+3,1))=1 BREAK;
+                                IF UPPER(SUBSTRING(@Body,@k,4))=N'CASE' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+4,1))=1 SET @cd+=1;
+                                IF UPPER(SUBSTRING(@Body,@k,3))=N'END' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+3,1))=1 AND @cd>0 SET @cd-=1;
+                                SET @thenE+=@kc; SET @k+=1;
+                            END;
+                            SET @whenE=LTRIM(RTRIM(REPLACE(REPLACE(REPLACE(@whenE,NCHAR(13),N' '),NCHAR(10),N' '),NCHAR(9),N' '))); SET @thenE=LTRIM(RTRIM(REPLACE(REPLACE(REPLACE(@thenE,NCHAR(13),N' '),NCHAR(10),N' '),NCHAR(9),N' ')));
+                            SET @assign=CASE WHEN @isRet=1 THEN N'RETURN '+@thenE ELSE N'SET '+LTRIM(RTRIM(@target))+N' = '+@thenE END;
+                            SET @chain += CASE WHEN @armN=0 THEN N'' ELSE N'    ELSE ' END
+                              + N'IF ' + CASE WHEN @searched=1 THEN N'('+@whenE+N')' ELSE @test+N' = '+@whenE END
+                              + CHAR(13)+CHAR(10) + N'        ' + @assign + N';' + CHAR(13)+CHAR(10);
+                            SET @armN+=1;
+                        END
+                        ELSE IF UPPER(SUBSTRING(@Body,@k,4))=N'ELSE' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+4,1))=1
+                        BEGIN
+                            SET @k+=4; SET @elseR=N''; SET @cd=0; SET @es=0; SET @eb=0;
+                            WHILE @k<=@len
+                            BEGIN
+                                SET @kc=SUBSTRING(@Body,@k,1);
+                                IF @es=1 BEGIN SET @elseR+=@kc; IF @kc=N'''' AND SUBSTRING(@Body,@k+1,1)=N'''' BEGIN SET @elseR+=N''''; SET @k+=2; CONTINUE; END; IF @kc=N'''' SET @es=0; SET @k+=1; CONTINUE; END;
+                                IF @eb=1 BEGIN SET @elseR+=@kc; IF @kc=N']' SET @eb=0; SET @k+=1; CONTINUE; END;
+                                IF @kc=N'''' BEGIN SET @elseR+=@kc; SET @es=1; SET @k+=1; CONTINUE; END;
+                                IF @kc=N'[' BEGIN SET @elseR+=@kc; SET @eb=1; SET @k+=1; CONTINUE; END;
+                                IF @cd=0 AND UPPER(SUBSTRING(@Body,@k,3))=N'END' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k-1,1))=1 AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+3,1))=1 BREAK;
+                                IF UPPER(SUBSTRING(@Body,@k,4))=N'CASE' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+4,1))=1 SET @cd+=1;
+                                IF UPPER(SUBSTRING(@Body,@k,3))=N'END' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+3,1))=1 AND @cd>0 SET @cd-=1;
+                                SET @elseR+=@kc; SET @k+=1;
+                            END;
+                            SET @elseR=LTRIM(RTRIM(REPLACE(REPLACE(REPLACE(@elseR,NCHAR(13),N' '),NCHAR(10),N' '),NCHAR(9),N' ')));
+                        END
+                        ELSE IF UPPER(SUBSTRING(@Body,@k,3))=N'END' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Body,@k+3,1))=1
+                        BEGIN SET @k+=3; SET @done=1; END
+                        ELSE BEGIN SET @done=2; END  -- parse confusion -> abort
+                    END;
+                    -- skip a trailing ';'
+                    IF @done=1
+                    BEGIN
+                        WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
+                        IF @k<=@len AND SUBSTRING(@Body,@k,1)=N';' SET @k+=1;
+                    END;
+                    IF @done=1 AND @armN>=1
+                    BEGIN
+                        SET @assign=CASE WHEN @isRet=1 THEN N'RETURN '+ISNULL(@elseR,N'NULL') ELSE N'SET '+LTRIM(RTRIM(@target))+N' = '+ISNULL(@elseR,N'NULL') END;
+                        IF @elseR IS NOT NULL OR @isRet=1
+                            SET @chain += N'    ELSE ' + @assign + N';' + CHAR(13)+CHAR(10);
+                        SET @out += @chain;
+                        SET @i=@k; SET @stmt=1; CONTINUE;
+                    END;
+                    -- parse failed: fall through to normal copy of the original char
+                END;
+            END;
+        END;
+
+        IF @ch=N'(' SET @paren+=1;
+        IF @ch=N')' SET @paren=CASE WHEN @paren>0 THEN @paren-1 ELSE 0 END;
+        SET @out+=@ch;
+        IF @ch=N';' SET @stmt=1;
+        ELSE IF @ch NOT IN (N' ',CHAR(9),CHAR(10),CHAR(13)) SET @stmt=0;
+        SET @i+=1;
+    END;
+    RETURN @out;
+END;
+
+GO
+PRINT 'TestGen.ExpandCaseToIf installed.';
+GO
+
+
+/*===========================================================================
  * Small text helpers used by the shadow transform.  All do a comment- /
  * string- / bracket-aware char walk so keywords inside literals or comments
  * are never matched.
@@ -677,6 +852,10 @@ BEGIN
         SET @procBody = @sel + @CRLF + N'END;';
     END;
 
+    -- v11 #11: expand a SET=CASE / RETURN CASE into an IF/ELSE chain so each arm
+    -- becomes an instrumentable branch (no-op on bodies without a top-level CASE
+    -- assignment).  Runs before Normalize so the emitted IF lines get reflowed too.
+    SET @procBody = TestGen.ExpandCaseToIf(@procBody);
     -- Gap fix: reflow one-line compound blocks to one-statement-per-line so the
     -- line-oriented instrumenter can decompose them (no-op on multi-line code).
     SET @procBody = TestGen.NormalizeShadowBody(@procBody);
@@ -1160,7 +1339,8 @@ BEGIN
     DECLARE @inLine BIT=0,@inBlk BIT=0,@inStr BIT=0,@inBr BIT=0;
     DECLARE @ch NCHAR(1),@nx NCHAR(1),@pvc NCHAR(1),@aft NCHAR(1);
     DECLARE @hasPending BIT=0, @bodyIsBegin BIT, @fw VARCHAR(6);
-    DECLARE @pp INT,@psA BIT,@pcl BIT,@pbk BIT,@stop BIT,@lhsOk BIT;
+    DECLARE @pp INT,@psA BIT,@pcl BIT,@pbk BIT,@stop BIT,@lhsOk BIT,@callDepth INT;
+    DECLARE @pstk NVARCHAR(400);
     DECLARE @tok NVARCHAR(200),@k INT,@kc NCHAR(1),@op VARCHAR(12),@operand NVARCHAR(500),@seed NVARCHAR(500),@w NVARCHAR(20),@w2 NVARCHAR(10);
 
     WHILE @i <= @len
@@ -1211,7 +1391,7 @@ BEGIN
             BEGIN
                 SET @i += CASE WHEN @fw='IF' THEN 2 ELSE 5 END;
                 DELETE FROM @leaf;
-                SET @pp=0; SET @psA=0; SET @pcl=0; SET @pbk=0; SET @stop=0; SET @bodyIsBegin=0; SET @lhsOk=1;
+                SET @pp=0; SET @psA=0; SET @pcl=0; SET @pbk=0; SET @stop=0; SET @bodyIsBegin=0; SET @lhsOk=1; SET @callDepth=0; SET @pstk=N'';
                 WHILE @i<=@len AND @stop=0
                 BEGIN
                     SET @ch=SUBSTRING(@Body,@i,1);
@@ -1220,12 +1400,50 @@ BEGIN
                     IF @psA=1 BEGIN IF @ch=N'''' AND @nx=N'''' BEGIN SET @i+=2; CONTINUE; END; IF @ch=N'''' SET @psA=0; SET @i+=1; CONTINUE; END;
                     IF @pbk=1 BEGIN IF @ch=N']' SET @pbk=0; SET @i+=1; CONTINUE; END;
                     IF @ch=N'-' AND @nx=N'-' BEGIN SET @i+=2; SET @pcl=1; CONTINUE; END;
+                    -- v11 #9: reversed STRING predicate  'literal' <op> @param  (e.g. 'US' = @code).
+                    -- A string at operand position (not a recognised @param RHS, which the @-handler
+                    -- already consumes) may be the LHS of a reversed comparison; read it, mirror the
+                    -- operator, seed the param.  Falls through to the normal string-skip otherwise.
+                    IF @lhsOk=1 AND @callDepth=0 AND @ch=N''''
+                    BEGIN
+                        SET @operand=N''''; SET @k=@i+1;
+                        WHILE @k<=@len BEGIN SET @kc=SUBSTRING(@Body,@k,1); IF @kc=N'''' AND SUBSTRING(@Body,@k+1,1)=N'''' BEGIN SET @operand+=N''''''; SET @k+=2; CONTINUE; END; SET @operand+=@kc; SET @k+=1; IF @kc=N'''' BREAK; END;
+                        WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
+                        SET @op=NULL;
+                        IF SUBSTRING(@Body,@k,2) IN (N'>=',N'<=',N'<>',N'!=') BEGIN SET @op=CASE WHEN SUBSTRING(@Body,@k,2)=N'!=' THEN '<>' ELSE SUBSTRING(@Body,@k,2) END COLLATE DATABASE_DEFAULT; SET @k+=2; END
+                        ELSE IF SUBSTRING(@Body,@k,1)=N'=' BEGIN SET @op='='; SET @k+=1; END
+                        ELSE IF SUBSTRING(@Body,@k,1)=N'<' BEGIN SET @op='<'; SET @k+=1; END
+                        ELSE IF SUBSTRING(@Body,@k,1)=N'>' BEGIN SET @op='>'; SET @k+=1; END;
+                        IF @op IS NOT NULL
+                        BEGIN
+                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
+                            IF @k<=@len AND SUBSTRING(@Body,@k,1)=N'@'
+                            BEGIN
+                                SET @tok=N'@'; SET @k+=1;
+                                WHILE @k<=@len BEGIN SET @kc=SUBSTRING(@Body,@k,1); IF @kc LIKE N'[A-Za-z0-9_@#]' BEGIN SET @tok+=@kc; SET @k+=1; END ELSE BREAK; END;
+                                IF CHARINDEX(N'|'+UPPER(@tok)+N'|',@pset)>0
+                                BEGIN
+                                    SET @w2=CASE @op WHEN '<' THEN '>' WHEN '>' THEN '<' WHEN '<=' THEN '>=' WHEN '>=' THEN '<=' ELSE @op END;
+                                    SET @seed=TestGen.SeedFromLeaf(@w2,@operand);
+                                    IF @seed IS NOT NULL INSERT @leaf(ParamName,SeedLiteral) VALUES(@tok,@seed);
+                                END;
+                            END;
+                            SET @lhsOk=0; SET @i=@k; CONTINUE;
+                        END;
+                    END;
                     IF @ch=N'''' BEGIN SET @i+=1; SET @psA=1; CONTINUE; END;
                     IF @ch=N'[' BEGIN SET @i+=1; SET @pbk=1; CONTINUE; END;
-                    IF @ch=N'(' BEGIN SET @pp+=1; SET @lhsOk=1; SET @i+=1; CONTINUE; END;
-                    IF @ch=N')' BEGIN SET @pp=CASE WHEN @pp>0 THEN @pp-1 ELSE 0 END; SET @i+=1; CONTINUE; END;
+                    -- v11 #1: classify each '(' as a GROUPING paren (a boolean/comparison
+                    -- sub-expression - extract leaves inside it) or a function-CALL paren
+                    -- (dbo.f(...), ISNULL(...) - suppress, its args aren't seedable leaves).
+                    -- @lhsOk=1 means we're at an operand position => grouping; =0 means we
+                    -- just read an identifier/function name => call.  @callDepth counts only
+                    -- call parens, so extraction is gated on @callDepth=0 (was @pp=0), which
+                    -- now lets IF (@x > 5) / (5 = @x) / (@a AND @b) through.
+                    IF @ch=N'(' BEGIN IF @lhsOk=1 SET @pstk=@pstk+N'G'; ELSE BEGIN SET @pstk=@pstk+N'C'; SET @callDepth+=1; END; SET @pp+=1; SET @lhsOk=1; SET @i+=1; CONTINUE; END;
+                    IF @ch=N')' BEGIN IF LEN(@pstk)>0 BEGIN IF RIGHT(@pstk,1)=N'C' SET @callDepth=CASE WHEN @callDepth>0 THEN @callDepth-1 ELSE 0 END; SET @pstk=LEFT(@pstk,LEN(@pstk)-1); END; SET @pp=CASE WHEN @pp>0 THEN @pp-1 ELSE 0 END; SET @lhsOk=0; SET @i+=1; CONTINUE; END;
 
-                    IF @pp=0
+                    IF @callDepth=0
                     BEGIN
                         SET @pvc=CASE WHEN @i=1 THEN N' ' ELSE SUBSTRING(@Body,@i-1,1) END;
                         IF UPPER(SUBSTRING(@Body,@i,5))=N'BEGIN' AND PATINDEX(N'%[^A-Za-z0-9_@#]%',@pvc)=1
@@ -1267,6 +1485,14 @@ BEGIN
                                 END;
                                 IF @op='ISNULL' INSERT @leaf(ParamName,SeedLiteral) VALUES(@tok,N'NULL');
                                 ELSE IF @op IS NOT NULL AND @operand IS NOT NULL BEGIN SET @seed=TestGen.SeedFromLeaf(@op,@operand); IF @seed IS NOT NULL INSERT @leaf(ParamName,SeedLiteral) VALUES(@tok,@seed); END;
+                                -- v11 #5/#7: @param <op> NON-LITERAL RHS (another param, GETDATE(),
+                                -- @@SPID, dbo.f(), ...).  We can't read a literal, but an inequality
+                                -- is still satisfiable by driving @param to a type extreme regardless
+                                -- of the RHS value: <,<= -> type MIN ; >,>= -> type MAX.  The <<MIN>>/
+                                -- <<MAX>> sentinel is resolved per-param-type in RunCoverageForFunction.
+                                -- =,<> against a non-literal stays residue (can't match an unknown).
+                                ELSE IF @op IN ('<','<=') AND @operand IS NULL INSERT @leaf(ParamName,SeedLiteral) VALUES(@tok,N'<<MIN>>');
+                                ELSE IF @op IN ('>','>=') AND @operand IS NULL INSERT @leaf(ParamName,SeedLiteral) VALUES(@tok,N'<<MAX>>');
                                 SET @i=@k; CONTINUE;
                             END;
                             SET @i=@k; CONTINUE;
@@ -1387,10 +1613,15 @@ BEGIN
     DECLARE @driverClass SYSNAME = N'test_'+@shadow;
 
     -- per-parameter happy literal (drives @namedHappy below + the seed args)
-    DECLARE @ph TABLE (ord INT, name SYSNAME, happyLit NVARCHAR(MAX));
-    INSERT @ph (ord,name,happyLit)
+    -- happyLit drives the @namedHappy list; minLit/maxLit (type boundary-low /
+    -- boundary-high) resolve the <<MIN>>/<<MAX>> sentinels the extractor emits for
+    -- @param <op> non-literal-RHS branches (v11 #5/#7).
+    DECLARE @ph TABLE (ord INT, name SYSNAME, happyLit NVARCHAR(MAX), minLit NVARCHAR(MAX), maxLit NVARCHAR(MAX));
+    INSERT @ph (ord,name,happyLit,minLit,maxLit)
     SELECT parameter_id, name,
-           TestGen.GetSampleValueLiteral(TYPE_NAME(user_type_id),max_length,precision,scale,0)
+           TestGen.GetSampleValueLiteral(TYPE_NAME(user_type_id),max_length,precision,scale,0),
+           TestGen.GetSampleValueLiteral(TYPE_NAME(user_type_id),max_length,precision,scale,1),
+           TestGen.GetSampleValueLiteral(TYPE_NAME(user_type_id),max_length,precision,scale,2)
     FROM sys.parameters WHERE object_id=@objid AND parameter_id>0;
 
     DECLARE @namedHappy NVARCHAR(MAX)=N'', @namedNull NVARCHAR(MAX)=N'';
@@ -1440,6 +1671,9 @@ BEGIN
         DECLARE @fndef NVARCHAR(MAX)=OBJECT_DEFINITION(@objid);
         DECLARE @asp INT = TestGen.FindTopLevelAs(@fndef);
         DECLARE @fnbody NVARCHAR(MAX)= CASE WHEN @asp>0 THEN SUBSTRING(@fndef,@asp+2,LEN(@fndef)) ELSE @fndef END;
+        -- v11 #11: expand SET=CASE / RETURN CASE so the seeder sees the same IF arms
+        -- the shadow does, and derives a value for each (no-op when there is no CASE).
+        SET @fnbody = TestGen.ExpandCaseToIf(@fnbody);
         DECLARE @paramCsv NVARCHAR(MAX)=N'';
         SELECT @paramCsv=@paramCsv+name+N',' FROM @ph ORDER BY ord;
         DECLARE @retClause NVARCHAR(120)=CASE WHEN @ret=N'' THEN N'' ELSE N', '+@ret END;
@@ -1451,7 +1685,10 @@ BEGIN
         FROM (
             SELECT b.BranchId,
                    STRING_AGG(CONVERT(NVARCHAR(MAX),
-                        p.name + N'=' + ISNULL(a.SeedLiteral, p.happyLit)),
+                        p.name + N'=' + CASE a.SeedLiteral
+                                          WHEN N'<<MIN>>' THEN p.minLit
+                                          WHEN N'<<MAX>>' THEN p.maxLit
+                                          ELSE ISNULL(a.SeedLiteral, p.happyLit) END),
                         N', ') WITHIN GROUP (ORDER BY p.ord) AS args
             FROM (SELECT DISTINCT BranchId FROM asg) b
             CROSS JOIN @ph p

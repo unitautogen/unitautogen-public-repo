@@ -5909,3 +5909,120 @@ Verify with scripts/Verify_ShadowTeardown.sql.
 FILES: modules/30_Function_Support_v1.sql,
        Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
        scripts/Verify_ShadowTeardown.sql (new), CHANGES.md
+
+================================================================================
+2026-06-01  v11 seed coverage: parenthesised / reversed-string / non-literal RHS
+            + clock-env, and a committed capability demo schema
+================================================================================
+Three more predicate shapes the function branch-seeder (ExtractBranchSeeds) now
+reaches, plus the driver wiring to satisfy them, plus examples/Demo_Schema.sql.
+
+  PARENTHESISED COMPARISONS  -  IF (@x > 5), IF (@a >= 1 AND @b < 3), nested
+  groupings.  The extraction gate was @pp=0 (top level only), so any predicate
+  wrapped in parens produced NO seed.  Replaced it with a call-vs-grouping paren
+  classifier: each '(' is GROUPING (a boolean/comparison sub-expression - keep
+  extracting) when seen at an operand position (@lhsOk=1), or a function-CALL
+  paren (dbo.f(...), ABS(...), ISNULL(...) - suppress) when it follows an
+  identifier (@lhsOk=0).  A 'G'/'C' stack drives @callDepth; extraction is now
+  gated on @callDepth=0.  Function-call args are still correctly NOT seeded.
+
+  REVERSED STRING LITERALS  -  'US' = @code, 'M' < @grade.  A string at operand
+  position is intercepted before the generic string-skip, read, and its operator
+  mirrored (parallel to the existing reversed-NUMERIC handler).  Reversed numeric
+  already shipped; this closes the string side.
+
+  NON-LITERAL RHS  (#5)  and  CLOCK/ENV RHS  (#7)  -  @d < GETDATE(), @x > @y,
+  @n <= dbo.f().  For an INEQUALITY whose RHS is not a readable literal, the
+  branch is still satisfiable by driving the PARAM to a type extreme regardless
+  of the RHS value: < / <= -> type MIN, > / >= -> type MAX.  ExtractBranchSeeds
+  emits a <<MIN>>/<<MAX>> sentinel; RunCoverageForFunction resolves it per param
+  type via GetSampleValueLiteral variant 1 / 2 (boundary-low / boundary-high),
+  which it now precomputes into @ph (minLit/maxLit).  This replaces the prior
+  "leave #5/#7 as residue" stance for the param-on-the-left case.  Honest residue
+  remaining: =,<> against a non-literal (can't match an unknown), and gates with
+  NO parameter to steer (paramless @@SPID=5 / GETDATE compares, accumulated
+  values built by a loop/query).
+
+VERIFIED on AdventureWorks2025 via the SQL MCP (parser + end-to-end driver-arg
+resolution): a 10-branch mixed body returned every expected seed incl. <<MIN>>/
+<<MAX>>; @status=@@SPID correctly produced no seed; @d<GETDATE() resolved to
+@d='1900-01-01', @n>@m to @n=2147483647, @m<=dbo.f() to @m=-2147483648.  Full
+no-regression sweep of the prior shapes (=, >=, IN, IS NULL, LIKE, NOT*, ancestor-
+chaining) - unchanged.
+
+DEMO SCHEMA  -  examples/Demo_Schema.sql.  A self-contained [uaDemo] schema, one
+small richly-commented function per capability (12 objects: 10 scalar FN, 1 inline
+IF, 1 multi-statement TF), built because stock AdventureWorks/Northwind have almost
+no param-gated function branches to exercise these features (AW: only ufnGetStock/
+ufnGetContactInformation have IF branches, and ufnGetStock's is on a local;
+Northwind has zero user functions).  Each function's seed extraction was verified
+on the live DB to match its documented claim, including the honest-residue rows
+(ABS(@y)=7 call-paren -> no seed; @hits>3 accumulated -> no seed).  Run it with
+EXEC TestGen.GenerateAndCoverDatabase @SchemaFilter='uaDemo', @OutputMode='HTML'.
+
+NOTE: these seeding changes are FUNCTION-path only (ExtractBranchSeeds is called
+solely by RunCoverageForFunction).  Stored procedures use a different branch-
+coverage mechanism and are unaffected.
+
+ENVIRONMENT: the Edit tool silently truncated module 30 mid-HTML-string TWICE more
+during this work (lines ~1930 and ~1995); both caught by tsql_lint + wc -l and the
+unchanged GACD HTML tail restored byte-exact from git HEAD.  Installers folded via
+Python span-replacement (md5 2913df4e10e9f633faf173da3c1c56af, byte-identical).
+
+FILES: modules/30_Function_Support_v1.sql,
+       Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       examples/Demo_Schema.sql (new), CHANGES.md
+
+================================================================================
+2026-06-01  v11 #11: CASE-in-RETURN branch decomposition (TestGen.ExpandCaseToIf)
+================================================================================
+PROBLEM: a scalar function whose body is  SET @v = CASE ... END;  or
+RETURN CASE ... END;  (e.g. ufnGetSalesOrderStatusText / ufnGetPurchaseOrderStatusText
+/ ufnGetDocumentStatusText) reported 0 BRANCHES.  A CASE is a single expression -
+the line-based instrumenter (module 20) explicitly treats CASE arms as
+non-branching (the @InCaseBefore guard) because you cannot hook "which arm ran"
+without converting the CASE into control flow.  So the whole headline branch
+metric was dragged down (AdventureWorks showed 1/2) purely by un-decomposed CASE.
+
+FIX: new pure fn TestGen.ExpandCaseToIf rewrites a statement-scope
+SET <target> = CASE ... END  /  RETURN CASE ... END  into an
+IF / ELSE IF / ELSE chain (simple CASE  CASE @x WHEN v ...  ->  IF @x = v ... ;
+searched CASE  CASE WHEN cond ...  ->  IF (cond) ...).  Each arm is now an
+instrumentable IF branch AND a seedable leaf.  Char-walk, comment/string/bracket/
+paren + nested-CASE aware; CONSERVATIVE - only a clean top-level SET=CASE/RETURN
+CASE is expanded, anything else is copied through verbatim, and a malformed
+expansion just fails the shadow compile (existing TRY/CATCH -> honest deferral),
+never a crash.  Captured segments are whitespace-collapsed so each emitted IF
+header is single-line (the instrumenter is line-oriented).
+
+Applied in TWO places (module 30):
+  - BuildShadowProcForFunction: on @procBody (after RewriteScalarReturns, before
+    NormalizeShadowBody) so the shadow has the IF branches to COUNT.
+  - RunCoverageForFunction: on @fnbody before ExtractBranchSeeds so the seeder
+    sees the same arms and derives a value for each to COVER them.
+Both see identical conditions (@status = 1, = 2, ...), so seeds line up with
+branches.
+
+VERIFIED on AdventureWorks2025 via the SQL MCP (parser + shadow-build path; the
+final % needs an SSMS run for XEvent):
+  - ExpandCaseToIf on the real ufnGetSalesOrderStatusText body: expands to a clean
+    IF/ELSE chain that COMPILES as a proc; ExtractBranchSeeds on it -> @Status =
+    1..6 (6 seeds).
+  - Integrated BuildShadowProcForFunction: ufnGetSalesOrderStatusText builds
+    Status=OK with 7 instrumented branches (6 WHEN arms + ELSE), 8 exec lines;
+    ufnGetStock (CASE-free) still builds OK = no regression.
+So in an SSMS sweep these status-text scalars go from "n/a" branch to ~7/7.
+
+DEMO: examples/Demo_Schema.sql gains section 13 uaDemo.fnStatusText (the same
+6-arm CASE shape) - verified to seed @status=1..6 on the live DB.
+
+ENVIRONMENT: the Edit tool truncated module 30 TWICE more (HTML tail, lines ~1995
+and ~2251) AND the demo file once (mid-CASE at line 237); all caught by tsql_lint
++ wc -l and restored (module tail byte-exact from HEAD; demo rewritten whole).
+A stray apostrophe in a demo COMMENT (AdventureWorks') also tripped the linter's
+string-masker - reworded.  Installers folded via Python insert + span-replace
+(md5 3f690c77a88ce685f7c676bfd0907677, byte-identical).
+
+FILES: modules/30_Function_Support_v1.sql,
+       Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       examples/Demo_Schema.sql, CHANGES.md
