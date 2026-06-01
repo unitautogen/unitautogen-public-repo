@@ -11511,9 +11511,22 @@ BEGIN
     -- coverage - one iteration already covers the body).
     SET @procBody = TestGen.InjectLoopGuards(@procBody);
 
-    /* ---- (re)create the shadow procedure ---- */
-    IF OBJECT_ID(@shadowFull, 'P') IS NOT NULL
-        EXEC('DROP PROCEDURE ' + @shadowFull);
+    /* ---- (re)create the shadow procedure ----
+     * Defensively clear EVERY stale artifact a prior or interrupted run could
+     * have left under this shadow name, not just a same-named PROCEDURE.  The
+     * coverage instrument-swap leaves a SYNONYM at the base shadow name plus
+     * _cov / _orig procedures; if RunCoverage died mid-swap (or its teardown was
+     * skipped) the synonym survives, and a bare OBJECT_ID(...,'P') check misses
+     * it - so CREATE PROCEDURE then fails with "There is already an object named
+     * '<fn>_covfn'" and the function reports a false generation failure on every
+     * subsequent sweep.  Drop the synonym FIRST (it occupies the base name),
+     * then the _cov / _orig copies, then any same-named procedure. */
+    DECLARE @covFull  NVARCHAR(400) = QUOTENAME(@SchemaName)+N'.'+QUOTENAME(@ShadowName+N'_cov');
+    DECLARE @origFull NVARCHAR(400) = QUOTENAME(@SchemaName)+N'.'+QUOTENAME(@ShadowName+N'_orig');
+    BEGIN TRY IF OBJECT_ID(@shadowFull,'SN') IS NOT NULL EXEC('DROP SYNONYM '  +@shadowFull); END TRY BEGIN CATCH END CATCH;
+    BEGIN TRY IF OBJECT_ID(@covFull,'P')     IS NOT NULL EXEC('DROP PROCEDURE '+@covFull);    END TRY BEGIN CATCH END CATCH;
+    BEGIN TRY IF OBJECT_ID(@origFull,'P')    IS NOT NULL EXEC('DROP PROCEDURE '+@origFull);   END TRY BEGIN CATCH END CATCH;
+    BEGIN TRY IF OBJECT_ID(@shadowFull,'P')  IS NOT NULL EXEC('DROP PROCEDURE '+@shadowFull);  END TRY BEGIN CATCH END CATCH;
 
     DECLARE @full NVARCHAR(MAX) = @header + @procBody;
     BEGIN TRY
@@ -11900,18 +11913,50 @@ CREATE FUNCTION TestGen.SeedFromLeaf(@op VARCHAR(12), @lit NVARCHAR(500))
 RETURNS NVARCHAR(500)
 AS
 BEGIN
+    -- @lit is the comparand pulled from the predicate: bare digits for a numeric
+    -- comparison, or a fully-quoted string literal (e.g. 'M') for text/date.
+    DECLARE @isStr BIT = CASE WHEN LEFT(@lit,1)=N'''' THEN 1 ELSE 0 END;
+    DECLARE @bi BIGINT, @dn DECIMAL(38,10);
+
     IF @op IN ('=','<=','>=','IN','BETWEEN','LIKE') RETURN @lit;   -- literal satisfies as-is
     IF @op = 'ISNULL' RETURN N'NULL';
+
+    -- < > <> : numeric +/-1, OR (v11 #4) a lexical seed for string/date literals.
     IF @op IN ('<','>','<>')
     BEGIN
-        DECLARE @bi BIGINT = TRY_CONVERT(BIGINT, @lit);
-        IF @bi IS NOT NULL
-            RETURN CONVERT(NVARCHAR(40), CASE WHEN @op='<' THEN @bi-1 ELSE @bi+1 END);
-        DECLARE @dn DECIMAL(38,10) = TRY_CONVERT(DECIMAL(38,10), @lit);
-        IF @dn IS NOT NULL
-            RETURN CONVERT(NVARCHAR(50), CASE WHEN @op='<' THEN @dn-1 ELSE @dn+1 END);
-        RETURN NULL;            -- non-numeric: cannot invert < > <>
+        IF @isStr = 0
+        BEGIN
+            SET @bi = TRY_CONVERT(BIGINT, @lit);
+            IF @bi IS NOT NULL
+                RETURN CONVERT(NVARCHAR(40), CASE WHEN @op='<' THEN @bi-1 ELSE @bi+1 END);
+            SET @dn = TRY_CONVERT(DECIMAL(38,10), @lit);
+            IF @dn IS NOT NULL
+                RETURN CONVERT(NVARCHAR(50), CASE WHEN @op='<' THEN @dn-1 ELSE @dn+1 END);
+            RETURN NULL;            -- unquoted non-numeric (function call etc.): residue
+        END;
+        -- string / ISO-date literal: smaller = empty string; larger/<> = append a char
+        IF @op = '<' RETURN N'''''';                       -- '' sorts before any non-empty value
+        RETURN STUFF(@lit, LEN(@lit), 1, N'~''');          -- 'M' -> 'M~'   ( > and <> )
     END;
+
+    -- v11 #3 NOT forms: best-effort satisfying value.  A miss is harmless - each
+    -- seed EXEC is TRY/CATCH'd, so an inexact value just leaves the branch as
+    -- honest residue rather than breaking the driver.
+    IF @op IN ('NOTBETWEEN','NOTIN')
+    BEGIN
+        IF @isStr = 0
+        BEGIN
+            SET @bi = TRY_CONVERT(BIGINT, @lit);
+            IF @bi IS NOT NULL RETURN CONVERT(NVARCHAR(40), @bi-1);   -- below the low bound / before the first element
+            SET @dn = TRY_CONVERT(DECIMAL(38,10), @lit);
+            IF @dn IS NOT NULL RETURN CONVERT(NVARCHAR(50), @dn-1);
+            RETURN NULL;
+        END;
+        IF @op = 'NOTBETWEEN' RETURN N'''''';              -- '' sorts below the low bound
+        RETURN STUFF(@lit, LEN(@lit), 1, N'~''');          -- distinct from the first list element
+    END;
+    IF @op = 'NOTLIKE' RETURN N'''''';                     -- '' evades prefix/suffix/substring patterns
+
     RETURN NULL;                -- ISNOTNULL and anything else: no seed
 END;
 GO
@@ -11941,7 +11986,7 @@ BEGIN
     DECLARE @inLine BIT=0,@inBlk BIT=0,@inStr BIT=0,@inBr BIT=0;
     DECLARE @ch NCHAR(1),@nx NCHAR(1),@pvc NCHAR(1),@aft NCHAR(1);
     DECLARE @hasPending BIT=0, @bodyIsBegin BIT, @fw VARCHAR(6);
-    DECLARE @pp INT,@psA BIT,@pcl BIT,@pbk BIT,@stop BIT;
+    DECLARE @pp INT,@psA BIT,@pcl BIT,@pbk BIT,@stop BIT,@lhsOk BIT;
     DECLARE @tok NVARCHAR(200),@k INT,@kc NCHAR(1),@op VARCHAR(12),@operand NVARCHAR(500),@seed NVARCHAR(500),@w NVARCHAR(20),@w2 NVARCHAR(10);
 
     WHILE @i <= @len
@@ -11992,7 +12037,7 @@ BEGIN
             BEGIN
                 SET @i += CASE WHEN @fw='IF' THEN 2 ELSE 5 END;
                 DELETE FROM @leaf;
-                SET @pp=0; SET @psA=0; SET @pcl=0; SET @pbk=0; SET @stop=0; SET @bodyIsBegin=0;
+                SET @pp=0; SET @psA=0; SET @pcl=0; SET @pbk=0; SET @stop=0; SET @bodyIsBegin=0; SET @lhsOk=1;
                 WHILE @i<=@len AND @stop=0
                 BEGIN
                     SET @ch=SUBSTRING(@Body,@i,1);
@@ -12003,7 +12048,7 @@ BEGIN
                     IF @ch=N'-' AND @nx=N'-' BEGIN SET @i+=2; SET @pcl=1; CONTINUE; END;
                     IF @ch=N'''' BEGIN SET @i+=1; SET @psA=1; CONTINUE; END;
                     IF @ch=N'[' BEGIN SET @i+=1; SET @pbk=1; CONTINUE; END;
-                    IF @ch=N'(' BEGIN SET @pp+=1; SET @i+=1; CONTINUE; END;
+                    IF @ch=N'(' BEGIN SET @pp+=1; SET @lhsOk=1; SET @i+=1; CONTINUE; END;
                     IF @ch=N')' BEGIN SET @pp=CASE WHEN @pp>0 THEN @pp-1 ELSE 0 END; SET @i+=1; CONTINUE; END;
 
                     IF @pp=0
@@ -12017,6 +12062,7 @@ BEGIN
                         BEGIN
                             SET @tok=N'@'; SET @k=@i+1;
                             WHILE @k<=@len BEGIN SET @kc=SUBSTRING(@Body,@k,1); IF @kc LIKE N'[A-Za-z0-9_@#]' BEGIN SET @tok+=@kc; SET @k+=1; END ELSE BREAK; END;
+                            SET @lhsOk=0;
                             IF CHARINDEX(N'|'+UPPER(@tok)+N'|',@pset)>0
                             BEGIN
                                 SET @op=NULL; SET @operand=NULL;
@@ -12031,24 +12077,56 @@ BEGIN
                                 BEGIN
                                     SET @w=N''; WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[A-Za-z]' BEGIN SET @w+=SUBSTRING(@Body,@k,1); SET @k+=1; END; SET @w=UPPER(@w);
                                     IF @w=N'IS' BEGIN WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1; SET @w2=N''; WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[A-Za-z]' BEGIN SET @w2+=SUBSTRING(@Body,@k,1); SET @k+=1; END; SET @w2=UPPER(@w2); IF @w2=N'NULL' SET @op='ISNULL'; END
+                                    ELSE IF @w=N'NOT' BEGIN WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1; SET @w2=N''; WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[A-Za-z]' BEGIN SET @w2+=SUBSTRING(@Body,@k,1); SET @k+=1; END; SET @w2=UPPER(@w2); IF @w2=N'IN' SET @op='NOTIN'; ELSE IF @w2=N'BETWEEN' SET @op='NOTBETWEEN'; ELSE IF @w2=N'LIKE' SET @op='NOTLIKE'; END
                                     ELSE IF @w=N'IN' SET @op='IN';
                                     ELSE IF @w=N'BETWEEN' SET @op='BETWEEN';
                                     ELSE IF @w=N'LIKE' SET @op='LIKE';
                                 END;
-                                IF @op IN ('=','<','>','<=','>=','<>','LIKE','IN','BETWEEN')
+                                IF @op IN ('=','<','>','<=','>=','<>','LIKE','IN','BETWEEN','NOTIN','NOTLIKE','NOTBETWEEN')
                                 BEGIN
-                                    IF @op='IN' BEGIN WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1; IF SUBSTRING(@Body,@k,1)=N'(' SET @k+=1; END;
+                                    IF @op IN ('IN','NOTIN') BEGIN WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1; IF SUBSTRING(@Body,@k,1)=N'(' SET @k+=1; END;
                                     WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
                                     SET @kc=CASE WHEN @k<=@len THEN SUBSTRING(@Body,@k,1) ELSE N'' END;
                                     IF @kc=N'''' BEGIN SET @operand=N''''; SET @k+=1; WHILE @k<=@len BEGIN SET @kc=SUBSTRING(@Body,@k,1); IF @kc=N'''' AND SUBSTRING(@Body,@k+1,1)=N'''' BEGIN SET @operand+=N''''''; SET @k+=2; CONTINUE; END; SET @operand+=@kc; SET @k+=1; IF @kc=N'''' BREAK; END; END
                                     ELSE IF @kc LIKE N'[0-9]' OR (@kc IN (N'-',N'+',N'.') AND SUBSTRING(@Body,@k+1,1) LIKE N'[0-9]') BEGIN SET @operand=N''; IF @kc IN (N'-',N'+') BEGIN SET @operand+=@kc; SET @k+=1; END; WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[0-9.]' BEGIN SET @operand+=SUBSTRING(@Body,@k,1); SET @k+=1; END; END;
-                                    IF @op='LIKE' AND @operand IS NOT NULL BEGIN SET @operand=REPLACE(REPLACE(@operand,N'%',N''),N'_',N''); IF @operand=N'''''' SET @operand=NULL; END;
+                                    IF @op IN ('LIKE','NOTLIKE') AND @operand IS NOT NULL BEGIN SET @operand=REPLACE(REPLACE(@operand,N'%',N''),N'_',N''); IF @operand=N'''''' SET @operand=NULL; END;
                                 END;
                                 IF @op='ISNULL' INSERT @leaf(ParamName,SeedLiteral) VALUES(@tok,N'NULL');
                                 ELSE IF @op IS NOT NULL AND @operand IS NOT NULL BEGIN SET @seed=TestGen.SeedFromLeaf(@op,@operand); IF @seed IS NOT NULL INSERT @leaf(ParamName,SeedLiteral) VALUES(@tok,@seed); END;
                                 SET @i=@k; CONTINUE;
                             END;
                             SET @i=@k; CONTINUE;
+                        END;
+                        IF @lhsOk=1 AND ((@ch LIKE N'[0-9]') OR (@ch IN (N'-',N'+',N'.') AND SUBSTRING(@Body,@i+1,1) LIKE N'[0-9]'))
+                        BEGIN
+                            -- v11 #2: reversed predicate  literal <op> @param  (numeric LHS only).
+                            -- Read the literal, then mirror the operator so the param-side seed
+                            -- still satisfies the comparison (5 > @x  ==  @x < 5).
+                            SET @operand=N''; SET @k=@i;
+                            IF SUBSTRING(@Body,@k,1) IN (N'-',N'+') BEGIN SET @operand+=SUBSTRING(@Body,@k,1); SET @k+=1; END;
+                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) LIKE N'[0-9.]' BEGIN SET @operand+=SUBSTRING(@Body,@k,1); SET @k+=1; END;
+                            WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
+                            SET @op=NULL;
+                            IF SUBSTRING(@Body,@k,2) IN (N'>=',N'<=',N'<>',N'!=') BEGIN SET @op=CASE WHEN SUBSTRING(@Body,@k,2)=N'!=' THEN '<>' ELSE SUBSTRING(@Body,@k,2) END COLLATE DATABASE_DEFAULT; SET @k+=2; END
+                            ELSE IF SUBSTRING(@Body,@k,1)=N'=' BEGIN SET @op='='; SET @k+=1; END
+                            ELSE IF SUBSTRING(@Body,@k,1)=N'<' BEGIN SET @op='<'; SET @k+=1; END
+                            ELSE IF SUBSTRING(@Body,@k,1)=N'>' BEGIN SET @op='>'; SET @k+=1; END;
+                            IF @op IS NOT NULL
+                            BEGIN
+                                WHILE @k<=@len AND SUBSTRING(@Body,@k,1) IN (N' ',CHAR(9),CHAR(13),CHAR(10)) SET @k+=1;
+                                IF @k<=@len AND SUBSTRING(@Body,@k,1)=N'@'
+                                BEGIN
+                                    SET @tok=N'@'; SET @k+=1;
+                                    WHILE @k<=@len BEGIN SET @kc=SUBSTRING(@Body,@k,1); IF @kc LIKE N'[A-Za-z0-9_@#]' BEGIN SET @tok+=@kc; SET @k+=1; END ELSE BREAK; END;
+                                    IF CHARINDEX(N'|'+UPPER(@tok)+N'|',@pset)>0
+                                    BEGIN
+                                        SET @w2=CASE @op WHEN '<' THEN '>' WHEN '>' THEN '<' WHEN '<=' THEN '>=' WHEN '>=' THEN '<=' ELSE @op END;
+                                        SET @seed=TestGen.SeedFromLeaf(@w2,@operand);
+                                        IF @seed IS NOT NULL INSERT @leaf(ParamName,SeedLiteral) VALUES(@tok,@seed);
+                                    END;
+                                END;
+                            END;
+                            SET @lhsOk=0; SET @i=@k; CONTINUE;
                         END;
                         IF @ch LIKE N'[A-Za-z]'
                         BEGIN
@@ -12057,6 +12135,7 @@ BEGIN
                             SET @w=UPPER(@w);
                             IF @w IN (N'RETURN',N'SET',N'SELECT',N'INSERT',N'UPDATE',N'DELETE',N'PRINT',N'EXEC',N'EXECUTE',N'THROW',N'RAISERROR',N'BREAK',N'CONTINUE',N'WAITFOR',N'GOTO',N'DECLARE',N'MERGE',N'COMMIT',N'ROLLBACK',N'TRUNCATE')
                             BEGIN SET @stop=1; CONTINUE; END;
+                            SET @lhsOk = CASE WHEN @w IN (N'AND',N'OR',N'NOT') THEN 1 ELSE 0 END;
                             SET @i=@k; CONTINUE;
                         END;
                     END;

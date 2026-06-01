@@ -5804,3 +5804,108 @@ files - use Python string-replace + verify the tail every time.
 
 FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
        CHANGES.md
+
+================================================================================
+2026-06-01  v11 seed extensions: reversed / NOT / non-numeric branch seeds
+================================================================================
+SCOPE: extends Step-2 predicate-inversion seeding (TestGen.SeedFromLeaf +
+TestGen.ExtractBranchSeeds, module 30) to three predicate shapes previously left
+as honest residue.  Backlog items #2, #3, #4 from the v11 residue list.
+
+  #2 REVERSED predicates  `literal <op> @param`  (IF 5 = @status, IF 0 < @n,
+     IF 90 <= @n).  ExtractBranchSeeds gained a numeric-LHS branch in the
+     predicate scanner: it reads the leading literal, then MIRRORS the operator
+     (< <-> >, <= <-> >=, =/<> unchanged) so the param-side seed still satisfies
+     the gate (5 > @x  ==  @x < 5).  Guarded by a new @lhsOk boundary flag (set
+     at predicate start, after '(' and after AND/OR/NOT; cleared after any
+     param/identifier) so a non-literal LHS (@a+5 > @b, col5 = @w) does NOT
+     emit a speculative seed - those stay residue.  Reversed STRING literals are
+     consumed by the string-skip before the handler sees them, so they remain
+     residue (documented).
+
+  #3 NOT IN / NOT LIKE / NOT BETWEEN.  The operator reader now recognises a NOT
+     prefix and yields op codes NOTIN / NOTLIKE / NOTBETWEEN; the operand reader
+     and IN paren-skip / LIKE de-wildcard were widened to the NOT variants.
+     SeedFromLeaf returns a best-effort satisfying value: NOT BETWEEN lo..hi ->
+     lo-1 (num) / '' (str);  NOT IN (a,..) -> a-1 (num) / a+'~' (str);  NOT LIKE
+     'p' -> '' (empty string evades prefix/suffix/substring patterns).
+
+  #4 Non-numeric  < > <>  on string / ISO-date literals (SeedFromLeaf was
+     numeric-only and returned NULL).  Now: < -> '' (sorts before any non-empty
+     value);  > and <> -> the literal with a trailing char appended via STUFF
+     ('M' -> 'M~').  ISO dates sort lexically, so '2020-01-01' style literals are
+     handled by the same string path.
+
+SAFE BY CONSTRUCTION (unchanged invariant): every seed EXEC and the whole
+seed-build block in RunCoverageForFunction are TRY/CATCH'd, so an inexact NOT/
+non-numeric seed merely fails to enter its branch (honest residue) and can never
+break a run or regress coverage.  Values still come only from the code's own
+literals (+/-1, '', or a one-char append), so emitted EXEC args are well-formed.
+
+VERIFIED on AdventureWorks2025 via the SQL MCP (CREATE OR ALTER both functions,
+then exercised directly - the parser path does not need XEvent):
+  - SeedFromLeaf: 16/16 scenarios (num </>/<>; str </>/<>; date <; NOT* num+str;
+    ISNULL; LIKE passthru; unquoted-non-numeric -> NULL residue).
+  - ExtractBranchSeeds: a 10-branch mixed body returned every expected seed;
+    reversed >=/<= mirrored correctly (90, 100); the @lhsOk guard suppressed
+    @a+5>@b and col5=@w; parenthesised (3<@z) stays residue (pre-existing @pp>0
+    gating, consistent).  Real OBJECT_DEFINITION path (fn_rev/fn_not/fn_guard)
+    matched the bare-body results.
+  - No regression: param-first =, >=, IN, IS NULL, LIKE and ancestor-chaining
+    all unchanged (fn_grade/fn_region-style bodies + nested IF @x>5 / IF @y=7).
+
+ENVIRONMENT NOTE: the Edit tool silently TRUNCATED module 30 mid-HTML-string at
+line ~1930 during this work (the known large-file Edit truncation).  Caught by
+tsql_lint (BEGIN/END imbalance + unterminated string) and wc -l (1929 vs HEAD
+1948).  All edits were above the cut; restored the unchanged GACD HTML tail
+byte-exact from git HEAD (CRLF-normalised), then re-linted clean.  Installers were
+folded via Python span-replacement (NOT the Edit tool) and are byte-identical
+(md5 db2018f5f18a60d83a5318fe4415baf0).
+
+FILES: modules/30_Function_Support_v1.sql,
+       Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       scripts/Patch_v11_SeedExtensions.sql (new, standalone CREATE OR ALTER),
+       scripts/Verify_SeedExtensions.sql (new), CHANGES.md
+
+================================================================================
+2026-06-01  Multi-statement TVF shadow teardown gap: false "failed generation"
+================================================================================
+SYMPTOM: a full GenerateAndCoverDatabase sweep on AdventureWorks2025 reported
+dbo.ufnGetContactInformation (the only multi-statement TVF, kind TF) as
+"failed generation - UNSUPPORTED:shadow compile failed: There is already an
+object named 'ufnGetContactInformation_covfn' in the database."  Northwind
+(no mTVFs) swept 100% clean, confirming the fault was isolated to the TF path.
+
+ROOT CAUSE: the coverage instrument-swap (InstrumentProcedure) renames the shadow
+proc <fn>_covfn -> <fn>_covfn_orig, builds an instrumented <fn>_covfn_cov, and
+points a SYNONYM <fn>_covfn at the instrumented copy.  RunCoverageForFunction's
+end-of-run teardown drops all three, but if a PRIOR run was interrupted (or its
+teardown was skipped) the SYNONYM survives.  On the NEXT sweep,
+BuildShadowProcForFunction's pre-create guard only did
+    IF OBJECT_ID(@shadowFull,'P') IS NOT NULL DROP PROCEDURE ...
+- a 'P'(rocedure)-only check.  A leftover SYNONYM ('SN') is invisible to that
+check, so CREATE PROCEDURE <fn>_covfn then collided with the synonym and the
+function reported a FALSE generation failure on every subsequent sweep until the
+orphan was cleared by hand.  Not a regression from the seed-extension work (that
+touches only SeedFromLeaf / ExtractBranchSeeds); a pre-existing teardown gap.
+
+FIX (BuildShadowProcForFunction, module 30 + both installers): replace the
+'P'-only guard with a COMPLETE defensive teardown that clears every artifact a
+prior/interrupted run could have left under the shadow name, in the right order -
+SYNONYM first (it occupies the base name), then _cov / _orig copies, then any
+same-named procedure - each wrapped in its own TRY/CATCH.  This makes the build
+idempotent regardless of what an earlier run stranded; the end-of-run teardown is
+unchanged (now belt-and-suspenders).
+
+VERIFIED on AdventureWorks2025 via the SQL MCP: pre-seeded the exact tangle
+(CREATE SYNONYM <fn>_covfn FOR sys.objects + dummy _orig/_cov procs), then called
+BuildShadowProcForFunction - Status='OK', the synonym was replaced by a real
+shadow PROCEDURE, both stale copies were dropped, and the 71-row ShadowLineMap
+built.  Before the fix this same scenario raised the "already an object named"
+error.  Cleaned all shadow orphans afterwards; originals intact.
+
+Verify with scripts/Verify_ShadowTeardown.sql.
+
+FILES: modules/30_Function_Support_v1.sql,
+       Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       scripts/Verify_ShadowTeardown.sql (new), CHANGES.md
