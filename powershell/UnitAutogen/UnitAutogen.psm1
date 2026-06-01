@@ -395,7 +395,9 @@ function Export-CoverageCoberturaXml {
 
     Write-Host "[UnitAutogen] Fetching Cobertura XML from [$Database]..."
 
-    $result = Invoke-Sqlcmd @connParams -Query $query
+    # -MaxCharLength: Invoke-Sqlcmd silently truncates column values at 4000
+    # chars by default; override so the full Cobertura XML reaches PowerShell.
+    $result = Invoke-Sqlcmd @connParams -Query $query -MaxCharLength ([int]::MaxValue)
     $xml    = $result.CoberturaXml
 
     if (-not $xml) {
@@ -457,7 +459,9 @@ function Export-TestResultsJunitXml {
 
     Write-Host "[UnitAutogen] Fetching JUnit XML from [$Database]..."
 
-    $result = Invoke-Sqlcmd @connParams -Query $query
+    # -MaxCharLength: Invoke-Sqlcmd silently truncates column values at 4000
+    # chars by default; override so the full JUnit XML reaches PowerShell.
+    $result = Invoke-Sqlcmd @connParams -Query $query -MaxCharLength ([int]::MaxValue)
     $xml    = $result.JUnitXml
 
     if (-not $xml) {
@@ -521,7 +525,9 @@ function Export-CoverageHtmlReport {
 
     Write-Host "[UnitAutogen] Fetching HTML report from [$Database]..."
 
-    $result = Invoke-Sqlcmd @connParams -Query $query
+    # -MaxCharLength: Invoke-Sqlcmd silently truncates column values at 4000
+    # chars by default; override so the full HTML report reaches PowerShell.
+    $result = Invoke-Sqlcmd @connParams -Query $query -MaxCharLength ([int]::MaxValue)
     $html   = $result.CoverageReportHTML
 
     if (-not $html) {

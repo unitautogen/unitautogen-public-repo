@@ -1,5 +1,5 @@
 @{
-    ModuleVersion     = '0.9.2'
+    ModuleVersion     = '0.9.3'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -38,23 +38,35 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
+## v0.9.3 (beta) — 2026-06-01
+
+Critical fix (affects ALL prior versions — please upgrade):
+- Export functions silently truncated their output at 4000 characters
+  in v0.9.0, v0.9.1, and v0.9.2 because Invoke-Sqlcmd's default
+  -MaxCharLength was not overridden. Export-CoverageCoberturaXml,
+  Export-TestResultsJunitXml, and Export-CoverageHtmlReport all now
+  pass -MaxCharLength ([int]::MaxValue), so the full content reaches
+  disk. Any user who ran Invoke-UnitAutogen against a non-trivial
+  database was affected.
+
+Other improvements:
+- Validation on AdventureWorks 2025 now reports 94.9% line coverage
+  and 94.4% branch coverage (up from 93.9% line / 50% branch on the
+  same database under v0.9.1). Branch detection in scalar functions
+  with multi-arm CASE expressions is per-arm, and seeding reaches
+  each arm. Three AdventureWorks status-text functions now hit
+  100% / 100%.
+
 ## v0.9.2 (beta) — 2026-06-01
 
-Fixes:
 - TVF shadow teardown: defensively drops the synonym/_cov/_orig objects
   before rebuild, eliminating the "already an object named _covfn" failure
   on rerun when a previous coverage run was interrupted.
-
-v11 work-in-progress (bundled SQL installer updates):
-- 30_Function_Support_v1.sql — scalar function + TVF coverage groundwork.
-- Patch_v11_SeedExtensions.sql + Verify_SeedExtensions.sql — seed
-  extension patches for branch-condition seeding.
-- Verify_ShadowTeardown.sql — verification script for the teardown fix.
-
-Examples:
+- Bundled SQL installer updated with v11 function coverage and seeding
+  extensions (30_Function_Support_v1.sql, Patch_v11_SeedExtensions.sql,
+  Verify_SeedExtensions.sql, Verify_ShadowTeardown.sql).
 - New examples/Demo_Schema.sql for an end-to-end walkthrough.
-
-PowerShell cmdlets are unchanged from v0.9.1.
+- PowerShell cmdlets unchanged from v0.9.1.
 
 ## v0.9.1 (beta)
 
