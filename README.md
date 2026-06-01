@@ -2,6 +2,8 @@
 
 > **Built on tSQLt — auto-generated unit tests with real branch coverage.**
 
+![UnitAutogen coverage report: 94.9% line, 94.4% branch, 100% autonomous on a full AdventureWorks2025 sweep](assets/hero-coverage.png)
+
 UnitAutogen is a framework for SQL Server that **reads a stored procedure, generates a complete tSQLt unit-test class for it, and reports real line *and* branch coverage** of the test run. Point it at a procedure; minutes later you have a runnable test class that exercises every IF / CASE / EXISTS path and a coverage report that tells you what was actually hit.
 
 It is built on top of the open-source [tSQLt](https://tsqlt.org) framework. The tests it generates run under tSQLt and produce tSQLt-native results.
@@ -13,9 +15,19 @@ Validated end-to-end against AdventureWorks, Northwind, and WideWorldImporters. 
 
 ---
 
+## See it in action
+
+One command generates the tests, runs them, measures coverage, and emits the CI-standard artifacts your pipeline already understands — Cobertura (coverage), JUnit (test results), and a human-readable HTML report:
+
+![End to end: one PowerShell command to coverage report to Cobertura and JUnit](assets/end-to-end.png)
+
+---
+
 ## Why it exists
 
 The SQL Server testing ecosystem already has unit-testing frameworks (tSQLt, Redgate SQL Test, Devart dbForge Unit Test) and coverage tools (SQLCover, SQLServerCoverage). Every one of them assumes a human has already written the tests. **UnitAutogen is the missing front half.** It writes the tests, runs them, and measures real branch coverage — converting "we should write tests for these 200 legacy procs" from a person-months task into an afternoon's curation.
+
+![Branch coverage: 50% with line-only tools versus 94.4% with UnitAutogen on the same tests](assets/branch-before-after.png)
 
 ## Requirements
 

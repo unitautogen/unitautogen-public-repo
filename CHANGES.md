@@ -6026,3 +6026,45 @@ string-masker - reworded.  Installers folded via Python insert + span-replace
 FILES: modules/30_Function_Support_v1.sql,
        Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
        examples/Demo_Schema.sql, CHANGES.md
+
+================================================================================
+2026-06-01  Brand fix: HTML coverage report header -> UnitAutogen
+================================================================================
+The generated HTML coverage report still rendered the OLD product name
+"tSQLt Auto-Gen" in its <title> and <h2> - so the public-facing report artifact
+(and the launch screenshots) were mis-branded while the PowerShell module et al.
+already said UnitAutogen.  Scoped to the report OUTPUTS only (per request):
+  - HTML <title>:  "tSQLt Auto-Gen Coverage"  ->  "UnitAutogen Coverage Report"
+  - HTML <h2>:     "tSQLt Auto-Gen - Database Coverage Report"
+                   ->  "UnitAutogen - Database Coverage Report"
+Applied in all three HTML renderers (module 04 base GACD, module 25 standalone
+Export-CoverageHtmlReport, module 30 v11 GACD) + both installer copies (6 strings
+each, byte-identical md5 5f8e4a80749a2c7560d3fa34933a40f4).  JUnit already emits
+name="UnitAutogen"; Cobertura carries no product name - both left untouched.  The
+underlying "tSQLt" references, installer banners, RAISERROR and test-comment
+strings are intentionally unchanged (tSQLt is the real framework it builds on).
+Re-install (the renderer lives in the DB) then re-run to get a UnitAutogen-branded
+report for the screenshots.
+
+FILES: modules/04_Test_Generator_v3.sql, modules/25_Coverage_Reporter_Html.sql,
+       modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+================================================================================
+2026-06-01  HTML report column relabel (Procedure -> Object) + README hero shots
+================================================================================
+- The standalone Export-CoverageHtmlReport (module 25) and the base GACD (module
+  04) HTML reports labelled the per-row column "Procedure" and the count
+  "N procedures", but the list includes user FUNCTIONS too (ufn*).  Module 30's
+  v11 GACD already said "Object"/"objects"; aligned 04 + 25 (+ both installers,
+  byte-identical md5 1ec95a87b709c90c139f9edc3cc567f9) so a function never sits
+  under a "Procedure" header.  Pure label text; no logic change.
+- README.md: new "See it in action" section just under the intro - the rebranded
+  HTML coverage report (94.9% line / 94.4% branch / 100% autonomy on a full
+  AdventureWorks2025 sweep), the one-line PowerShell invocation, and the Cobertura
+  + JUnit artifact shots.  Images live in Screenshots/.  (The post-rebrand re-run
+  confirmed branch coverage 50% -> 94.4% once the CASE-in-RETURN arms are counted.)
+
+FILES: modules/04_Test_Generator_v3.sql, modules/25_Coverage_Reporter_Html.sql,
+       Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       README.md, Screenshots/*.png, CHANGES.md

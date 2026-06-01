@@ -2110,7 +2110,7 @@ BEGIN
 
     /*-------------------------------- HTML ---------------------------------*/
     DECLARE @H NVARCHAR(MAX) = N'';
-    SET @H = @H + N'<!DOCTYPE html><html><head><meta charset="utf-8"><title>tSQLt Auto-Gen Coverage</title><style>';
+    SET @H = @H + N'<!DOCTYPE html><html><head><meta charset="utf-8"><title>UnitAutogen Coverage Report</title><style>';
     SET @H = @H + N'body{font-family:Segoe UI,Arial,sans-serif;margin:20px;color:#222}';
     SET @H = @H + N'h2{margin:0 0 2px}.meta{color:#777;font-size:12px;margin:0 0 14px}';
     SET @H = @H + N'.cards{display:flex;gap:14px;margin-bottom:16px;flex-wrap:wrap}';
@@ -2122,7 +2122,7 @@ BEGIN
     SET @H = @H + N'th{background:#f3f3f3}td.l,th.l{text-align:left}';
     SET @H = @H + N'tr.total{font-weight:bold;background:#f3f3f3}';
     SET @H = @H + N'</style></head><body>';
-    SET @H = @H + N'<h2>tSQLt Auto-Gen &mdash; Database Coverage Report</h2>';
+    SET @H = @H + N'<h2>UnitAutogen &mdash; Database Coverage Report</h2>';
     SET @H = @H + N'<p class="meta">' + DB_NAME() + N' &middot; ' + CONVERT(VARCHAR,@BatchId,120)
                  + N' &middot; ' + CAST(@gProcs AS VARCHAR) + N' objects ('
                  + CAST(@gGenFail AS VARCHAR) + N' failed generation, '
