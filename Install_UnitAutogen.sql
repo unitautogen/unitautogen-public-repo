@@ -76,6 +76,36 @@ BEGIN
 END
 GO
 
+/*---------------------------------------------------------------------------
+ * Pre-flight check: database compatibility level must be 130 or higher.
+ * UnitAutogen uses STRING_SPLIT, which requires compatibility_level >= 130
+ * (SQL Server 2016 syntax). The SQL Server instance can be newer; this is
+ * about the DATABASE compat setting specifically. Databases upgraded
+ * across SQL Server versions without an explicit ALTER DATABASE often sit
+ * at compat 110 (SQL 2012) or 120 (SQL 2014).
+ *
+ * Same short-circuit pattern as the tSQLt check: SET NOEXEC ON, with the
+ * matching SET NOEXEC OFF at the very bottom of this file.
+ *--------------------------------------------------------------------------*/
+DECLARE @CompatLevel TINYINT;
+SELECT @CompatLevel = compatibility_level
+FROM sys.databases
+WHERE database_id = DB_ID();
+
+IF @CompatLevel < 130
+BEGIN
+    DECLARE @msg NVARCHAR(MAX) =
+        'UnitAutogen install aborted: this database compatibility_level is ' +
+        CAST(@CompatLevel AS VARCHAR(10)) +
+        '. UnitAutogen requires compatibility_level >= 130 (SQL Server 2016) ' +
+        'because the framework uses STRING_SPLIT. To bump the level: ' +
+        'ALTER DATABASE [' + DB_NAME() + '] SET COMPATIBILITY_LEVEL = 130; ' +
+        'then re-run this installer.';
+    RAISERROR(@msg, 16, 1);
+    SET NOEXEC ON;
+END
+GO
+
 IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'TestGen')
     EXEC('CREATE SCHEMA TestGen AUTHORIZATION dbo;');
 GO
@@ -7800,6 +7830,13 @@ BEGIN
         RETURN;
     END;
 
+    -- v0.9.5: defensively self-heal any procedures left in a broken state
+    -- by a previously-killed coverage run.  Safe no-op if database is clean.
+    -- Runs once at the start as a database-wide sweep (more efficient than
+    -- per-procedure checks while iterating).
+    IF OBJECT_ID('TestGen.CleanupInterruptedRuns','P') IS NOT NULL
+        EXEC TestGen.CleanupInterruptedRuns @SchemaFilter = @SchemaFilter;
+
     DECLARE @BatchId DATETIME2(3) = SYSUTCDATETIME();
 
     -- loop variables (declared once; SET per iteration - never DECLARE = expr in a loop)
@@ -12655,6 +12692,157 @@ PRINT 'TestGen.RunCoverageForFunction installed.';
 GO
 
 /*===========================================================================
+ * v0.9.5: Recovery procedures for interrupted coverage runs.
+ *
+ * When a coverage run is killed mid-flight (test cancelled, agent crashed,
+ * connection dropped), the procedure being instrumented is left in this
+ * broken state:
+ *   - synonym   [schema].[proc]      -> [schema].[proc]_cov  (wrong target)
+ *   - procedure [schema].[proc]_cov                          (instrumented copy)
+ *   - procedure [schema].[proc]_orig                         (the renamed original)
+ * The base name [schema].[proc] is now a synonym, so any caller of the
+ * procedure routes through a synonym to a stale instrumented copy. Production
+ * would break.
+ *
+ * Recovery is safe and reversible: rename _orig BACK to the original name
+ * (sp_rename preserves the body and metadata) after dropping the synonym
+ * and the _cov copy. We explicitly never DROP _orig - the original body
+ * lives in it.
+ *
+ * Two public procedures:
+ *   TestGen.CleanupInterruptedRunForProc - single-procedure targeted recovery
+ *   TestGen.CleanupInterruptedRuns       - database-wide sweep with @WhatIf preview
+ *==========================================================================*/
+
+IF OBJECT_ID('TestGen.CleanupInterruptedRunForProc','P') IS NOT NULL
+    DROP PROCEDURE TestGen.CleanupInterruptedRunForProc;
+GO
+CREATE PROCEDURE TestGen.CleanupInterruptedRunForProc
+    @SchemaName SYSNAME,
+    @ProcName   SYSNAME
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @origName SYSNAME       = @ProcName + '_orig';
+    DECLARE @covName  SYSNAME       = @ProcName + '_cov';
+    DECLARE @origObj  NVARCHAR(300) = QUOTENAME(@SchemaName) + '.' + QUOTENAME(@origName);
+    DECLARE @covObj   NVARCHAR(300) = QUOTENAME(@SchemaName) + '.' + QUOTENAME(@covName);
+    DECLARE @baseObj  NVARCHAR(300) = QUOTENAME(@SchemaName) + '.' + QUOTENAME(@ProcName);
+    DECLARE @SQL      NVARCHAR(MAX);
+
+    -- No _orig means no interrupted run for this procedure.
+    IF OBJECT_ID(@origObj, 'P') IS NULL
+        RETURN;
+
+    -- (1) Drop the synonym if present.
+    IF EXISTS (
+        SELECT 1 FROM sys.synonyms
+        WHERE name = @ProcName AND schema_id = SCHEMA_ID(@SchemaName)
+    )
+    BEGIN
+        SET @SQL = N'DROP SYNONYM ' + @baseObj;
+        EXEC sp_executesql @SQL;
+    END;
+
+    -- (2) Drop the _cov instrumented copy if present.
+    IF OBJECT_ID(@covObj, 'P') IS NOT NULL
+    BEGIN
+        SET @SQL = N'DROP PROCEDURE ' + @covObj;
+        EXEC sp_executesql @SQL;
+    END;
+
+    -- (3) Rename _orig back to the original name.  NEVER drop _orig.
+    --     The original procedure body lives in _orig.  sp_rename preserves
+    --     the body, parameters, permissions chain, and dependency metadata.
+    SET @SQL = N'EXEC sp_rename ''' + @SchemaName + N'.' + @origName + N''', ''' + @ProcName + N'''';
+    EXEC sp_executesql @SQL;
+
+    PRINT 'Self-healed: ' + @baseObj + ' restored from interrupted prior coverage run (original body preserved via _orig rename).';
+END;
+GO
+PRINT 'TestGen.CleanupInterruptedRunForProc installed.';
+GO
+
+IF OBJECT_ID('TestGen.CleanupInterruptedRuns','P') IS NOT NULL
+    DROP PROCEDURE TestGen.CleanupInterruptedRuns;
+GO
+CREATE PROCEDURE TestGen.CleanupInterruptedRuns
+    @SchemaFilter SYSNAME = NULL,
+    @WhatIf       BIT     = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Find every procedure ending in _orig whose base name is held by a
+    -- synonym - that combination indicates a broken half-instrumented state.
+    DECLARE @Orphans TABLE (
+        SchemaName SYSNAME,
+        ProcName   SYSNAME
+    );
+
+    INSERT @Orphans (SchemaName, ProcName)
+    SELECT
+        s.name,
+        LEFT(o.name, LEN(o.name) - 5)  -- strip the '_orig' suffix
+    FROM sys.objects o
+    JOIN sys.schemas s ON s.schema_id = o.schema_id
+    WHERE o.type = 'P'
+      AND o.name LIKE '%[_]orig'
+      AND (@SchemaFilter IS NULL OR s.name = @SchemaFilter)
+      AND EXISTS (
+          SELECT 1 FROM sys.synonyms syn
+          WHERE syn.schema_id = o.schema_id
+            AND syn.name      = LEFT(o.name, LEN(o.name) - 5)
+      );
+
+    DECLARE @count INT = (SELECT COUNT(*) FROM @Orphans);
+
+    IF @count = 0
+    BEGIN
+        PRINT 'TestGen.CleanupInterruptedRuns: no interrupted runs detected. Database is clean.';
+        RETURN;
+    END;
+
+    PRINT 'TestGen.CleanupInterruptedRuns: detected ' + CAST(@count AS VARCHAR(10)) + ' procedure(s) with orphaned coverage state.';
+
+    DECLARE @s SYSNAME, @p SYSNAME;
+
+    IF @WhatIf = 1
+    BEGIN
+        PRINT '[WhatIf] Would clean up the following procedures:';
+        DECLARE c CURSOR LOCAL FAST_FORWARD FOR
+            SELECT SchemaName, ProcName FROM @Orphans;
+        OPEN c;
+        FETCH NEXT FROM c INTO @s, @p;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            PRINT '  [WhatIf]   ' + QUOTENAME(@s) + N'.' + QUOTENAME(@p);
+            FETCH NEXT FROM c INTO @s, @p;
+        END;
+        CLOSE c; DEALLOCATE c;
+        PRINT '[WhatIf] Re-run with @WhatIf = 0 to perform the cleanup.';
+        RETURN;
+    END;
+
+    DECLARE c2 CURSOR LOCAL FAST_FORWARD FOR
+        SELECT SchemaName, ProcName FROM @Orphans;
+    OPEN c2;
+    FETCH NEXT FROM c2 INTO @s, @p;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        EXEC TestGen.CleanupInterruptedRunForProc @SchemaName = @s, @ProcName = @p;
+        FETCH NEXT FROM c2 INTO @s, @p;
+    END;
+    CLOSE c2; DEALLOCATE c2;
+
+    PRINT 'TestGen.CleanupInterruptedRuns: cleanup complete.';
+END;
+GO
+PRINT 'TestGen.CleanupInterruptedRuns installed.';
+GO
+
+/*===========================================================================
  * v11: function-aware override of TestGen.GenerateAndCoverDatabase.
  * Identical to the base proc for stored procedures; additionally
  * enumerates user functions (FN/IF/TF) and routes them through
@@ -12678,6 +12866,13 @@ BEGIN
         RAISERROR('The tSQLt Auto-Gen framework is not fully installed in this database.',16,1);
         RETURN;
     END;
+
+    -- v0.9.5: defensively self-heal any procedures left in a broken state
+    -- by a previously-killed coverage run.  Safe no-op if database is clean.
+    -- Runs once at the start as a database-wide sweep (more efficient than
+    -- per-procedure checks while iterating).
+    IF OBJECT_ID('TestGen.CleanupInterruptedRuns','P') IS NOT NULL
+        EXEC TestGen.CleanupInterruptedRuns @SchemaFilter = @SchemaFilter;
 
     DECLARE @BatchId DATETIME2(3) = SYSUTCDATETIME();
 

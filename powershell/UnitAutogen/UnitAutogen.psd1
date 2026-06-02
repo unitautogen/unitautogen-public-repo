@@ -1,5 +1,5 @@
 @{
-    ModuleVersion     = '0.9.3'
+    ModuleVersion     = '0.9.5'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -38,6 +38,35 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
+## v0.9.5 (beta) — 2026-06-02
+
+Production-safety release.  Two operational fixes:
+
+1. Recovery from interrupted coverage runs (production-critical):
+   When a coverage run is killed mid-flight (test cancelled, agent
+   crashed, connection dropped), the procedure being instrumented was
+   left in a broken state - the base name became a synonym pointing
+   at a stale _cov copy, and any application that called the procedure
+   would hit the wrong target.  Two new public procedures:
+
+   - TestGen.CleanupInterruptedRunForProc - single-procedure recovery
+   - TestGen.CleanupInterruptedRuns       - database-wide sweep with
+                                            optional @SchemaFilter and
+                                            @WhatIf preview mode
+
+   GenerateAndCoverDatabase now calls CleanupInterruptedRuns at the
+   start as a database-wide sweep, so the framework self-heals
+   automatically on the next coverage run.  No user action required
+   in the normal path.  Recovery is safe and reversible:  _orig is
+   renamed back to the original name via sp_rename; the original
+   procedure body is preserved (never DROPped).
+
+2. Compatibility-level pre-flight check:
+   Installer now detects databases with compatibility_level < 130 and
+   aborts with a clear actionable message (instead of cascading errors
+   from STRING_SPLIT).  The required ALTER DATABASE statement is
+   included verbatim in the error so the user can copy-paste to fix.
+
 ## v0.9.3 (beta) — 2026-06-01
 
 Critical fix (affects ALL prior versions — please upgrade):
