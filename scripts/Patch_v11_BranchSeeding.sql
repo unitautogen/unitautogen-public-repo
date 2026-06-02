@@ -3,7 +3,7 @@
  *----------------------------------------------------------------------------
  * Run AFTER Install_UnitAutogen.sql (+ earlier v11 patches). Idempotent.
  *
- * GOAL (DESIGN_v11_BranchSeeding.md, Layer B): reach value-gated branches of a
+ * GOAL (design/DESIGN_v11_BranchSeeding.md, Layer B): reach value-gated branches of a
  * function ON PURPOSE instead of by luck.  The happy+NULL driver only covers the
  * branches those two inputs happen to land on; a branch like `IF @status = 5`
  * or `IF @n < 0` is missed.  This derives a parameter value that SATISFIES each

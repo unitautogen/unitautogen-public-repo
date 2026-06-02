@@ -3,7 +3,7 @@
  *----------------------------------------------------------------------------
  * Run AFTER Patch_v11_BranchSeeding.sql (or the folded Step 2). Idempotent.
  *
- * GOAL (DESIGN_v11_AncestorChaining.md): reach a branch nested inside ANOTHER
+ * GOAL (design/DESIGN_v11_AncestorChaining.md): reach a branch nested inside ANOTHER
  * parameter's predicate.  Step 2 satisfied a branch's own leaf but left every
  * other param happy, so
  *       IF @kind = 'A' BEGIN  IF @amount > 1000 ...  END

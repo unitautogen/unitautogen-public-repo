@@ -10869,7 +10869,7 @@ GO
  *   IF  inline table-valued
  *   TF  multi-statement table-valued
  *
- * Design: DESIGN_v11_Functions.md.  Coverage is measured via the
+ * Design: design/DESIGN_v11_Functions.md.  Coverage is measured via the
  * SHADOW-PROCEDURE TRANSFORM: a function body cannot host an
  * EXEC TestGen.RecordCoverageHit recorder and is unreliable to capture
  * directly (scalar-UDF statements run inside the calling statement, and
@@ -12112,7 +12112,7 @@ GO
  *   4. relabel CoverageResult to the function   5. clean up
  *==========================================================================*/
 /*===========================================================================
- * v11 Step 2 (DESIGN_v11_BranchSeeding.md, Layer B): predicate-inversion
+ * v11 Step 2 (design/DESIGN_v11_BranchSeeding.md, Layer B): predicate-inversion
  * branch seeding.  SeedFromLeaf inverts one comparison leaf to a value that
  * makes the predicate TRUE; ExtractBranchSeeds pulls (param, satisfying value)
  * leaves from a function body.  RunCoverageForFunction then drives the shadow
@@ -12184,7 +12184,7 @@ GO
 -- and a stack of enclosing IF/WHILE gates; each branch's seed = its own leaves
 -- PLUS every ancestor gate's satisfying assignment.  Returns BranchId so the
 -- caller drives one shadow EXEC per branch with all assigned params overridden.
--- See DESIGN_v11_AncestorChaining.md.
+-- See design/DESIGN_v11_AncestorChaining.md.
 CREATE FUNCTION TestGen.ExtractBranchSeeds(@Body NVARCHAR(MAX), @ParamCsv NVARCHAR(MAX))
 RETURNS @seeds TABLE (BranchId INT, ParamName SYSNAME, SeedLiteral NVARCHAR(500))
 AS
@@ -13174,141 +13174,4 @@ BEGIN
     SET @H = @H + N'</div>';
 
     SET @H = @H + N'<table><tr>'
-        + N'<th class="l">Schema</th><th class="l">Object</th>'
-        + N'<th>Testable</th><th>Gen</th>'
-        + N'<th>Tests</th><th>Pass</th><th>Fail</th><th>Err</th><th>Skip</th>'
-        + N'<th>Lines</th><th>Covered</th><th>Line %</th><th>Branch %</th></tr>';
-
-    DECLARE @rS SYSNAME,@rP SYSNAME,@rGen BIT,@rRun INT,@rPass INT,@rFail INT,
-            @rErr INT,@rSkip INT,@rTot INT,@rCov INT,@rLP DECIMAL(5,1),@rBP DECIMAL(5,1);
-    DECLARE @rTestability VARCHAR(20), @rReason NVARCHAR(400), @rTB INT;
-    DECLARE @rPres INT;   -- v9.4.4: per-proc count of preserved (developer-modified) tests
-    DECLARE rc CURSOR LOCAL FAST_FORWARD FOR
-        SELECT SchemaName,ProcName,GenSucceeded,TestsRun,TestsPassed,TestsFailed,
-               TestsErrored,TestsSkipped,TotalLines,CoveredLines,LinePct,BranchPct,TotalBranches,Testability,NotTestableReason,
-               TestsPreserved
-        FROM TestGen.CoverageResult WHERE BatchId=@BatchId
-        ORDER BY SchemaName,ProcName;
-    OPEN rc;
-    FETCH NEXT FROM rc INTO @rS,@rP,@rGen,@rRun,@rPass,@rFail,@rErr,@rSkip,@rTot,@rCov,@rLP,@rBP,@rTB,@rTestability,@rReason,@rPres;
-    WHILE @@FETCH_STATUS = 0
-    BEGIN
-        IF @rTestability = N'NOT_TESTABLE'
-            SET @H = @H + N'<tr style="background:#f6f6f6;color:#999">'
-                + N'<td class="l">' + @rS + N'</td>'
-                + N'<td class="l">' + @rP
-                + N'<details style="margin-top:2px"><summary style="font-size:11px;color:#888;cursor:pointer;font-weight:normal">why not testable?</summary>'
-                + N'<div style="font-size:12px;font-weight:normal;color:#555;margin-top:4px;white-space:normal">'
-                + ISNULL(@rReason, N'no fakeable dependencies; system-catalog usage')
-                + N'</div></details>'
-                + N'</td>'
-                + N'<td><span class="r">N</span></td>'
-                + N'<td>' + CASE WHEN @rGen=1 THEN N'Y' ELSE N'N' END + N'</td>'
-                + N'<td>' + CAST(ISNULL(@rRun ,0) AS VARCHAR)
-                    + CASE WHEN ISNULL(@rPres,0) > 0
-                           THEN N' <span style="color:#9a6700" title="user-modified tests preserved this regen">(' + CAST(@rPres AS VARCHAR) + N' preserved)</span>'
-                           ELSE N'' END
-                    + N'</td>'
-                + N'<td>' + CAST(ISNULL(@rPass,0) AS VARCHAR) + N'</td>'
-                + N'<td>' + CAST(ISNULL(@rFail,0) AS VARCHAR) + N'</td>'
-                + N'<td>' + CAST(ISNULL(@rErr ,0) AS VARCHAR) + N'</td>'
-                + N'<td>' + CAST(ISNULL(@rSkip,0) AS VARCHAR) + N'</td>'
-                + N'<td style="color:#999">n/a</td>'
-                + N'<td style="color:#999">n/a</td>'
-                + N'<td style="color:#999">n/a</td>'
-                + N'<td style="color:#999">n/a</td>'
-                + N'</tr>';
-        ELSE
-        SET @H = @H + N'<tr><td class="l">' + @rS + N'</td><td class="l">' + @rP + N'</td>'
-            + N'<td><span class="g">Y</span></td>'
-            + N'<td>' + CASE WHEN @rGen=1 THEN N'Y' ELSE N'<span class="r">N</span>' END + N'</td>'
-            + N'<td>' + CAST(@rRun AS VARCHAR)
-                + CASE WHEN ISNULL(@rPres,0) > 0
-                       THEN N' <span style="color:#9a6700" title="user-modified tests preserved this regen">(' + CAST(@rPres AS VARCHAR) + N' preserved)</span>'
-                       ELSE N'' END
-                + N'</td>'
-            + N'<td>' + CAST(@rPass AS VARCHAR) + N'</td>'
-            + N'<td>' + CASE WHEN @rFail>0 THEN N'<span class="r">'+CAST(@rFail AS VARCHAR)+N'</span>' ELSE N'0' END + N'</td>'
-            + N'<td>' + CASE WHEN @rErr >0 THEN N'<span class="r">'+CAST(@rErr  AS VARCHAR)+N'</span>' ELSE N'0' END + N'</td>'
-            + N'<td>' + CAST(@rSkip AS VARCHAR) + N'</td>'
-            + N'<td>' + CAST(@rTot AS VARCHAR) + N'</td>'
-            + N'<td>' + CAST(@rCov AS VARCHAR) + N'</td>'
-            + CASE WHEN ISNULL(@rTot,0) = 0
-                   THEN N'<td style="color:#999">n/a</td>'
-                   ELSE N'<td class="' + CASE WHEN @rLP>=80 THEN 'g' WHEN @rLP>=50 THEN 'a' ELSE 'r' END
-                        + N'">' + CAST(@rLP AS VARCHAR) + N'%</td>' END
-            + CASE WHEN ISNULL(@rTB,0) = 0
-                   THEN N'<td style="color:#999">n/a</td>'
-                   ELSE N'<td class="' + CASE WHEN @rBP>=80 THEN 'g' WHEN @rBP>=50 THEN 'a' ELSE 'r' END
-                        + N'">' + CAST(@rBP AS VARCHAR) + N'%</td>' END
-            + N'</tr>';
-        FETCH NEXT FROM rc INTO @rS,@rP,@rGen,@rRun,@rPass,@rFail,@rErr,@rSkip,@rTot,@rCov,@rLP,@rBP,@rTB,@rTestability,@rReason,@rPres;
-    END;
-    CLOSE rc; DEALLOCATE rc;
-
-    SET @H = @H + N'<tr class="total"><td class="l" colspan="4">TOTAL &mdash; '
-        + CAST(@gProcs AS VARCHAR) + N' objects ('
-        + CAST(@gProcs - @gNotTestable AS VARCHAR) + N' testable, '
-        + CAST(@gNotTestable AS VARCHAR) + N' not)</td>'
-        + N'<td>' + CAST(@gRun AS VARCHAR)
-            + CASE WHEN @gPres > 0
-                   THEN N' <span style="color:#9a6700">(' + CAST(@gPres AS VARCHAR) + N' preserved)</span>'
-                   ELSE N'' END
-            + N'</td>'
-        + N'<td>' + CAST(@gPass AS VARCHAR) + N'</td>'
-        + N'<td>' + CAST(@gFail AS VARCHAR) + N'</td><td>' + CAST(@gErr AS VARCHAR) + N'</td>'
-        + N'<td>' + CAST(@gSkip AS VARCHAR) + N'</td>'
-        + N'<td>' + CAST(@gTot AS VARCHAR) + N'</td><td>' + CAST(@gCov AS VARCHAR) + N'</td>'
-        + N'<td>' + CAST(@gLinePct AS VARCHAR) + N'%</td><td>' + CAST(@gBrPct AS VARCHAR) + N'%</td></tr>';
-    SET @H = @H + N'</table></body></html>';
-
-    SELECT @H AS CoverageReportHTML;
-
-    PRINT '/* =============== DATABASE COVERAGE REPORT HTML =============== */';
-    DECLARE @Chunk INT = 1, @ChunkSize INT = 4000;
-    WHILE @Chunk <= LEN(@H)
-    BEGIN
-        PRINT SUBSTRING(@H, @Chunk, @ChunkSize);
-        SET @Chunk = @Chunk + @ChunkSize;
-    END;
-    PRINT '/* =================== END HTML =================== */';
-END;
-GO
-PRINT 'TestGen.GenerateAndCoverDatabase (v11 function-aware) installed.';
-GO
-
-PRINT '';
-PRINT '== v11 function support (30_Function_Support_v1.sql) installed ==';
-PRINT '   Generate:  EXEC TestGen.GenerateTestsForObject  @SchemaName=N''dbo'', @ObjectName=N''YourFunction'';';
-PRINT '   Coverage:  EXEC TestGen.RunCoverageForFunction  @SchemaName=N''dbo'', @FunctionName=N''YourFunction'';';
-GO
-
-
-/*---------------------------------------------------------------------------
- * End-of-install: re-enable execution. Pairs with SET NOEXEC ON in the
- * pre-flight check at the top. If the pre-flight tripped, this restores
- * the session to a normal state; if it didn't, this is a no-op.
- *
- * The success / failure banner below is guarded on whether tSQLt is
- * present AND a core framework procedure actually got created, so we
- * never lie about a successful install when the pre-flight aborted.
- *--------------------------------------------------------------------------*/
-SET NOEXEC OFF;
-GO
-
-IF EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'tSQLt')
-   AND OBJECT_ID('TestGen.GenerateTestsForProcedure','P') IS NOT NULL
-BEGIN
-    PRINT '----------------------------------------------------------------';
-    PRINT 'UnitAutogen framework installed successfully.';
-    PRINT '----------------------------------------------------------------';
-END
-ELSE
-BEGIN
-    PRINT '****************************************************************';
-    PRINT '* UnitAutogen install did NOT complete. See errors above.      *';
-    PRINT '* Most common cause: tSQLt is not installed in this database.  *';
-    PRINT '* Install tSQLt from https://tsqlt.org and re-run this script. *';
-    PRINT '****************************************************************';
-END
-GO
+        + N'<t

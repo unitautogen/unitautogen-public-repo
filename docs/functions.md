@@ -101,4 +101,4 @@ the assertion-test counts is a follow-up.)
   follow-ups.
 - Encrypted and CLR (`EXTERNAL NAME`) functions are reported as not testable.
 
-The full internal design rationale is in `DESIGN_v11_Functions.md`.
+The full internal design rationale is in `design/DESIGN_v11_Functions.md`.

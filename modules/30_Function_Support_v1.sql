@@ -6,7 +6,7 @@
  *   IF  inline table-valued
  *   TF  multi-statement table-valued
  *
- * Design: DESIGN_v11_Functions.md.  Coverage is measured via the
+ * Design: design/DESIGN_v11_Functions.md.  Coverage is measured via the
  * SHADOW-PROCEDURE TRANSFORM: a function body cannot host an
  * EXEC TestGen.RecordCoverageHit recorder and is unreliable to capture
  * directly (scalar-UDF statements run inside the calling statement, and
@@ -1250,7 +1250,7 @@ GO
  *   4. relabel CoverageResult to the function   5. clean up
  *==========================================================================*/
 /*===========================================================================
- * v11 Step 2 (DESIGN_v11_BranchSeeding.md, Layer B): predicate-inversion
+ * v11 Step 2 (design/DESIGN_v11_BranchSeeding.md, Layer B): predicate-inversion
  * branch seeding.  SeedFromLeaf inverts one comparison leaf to a value that
  * makes the predicate TRUE; ExtractBranchSeeds pulls (param, satisfying value)
  * leaves from a function body.  RunCoverageForFunction then drives the shadow
@@ -1322,7 +1322,7 @@ GO
 -- and a stack of enclosing IF/WHILE gates; each branch's seed = its own leaves
 -- PLUS every ancestor gate's satisfying assignment.  Returns BranchId so the
 -- caller drives one shadow EXEC per branch with all assigned params overridden.
--- See DESIGN_v11_AncestorChaining.md.
+-- See design/DESIGN_v11_AncestorChaining.md.
 CREATE FUNCTION TestGen.ExtractBranchSeeds(@Body NVARCHAR(MAX), @ParamCsv NVARCHAR(MAX))
 RETURNS @seeds TABLE (BranchId INT, ParamName SYSNAME, SeedLiteral NVARCHAR(500))
 AS
