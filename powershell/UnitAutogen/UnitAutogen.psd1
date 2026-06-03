@@ -1,5 +1,5 @@
 @{
-    ModuleVersion     = '0.9.8'
+    ModuleVersion     = '0.9.9'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -39,7 +39,7 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
-## v0.9.8 (beta) — 2026-06-03  (ships the "v0.13" in-database parser + fixes)
+## v0.9.9 (beta) — 2026-06-03  (ships the "v0.13" in-database parser + fixes; first auto-published release)
 
 Fixes on top of the SSMS-native parser work below:
 

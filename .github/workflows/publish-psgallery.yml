@@ -1,19 +1,27 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # UnitAutogen — Publish to PowerShell Gallery
 #
-# Triggered automatically when a version tag (e.g. v0.9.1, v1.0.0) is pushed.
+# ACTIVE workflow. GitHub Actions only runs workflows under .github/workflows/,
+# so this file MUST live here (a copy under ci/ is never executed).
 #
-# Setup — before using this workflow:
-#   1. Go to https://www.powershellgallery.com/account/apikeys and generate
-#      an API key scoped to "Push new packages and package versions".
-#   2. Add it to your GitHub repository as a secret named PSGALLERY_API_KEY:
+# Triggered automatically when a version tag (e.g. v0.9.8, v1.0.0) is pushed.
+#
+# One-time setup:
+#   1. Generate a PowerShell Gallery API key scoped to "Push new packages and
+#      package versions": https://www.powershellgallery.com/account/apikeys
+#   2. Add it as a GitHub repository secret named PSGALLERY_API_KEY:
 #         Settings → Secrets and variables → Actions → New repository secret
 #
 # Release flow:
-#   1. Update ModuleVersion in powershell/UnitAutogen/UnitAutogen.psd1
+#   1. Bump ModuleVersion in powershell/UnitAutogen/UnitAutogen.psd1
 #   2. Commit and push to main
-#   3. Tag the commit:  git tag v0.9.1 && git push origin v0.9.1
+#   3. Tag the commit:  git tag v0.9.8 && git push origin v0.9.8
 #   4. This workflow fires, validates the manifest, and publishes the module.
+#
+# Note: the git tag and the Gallery prerelease status are independent. publish.ps1
+# publishes whatever the manifest says; the manifest has no Prerelease field, so a
+# tag like v0.9.8-beta still publishes a STABLE 0.9.8 to the Gallery. Add
+# PrivateData.PSData.Prerelease to publish a Gallery prerelease.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Publish to PowerShell Gallery
@@ -21,7 +29,7 @@ name: Publish to PowerShell Gallery
 on:
   push:
     tags:
-      - 'v*'          # Triggers on v0.9.1, v1.0.0, etc.
+      - 'v*'          # Triggers on v0.9.8, v1.0.0, etc.
   workflow_dispatch:   # Allow manual trigger from the Actions tab
 
 jobs:
@@ -35,7 +43,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Validate manifest ────────────────────────────────────────────
+      # ── 2. Validate manifest + bundled installers ───────────────────────
       - name: Validate module manifest
         shell: pwsh
         run: |
@@ -46,12 +54,14 @@ jobs:
           Write-Host "Version : $($manifest.Version)"
           Write-Host "Exports : $($manifest.ExportedFunctions.Keys -join ', ')"
 
-          # Verify the bundled SQL installer is present
-          $sql = '${{ github.workspace }}\powershell\UnitAutogen\sql\Install_UnitAutogen.sql'
-          if (-not (Test-Path $sql)) {
-              throw "Bundled SQL installer missing: $sql"
+          # publish.ps1 syncs both installers into the module before publishing, but
+          # verify the canonical sources exist so a broken checkout fails fast.
+          foreach ($f in @(
+              '${{ github.workspace }}\Install_UnitAutogen.sql',
+              '${{ github.workspace }}\clr\Install-UnitAutogenClr.SSMS.sql')) {
+              if (-not (Test-Path $f)) { throw "Required installer missing: $f" }
+              Write-Host "OK: $f ($((Get-Item $f).Length) bytes)"
           }
-          Write-Host "SQL installer present ($((Get-Item $sql).Length) bytes)"
 
       # ── 3. Publish ───────────────────────────────────────────────────────
       - name: Publish to PSGallery
@@ -59,17 +69,16 @@ jobs:
         env:
           PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:PSGALLERY_API_KEY)) {
+              throw "PSGALLERY_API_KEY secret is not set. Add it under Settings → Secrets and variables → Actions."
+          }
           .\publish.ps1 -ApiKey $env:PSGALLERY_API_KEY
 
       # ── 4. Confirm ───────────────────────────────────────────────────────
       - name: Confirm published version
         shell: pwsh
         run: |
-          # Give PSGallery a few seconds to index the new version
-          Start-Sleep -Seconds 10
+          Start-Sleep -Seconds 10   # give PSGallery a moment to index
           $pkg = Find-Module -Name UnitAutogen -Repository PSGallery -ErrorAction SilentlyContinue
-          if ($pkg) {
-              Write-Host "PSGallery version: $($pkg.Version)"
-          } else {
-              Write-Warning "Module not yet visible on PSGallery (indexing may take a few minutes)."
-          }
+          if ($pkg) { Write-Host "PSGallery version: $($pkg.Version)" }
+          else { Write-Warning "Module not yet visible on PSGallery (indexing may take a few minutes)." }
