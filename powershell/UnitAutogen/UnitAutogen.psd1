@@ -1,5 +1,5 @@
 @{
-    ModuleVersion     = '0.9.6'
+    ModuleVersion     = '0.9.7'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -39,7 +39,21 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
-## v0.9.6 (beta) — 2026-06-03  (ships the "v0.13" in-database parser)
+## v0.9.7 (beta) — 2026-06-03  (ships the "v0.13" in-database parser + fixes)
+
+Fixes on top of the SSMS-native parser work below:
+
+- De-dup branch tests: a procedure with data-shape gates no longer emits the
+  redundant legacy "executes <branch> path" smoke-SKIP tests alongside the real
+  seeded predicate-branch tests. When the in-database parser is active, those legacy
+  smoke-only fallbacks are rolled back (the predicate-branch tests already cover every
+  gate). AssessCustomer: 15 tests (3 skipped) -> 12 tests, 12 pass, 0 skip, still
+  100% line + 100% branch.
+- Hardened connection-recovery resync in GenerateAndCoverDatabase. Running the
+  in-session SQLCLR parser right before a sweep can trip SQL Server's idle-connection
+  recovery ("the connection was recovered ... valid rowcount") on the first object's
+  generation; the resync probe is now a swallowed real round-trip that reliably
+  absorbs that first-query penalty (was a bare assignment that did not).
 
 SSMS-native predicate parser — ONE parser everywhere (the PowerShell ScriptDom
 parser is retired):

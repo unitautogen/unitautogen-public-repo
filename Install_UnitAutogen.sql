@@ -6049,7 +6049,19 @@ BEGIN
             DECLARE @BranchParam SYSNAME, @BranchVal NVARCHAR(500);
             DECLARE @BranchArgList NVARCHAR(MAX);
             DECLARE @BranchTestName NVARCHAR(500);
-            
+
+            -- v0.13: is the in-database predicate parser active for this proc?
+            -- When it is, module 34 emits a per-branch artefact for EVERY gate
+            -- (a seeded TRUE/FALSE pair, or a NOT_TESTABLE skip), so the legacy
+            -- smoke-ONLY fallback tests below become redundant duplicates and are
+            -- rolled back (see the IF @GenTestCount = 0 block). When the parser did
+            -- NOT run (no inbox rows), the legacy skip is preserved as the only marker.
+            DECLARE @uagPredicateActive BIT =
+                CASE WHEN EXISTS (SELECT 1 FROM TestGen.PredicateInbox
+                                  WHERE SchemaName = @SchemaName AND ProcName = @ProcName)
+                     THEN 1 ELSE 0 END;
+            DECLARE @uagFbStart INT;
+
             -- Get distinct parameter/value combinations
             DECLARE brcur CURSOR LOCAL FAST_FORWARD FOR
                 SELECT DISTINCT ParamName, BranchValue
@@ -7100,6 +7112,7 @@ BEGIN
                     SET @S = @S + N'GO' + @CRLF;
                     SET @v94CpPos      = DATALENGTH(@S)/2 + 1;  -- v9.4.2+: SkipTest annotation insert point
                     SET @v94SkipReason = NULL;
+                    SET @uagFbStart    = DATALENGTH(@S)/2;       -- v0.13: roll-back point (after the DROP, before CREATE) for the predicate-parser de-dup
                     SET @S = @S + N'CREATE PROCEDURE ' + QUOTENAME(@TC) + N'.[' + @FallbackName + N']' + @CRLF;
                     SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF;
                     SET @S = @S + @MockBlock + ISNULL(@OutputDecls, N'');
@@ -7162,8 +7175,21 @@ BEGIN
                     IF @v94SkipReason IS NOT NULL AND @v94CpPos > 0 AND @v94CpPos <= DATALENGTH(@S)/2
                         SET @S = STUFF(@S, @v94CpPos, 0, N'--[@tSQLt:SkipTest](''' + @v94SkipReason + N''')' + @CRLF);
                     SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
+
+                    -- v0.13 de-dup: when the in-database predicate parser produced rows
+                    -- for this procedure, module 34 already emits a per-branch artefact
+                    -- for every gate (seeded TRUE/FALSE, or a NOT_TESTABLE skip). A
+                    -- legacy smoke-ONLY fallback (no assertion, carries a SkipTest marker,
+                    -- contributes no coverage because skipped tests never run) is then a
+                    -- redundant duplicate, so roll it back to @uagFbStart. The DROP emitted
+                    -- above is kept, so any stale copy from a prior generation is still
+                    -- removed. Real legacy assertions (@v94SkipReason IS NULL) are never
+                    -- rolled back; and when the parser did not run (@uagPredicateActive = 0)
+                    -- the legacy skip is preserved as the branch's only marker.
+                    IF @v94SkipReason IS NOT NULL AND @uagPredicateActive = 1
+                        SET @S = SUBSTRING(@S, 1, @uagFbStart);
                 END;
-                
+
                 FETCH NEXT FROM brcur INTO @BranchParam, @BranchVal;
             END;
             
@@ -12954,7 +12980,14 @@ BEGIN
         -- that same message (2026-05-31: all 8 procs after the functions failed
         -- in 0.37s total).  A trivial query each iteration re-syncs the session
         -- so a recovery on a prior object cannot poison this one.
-        SELECT @resync = 1;
+        -- v0.13: the bare assignment SELECT did NOT always clear it - the recovery can
+        -- land right after the in-session SQLCLR predicate parser, and the driver throws
+        -- the "first query after recovery" error on the next real query. Use two
+        -- throwaway round-trips, each swallowed, so that first-query penalty is consumed
+        -- HERE and the generation below starts on a clean session (and the probe itself
+        -- can never abort the sweep).
+        BEGIN TRY SELECT @resync = COUNT(*) FROM sys.objects; END TRY BEGIN CATCH END CATCH;
+        BEGIN TRY SELECT @resync = COUNT(*) FROM sys.objects; END TRY BEGIN CATCH END CATCH;
 
         PRINT '  [' + CAST(@Seq AS VARCHAR) + '/' + CAST(@Total AS VARCHAR) + '] ' + @s + '.' + @p;
 
@@ -13022,7 +13055,8 @@ BEGIN
             -- the object (it used to cost every REMAINING object in the sweep).
             IF @err LIKE N'%connection was recovered%' OR @err LIKE N'%valid rowcount%'
             BEGIN
-                SELECT @resync = 1;
+                BEGIN TRY SELECT @resync = COUNT(*) FROM sys.objects; END TRY BEGIN CATCH END CATCH;
+                BEGIN TRY SELECT @resync = COUNT(*) FROM sys.objects; END TRY BEGIN CATCH END CATCH;
                 BEGIN TRY
                     EXEC TestGen.GenerateTestsForProcedure @SchemaName=@s, @ProcName=@p, @ExecuteScript=1,
                          @TestsPreservedCount=@pres OUTPUT;

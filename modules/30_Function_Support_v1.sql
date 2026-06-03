@@ -1909,7 +1909,14 @@ BEGIN
         -- that same message (2026-05-31: all 8 procs after the functions failed
         -- in 0.37s total).  A trivial query each iteration re-syncs the session
         -- so a recovery on a prior object cannot poison this one.
-        SELECT @resync = 1;
+        -- v0.13: the bare assignment SELECT did NOT always clear it - the recovery can
+        -- land right after the in-session SQLCLR predicate parser, and the driver throws
+        -- the "first query after recovery" error on the next real query. Use two
+        -- throwaway round-trips, each swallowed, so that first-query penalty is consumed
+        -- HERE and the generation below starts on a clean session (and the probe itself
+        -- can never abort the sweep).
+        BEGIN TRY SELECT @resync = COUNT(*) FROM sys.objects; END TRY BEGIN CATCH END CATCH;
+        BEGIN TRY SELECT @resync = COUNT(*) FROM sys.objects; END TRY BEGIN CATCH END CATCH;
 
         PRINT '  [' + CAST(@Seq AS VARCHAR) + '/' + CAST(@Total AS VARCHAR) + '] ' + @s + '.' + @p;
 
@@ -1977,7 +1984,8 @@ BEGIN
             -- the object (it used to cost every REMAINING object in the sweep).
             IF @err LIKE N'%connection was recovered%' OR @err LIKE N'%valid rowcount%'
             BEGIN
-                SELECT @resync = 1;
+                BEGIN TRY SELECT @resync = COUNT(*) FROM sys.objects; END TRY BEGIN CATCH END CATCH;
+                BEGIN TRY SELECT @resync = COUNT(*) FROM sys.objects; END TRY BEGIN CATCH END CATCH;
                 BEGIN TRY
                     EXEC TestGen.GenerateTestsForProcedure @SchemaName=@s, @ProcName=@p, @ExecuteScript=1,
                          @TestsPreservedCount=@pres OUTPUT;

@@ -6930,3 +6930,44 @@ powershell/UnitAutogen/sql/Install-UnitAutogenClr.SSMS.sql, powershell/UnitAutog
 powershell/legacy/Get-ParsedPredicates.ps1, powershell/legacy/README.md, publish.ps1,
 INSTALL.md, README.md, docs/quickstart.md, powershell/USAGE.md, Build-ReleaseBundle.ps1,
 .gitignore, CHANGES.md
+
+--------------------------------------------------------------------------------
+v0.13 FIX — drop redundant legacy smoke-skip branch tests   2026-06-03
+--------------------------------------------------------------------------------
+SYMPTOM: a procedure with data-shape gates (e.g. HighValueCustomer.dbo.AssessCustomer)
+showed 3 SKIPPED tests ("executes <branch> path", "MANUAL TEST REQUIRED: no
+analysable branches ... only a smoke run") alongside the 6 passing predicate-branch
+tests, even though the predicate seeder covered every gate (100% branch).
+
+ROOT CAUSE: TWO generators emitted a test per gate. Module 34
+(GeneratePredicateBranchTests) emits a per-branch artefact for every gate the parser
+saw - a seeded TRUE/FALSE pair, or a NOT_TESTABLE skip for UNRECOGNISED gates. The
+legacy "Test 10" branch-path generator in module 04 ALSO emits a smoke-only fallback
+per detected branch when its pre-ScriptDom analyzer finds "no analysable paths"; that
+fallback has no assertion, carries a SkipTest marker, and contributes no coverage
+(skipped tests don't run). For data-shape gates the legacy analyzer always falls back,
+so its smoke-skip was a pure redundant duplicate of module 34's real test. (Its name
+was also garbled - "executes @CustomerID) = 3 path" - and it omitted the OUTPUT param,
+so it would error if not skipped.)
+
+FIX (module 04 GenerateTestsForProcedure, Test 10): when the in-database predicate
+parser produced inbox rows for this proc (@uagPredicateActive=1), roll back the
+smoke-ONLY fallback (the @v94SkipReason path) instead of emitting it - module 34
+already provides the per-branch marker, so no branch loses its amber/skip marker and
+no coverage is lost. The DROP is kept (cleans any stale copy). Real legacy assertions
+(@v94SkipReason IS NULL, e.g. result-set CASE assertions) are never rolled back; and
+when the parser did not run, the legacy skip is preserved as the only marker.
+
+VALIDATED on HighValueCustomer: dbo.AssessCustomer regenerated -> base generation
+9 tests -> 6 (the 3 smoke-skips gone), GeneratePredicateBranchTests emitted 6;
+"12 test case(s) executed, 12 succeeded, 0 skipped, 0 failed"; coverage held at
+100% line (7/7) + 100% branch (6/6).
+
+GOTCHA (dev): sqlcmd defaults QUOTED_IDENTIFIER OFF; deploying module 04 via sqlcmd
+WITHOUT -I created the proc with QI OFF, and its INSERT into a table with a filtered
+index/computed column then failed at generation ("INSERT failed because ...
+'QUOTED_IDENTIFIER'"). Use sqlcmd -I (or SSMS / Invoke-Sqlcmd, which are ON) when
+deploying. The shipped installer runs under QI ON, so end users are unaffected.
+
+FILES: modules/04_Test_Generator_v3.sql, Install_UnitAutogen.sql,
+powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
