@@ -9,8 +9,16 @@ ready for CI/CD pipeline consumption.
 ## Prerequisites
 
 - PowerShell 5.1 or later
-- SQL Server with UnitAutogen framework installed (`Install_UnitAutogen.sql`)
+- SQL Server with the UnitAutogen framework **and** the in-database predicate
+  parser installed. The quickest way is `Install-UnitAutogenDatabase` (below),
+  which installs both; it needs sysadmin once and `clr enabled = 1` to register
+  the parser. (Or install the two SQL files by hand — see [`../INSTALL.md`](../INSTALL.md).)
+- tSQLt in the target database
 - The `SqlServer` PowerShell module — **auto-installed on first use**
+
+> **v0.13:** there is now a single predicate parser — the C# parser hosted inside
+> SQL Server. `Invoke-UnitAutogen` calls it via `EXEC TestGen.ParseDatabasePredicates`;
+> there is no PowerShell-side parser anymore.
 
 ---
 
@@ -29,7 +37,8 @@ already present. Subsequent imports skip straight to loading.
 
 | Function | Purpose |
 |---|---|
-| `Invoke-UnitAutogen` | Full pipeline: generate tests → measure coverage → export all 3 files |
+| `Install-UnitAutogenDatabase` | Install the framework **and** register the in-database predicate parser (sysadmin once) |
+| `Invoke-UnitAutogen` | Full pipeline: parse predicates (in-DB) → generate tests → measure coverage → export all 3 files |
 | `Export-CoverageCoberturaXml` | Re-export Cobertura XML from last run (no re-run) |
 | `Export-TestResultsJunitXml` | Re-export JUnit XML from last run (no re-run) |
 | `Export-CoverageHtmlReport` | Re-export HTML report from last run (no re-run) |

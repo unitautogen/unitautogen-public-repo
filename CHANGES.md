@@ -6068,3 +6068,865 @@ FILES: modules/04_Test_Generator_v3.sql, modules/25_Coverage_Reporter_Html.sql,
 FILES: modules/04_Test_Generator_v3.sql, modules/25_Coverage_Reporter_Html.sql,
        Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
        README.md, Screenshots/*.png, CHANGES.md
+
+================================================================================
+2026-06-02  v0.10 BUILD (first cut) - predicate-aware data-shape seeding
+================================================================================
+Implements DESIGN_v0_10_PredicateSeeding.md (rev 4 - open questions resolved).
+Reaches branches gated by DATA-SHAPE predicates the v11 parameter-inversion
+seeder cannot: IF EXISTS(...), IF (SELECT COUNT(*) ...) = N, SUM/MIN/MAX/AVG
+thresholds, scalar-subquery compares and IS [NOT] NULL. Motivated by the first
+real-world adoption (EIN colleague's rich_4thJan) where these showed uncovered.
+
+ARCHITECTURE (confirmed by Phase-0 spike, now built end to end)
+  PowerShell ScriptDom parser  ->  TestGen.PredicateInbox (staging)  ->
+  T-SQL case-analysis seeder    ->  test-gen integration / NOT_TESTABLE.
+
+NEW SQL MODULES
+  modules/31_PredicateInbox_v1.sql
+    TestGen.PredicateInbox (closed Shape vocabulary, JSON columns ISJSON-checked,
+    UNIQUE(RunId,Schema,Proc,Branch)); AddParsedPredicate (normalising insert
+    surface), GetPredicatesForProc, ClearPredicateInbox.
+  modules/32_Seeder_v1.sql
+    TestGen.SatisfyPredicate(@InboxId,@Direction) -> seed T-SQL + Supported/Reason.
+    Helpers SatisfyingValue (op+literal -> satisfying/violating value; '=','<>'
+    for any literal, numeric inequalities for numbers) and BuildSeedInsert
+    (identity/computed/rowversion-excluded column list, VALUES for K=1 / SELECT
+    TOP(K) from a tally for K>1). Full case table: EXISTS/NOT_EXISTS, COUNT
+    =,<>,>,>=,<,<=, COUNT_IN, COUNT_BETWEEN, SUM/MIN/MAX/AVG/SCALAR compare,
+    SCALAR IS [NOT] NULL. Degenerate/over-cap/non-literal cases return Supported=0.
+  modules/33_Predicate_TestGen_v1.sql
+    BuildPredicateSeedBlock (THE hook module 04 calls at the @ThisSeedBlock seam
+    ~line 2855; falls back gracefully when a proc was never parsed),
+    BuildNotTestableFailBody (quote-escaped tSQLt.Fail carrying the verbatim
+    predicate + reason), GeneratePredicateBranchPlan (per branch x direction
+    result set - the standalone, demoable verification surface).
+
+NEW POWERSHELL
+  powershell/UnitAutogen/Get-ParsedPredicates.ps1
+    Production promotion of the spike. Reads sys.sql_modules, walks the AST,
+    classifies each IF/WHILE/CASE-WHEN gate, extracts target table {schema,
+    table,alias}, WHERE conjuncts {col,op,val} (AND of <col> <op> <literal>
+    only - OR / column-to-column / multi-table FROM / non-literal -> UNRECOGNISED
+    per resolved Q5), comparator + comparand. Writes via AddParsedPredicate.
+    ScriptDom policy "latest, not just available": loads the HIGHEST-version DLL
+    among candidates (SqlServer module 17.x preferred - it carries TSql170Parser,
+    which the public NuGet 161.x train does not), auto-selects the highest
+    TSqlNNNParser the assembly exposes, and WARNS when that is older than the
+    target DB's compatibility_level. ASCII-only source (PS 5.1 encoding-safe).
+
+NEW EXAMPLES
+  examples/PredicateZoo/ - 12 recognised-shape procs + 3 UNRECOGNISED, schema
+  pz, with 00_Schema/01_Procedures/02_Expected_Shapes.md/README.
+
+NEW TOOLING
+  tools/mcp_powershell_server.ps1 (+ .py twin, config, README) - a zero-
+  dependency MCP stdio server that runs PowerShell on the host so the ScriptDom
+  parser can be exercised live (the assistant sandbox is Linux). PowerShell
+  variant is primary (no Python needed; the Store python alias does not work).
+
+VERIFICATION (live, AdventureWorks2025 / SQL 2025 / compat 170 / tSQLt present)
+  - Modules 31/32/33 deployed clean; tsql_lint clean on all new .sql.
+  - Seeder round-trip: 12 shape x direction cases - emitted seed executed, then
+    the predicate evaluated; ALL 12 PASS (TRUE seed -> true, FALSE seed -> false).
+  - Parser run against schema pz: 15 rows, parser TSql170Parser auto-selected,
+    compat guard OK. Classifications match 02_Expected_Shapes.md exactly: 9 fully
+    recognised; 6 UNRECOGNISED (3 grammar: OR, join-FROM, param-comparand; 3
+    param-WHERE `= @p` which honestly degrade to NOT_TESTABLE in v0.10.0).
+  - GeneratePredicateBranchPlan on real parsed rows: CountEqGate TRUE/FALSE seed
+    2/3 Active=1 rows (identity excluded); ExistsGate -> clean NOT_TESTABLE body.
+
+NOT DONE / FOLLOW-UPS
+  - Top priority v0.10.1: thread the EXEC argument value into WHERE conjuncts of
+    the form `col = @param` so the dominant real-world EXISTS gate
+    (IF EXISTS(SELECT 1 FROM T WHERE FK=@id)) seeds instead of going NOT_TESTABLE.
+    Needs the proc-call layer in module 04 (the standalone parser cannot know the
+    arg value). This is the single biggest coverage win remaining.
+  - Wire BuildPredicateSeedBlock into 04's branch cursor at the @ThisSeedBlock
+    seam (contract is ready; not yet applied to the 4490-line generator).
+  - HTML report NOT_TESTABLE bottom panel (resolved Q2) - reporter change pending.
+  - Multi-join joint satisfaction (deferred to v0.11 per Q5).
+  - PredicateZoo objects currently live in AdventureWorks2025 (schema pz) from
+    verification; drop or relocate to a dedicated DB before release.
+
+FILES: modules/31_PredicateInbox_v1.sql, modules/32_Seeder_v1.sql,
+       modules/33_Predicate_TestGen_v1.sql,
+       powershell/UnitAutogen/Get-ParsedPredicates.ps1,
+       examples/PredicateZoo/*, tools/mcp_powershell_server.ps1,
+       tools/mcp_powershell_server.py, tools/mcp_powershell_config.json,
+       tools/mcp_powershell_README.md, design/DESIGN_v0_10_PredicateSeeding.md,
+       CHANGES.md
+
+================================================================================
+2026-06-02  CLEAN-ROOM SWEEP baseline reproduced (+ retraction of 2 "errors")
+================================================================================
+User restored a clean AdventureWorks2025, installed tSQLt + the single
+Install_UnitAutogen.sql (v0.10 folded in), and ran a full Invoke-UnitAutogen
+sweep. Result matches the documented baseline to the decimal:
+  94.9% line (56/59), 94.4% branch (17/18), 100% autonomy,
+  91 tests: 81 pass / 0 FAIL / 0 ERR / 10 skip, 19 objects (17 testable, 2 not).
+=> No regression; single-installer + v0.10 fold-in confirmed good; v0.10 objects
+   inert (no coverage delta), as designed.
+
+RETRACTION: the two failures seen earlier on the DIRTY db do NOT reproduce on a
+clean install and were artifacts of dirty/stale state, NOT current-code bugs:
+  - uspLogError "annotation has unmatched quote" -> on clean run it is a clean
+    NOT_TESTABLE skip; the reason text still contains "procedure's" and the
+    SkipTest annotation registered fine. The current generator escapes it
+    correctly. The earlier apostrophe-escaping "fix" is therefore NOT needed.
+  - uspUpdateEmployeeLogin "severe error" -> on clean run it is 11/11 pass.
+Lesson: triage generator output on a CLEAN install before concluding a bug;
+interrupted/stale runs produce phantom errors.
+
+Sole remaining sub-100 object (pre-existing, unchanged): HumanResources.
+uspUpdateEmployeeHireInfo 66.7% line (4/6) / 0% branch - the uncovered path is
+the @@TRANCOUNT=0 / error-handling branch (manual scaffold), NOT a data-shape
+predicate, so v0.10 seeding does not address it.
+
+FILES: CHANGES.md
+
+================================================================================
+2026-06-02  v0.10 source-line match key + StartLine; installer re-folded
+================================================================================
+Per the decision to keep ScriptDom scoped to predicates only (string parser
+still owns branch identity), added a ROBUST join key so module 04 can attach a
+predicate seed to the right branch WITHOUT the two parsers agreeing on ordinal
+numbering: match by SOURCE LINE.
+  - Get-ParsedPredicates.ps1 captures each gate's StartLine (IfStatement/
+    WhileStatement/SearchedCaseExpression .StartLine) and writes it.
+  - PredicateInbox gains a StartLine column (upgrade-safe ALTER for existing
+    tables); AddParsedPredicate/GetPredicatesForProc carry it.
+  - BuildPredicateSeedBlock gains @MatchByLine (preferred) + @StartLine OUTPUT;
+    falls back to BranchId when not supplied. GeneratePredicateBranchPlan
+    surfaces StartLine. VERIFIED on pz: 15 rows, all 15 StartLine populated and
+    equal to the actual IF/WHILE line in sys.sql_modules.
+  - BuildNotTestableFailBody rewritten to escape quotes via NCHAR(39) instead of
+    literal '''' / '''''' runs - same output, but no quote-doubling runs (more
+    readable AND clears a tsql_lint masker false-positive).
+  - Installer re-folded (both copies, byte-identical) via the BEGIN/END
+    sentinels now wrapping the v0.10 block. Full installer runs end to end on
+    AdventureWorks2025 -> "UnitAutogen framework installed successfully."
+
+TOOLING LESSON (important): the sandbox/bash/Read-tool view of files on the
+mounted Windows folder INTERMITTENTLY TRUNCATES large-file reads (~30KB+),
+making COMPLETE files look cut off (e.g. parser appeared to end mid-line at
+"Write-InboxRows -conn" but was actually intact at 566 lines). This caused a
+false "truncation" diagnosis and a bad append that duplicated a tail. RULE:
+verify large .sql / .ps1 integrity via the PowerShell MCP (host filesystem) or
+SQL Server (Invoke-Sqlcmd), NOT via bash tail/Read tool. Treat tsql_lint over
+the 700KB installer as advisory; SQL Server running the whole file is the gate.
+
+FILES: powershell/UnitAutogen/Get-ParsedPredicates.ps1,
+       modules/31_PredicateInbox_v1.sql, modules/33_Predicate_TestGen_v1.sql,
+       Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       CHANGES.md
+
+================================================================================
+2026-06-02  v0.10 module 34 - seeded predicate-branch test generator (COVERAGE)
+================================================================================
+THE integration piece that makes v0.10 move real coverage. Investigation found:
+the string generator (04) DETECTS a data-shape gate as 2 branches but reaches
+only ONE arm (default empty-faked-table arm) - it cannot engineer data to flip a
+COUNT/SUM/EXISTS/... predicate, so these gates sit at 50% branch. (#BranchPaths
+has no source line and AnalyzeBranchPaths emits no seeding path for them.)
+
+modules/34_Predicate_BranchTests_v1.sql - TestGen.GeneratePredicateBranchTests
+@Schema,@Proc: for each PredicateInbox gate, emits a tSQLt test PER DIRECTION
+into the proc's test class (FakeTable target table(s) + v0.10 seed + EXEC proc
+in TRY/CATCH); UNRECOGNISED gates get a NOT_TESTABLE placeholder. COMPLEMENTARY -
+adds to the existing class, never edits module 04, so the 94.9/94.4 baseline is
+untouched. v0.10.0 scope: fakes the predicate's TARGET table(s) only (procs
+reading extra tables may still need the standard generator's full faking).
+
+PROVEN on AdventureWorks2025/pz (live):
+  - Baseline (string gen only): data-shape gates = 50% branch (1/2 arms).
+  - After GeneratePredicateBranchTests + RunCoverage (no regen):
+      CountEqGate -> BOTH arms hit (line 6 'EXACTLY_TWO' + line 8 'NOT_TWO').
+      SumGate     -> BOTH arms hit (line 6 'BIG_REVENUE' + line 8 'SMALL').
+    i.e. 50% -> 100% branch, fully automatic, both v0.10 tests pass.
+  - The lone remaining failure in test_CountEqGate is a pre-existing result-shape
+    baseline-drift scaffold (needs re-bless), NOT a v0.10 test.
+
+Module 34 folded into the single installer (both copies, md5-identical, 14223
+lines, sentinel-wrapped v0.10 block now = modules 31/32/33/34).
+
+OPEN: an orchestrator that runs GenerateAndCoverDatabase -> then
+GeneratePredicateBranchTests per proc -> then RunCoverage, so a one-command sweep
+reflects the v0.10 lift in the HTML report (today GACD regenerates and would wipe
+the v0.10 tests, so they must be added AFTER generation and measured via
+RunCoverage). Also: assertions on the seeded arm (currently reachability/smoke).
+
+FILES: modules/34_Predicate_BranchTests_v1.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+================================================================================
+2026-06-02  v0.10 module 35 ORCHESTRATOR - one-command sweep reflects the lift
+================================================================================
+modules/35_Predicate_Orchestrator_v1.sql - TestGen.GenerateAndCoverDatabaseV10
+@SchemaFilter,@ExcludePattern,@OutputMode. Resolves "why can't I just resweep":
+GenerateAndCoverDatabase regenerates each class AND measures in one shot, so the
+v0.10 tests must be added AFTER its generate step. The orchestrator:
+  1. EXEC GenerateAndCoverDatabase (string gen + measure + CoverageResult batch)
+  2. for each PARSED proc in that batch (has PredicateInbox rows):
+       EXEC GeneratePredicateBranchTests (add seeded per-direction tests)
+       EXEC RunCoverage (re-measure, no regen)
+       recompute Line%/Branch% (identical rule to GACD) and UPDATE the proc's
+       CoverageResult row -> the HTML/XML report shows the lift.
+Procs never parsed (no PredicateInbox rows) are untouched -> baseline preserved.
+
+PROVEN (live, one GenerateAndCoverDatabaseV10 @SchemaFilter='pz' call): 10 of the
+recognised data-shape gates went 50% -> 100% branch in a single batch
+(CountEq/Gt/In/Between, Sum, Min, Max, Avg, NotExists, ScalarNull). ExistsGate /
+ScalarCmpGate stay 50% (WHERE = @param -> UNRECOGNISED, the v0.10.1 follow-up);
+Join/Or/ParamComparand stay 0% (UNRECOGNISED grammar).
+
+Module 34 hardened in the same pass:
+  - UNRECOGNISED / unseedable directions now emit a [@tSQLt:SkipTest] marker
+    (reported SKIPPED, amber) instead of tSQLt.Fail (red) - matches the
+    framework's honest-skip model; v0.10 no longer turns the report red.
+  - Clears its own prior "(v0.10)" tests at the start of each run (fixes stale
+    TRUE/FALSE tests lingering after a shape change, and the "already an object
+    named ..." collision from the earlier unbracketed-OBJECT_ID drop).
+  Verified: JoinFromGate -> single Skipped; CountGtGate -> both directions pass.
+
+All five v0.10 modules (31-35) folded into the single installer (both copies
+md5-identical, sentinel-wrapped block). PERF NOTE: the orchestrator re-runs
+RunCoverage per parsed proc (XEvent setup/teardown each) - ~10 min for pz's 15
+procs; fine for correctness, needs a batched-instrumentation pass before large
+production DBs (deferred to v0.11).
+
+FILES: modules/34_Predicate_BranchTests_v1.sql,
+       modules/35_Predicate_Orchestrator_v1.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+================================================================================
+2026-06-02  v0.10 PERF - single-pass: GACD predicate-aware INLINE (no 2nd pass)
+================================================================================
+Profiled the cost (live, pz/CountEqGate): GenerateTestsForProcedure ~11s,
+GeneratePredicateBranchTests ~0.6s, RunCoverage ~37s (cold standalone). The
+module-35 orchestrator ran RunCoverage a SECOND time per parsed proc -> nearly
+doubled sweep time (pz: ~10 min).
+
+Fix: inject the 0.6s GeneratePredicateBranchTests into the GACD per-proc loop
+BETWEEN GenerateTestsForProcedure and its single RunCoverage, gated on the proc
+having PredicateInbox rows. Coverage then runs ONCE with the v0.10 tests present.
+Applied to BOTH GACD definitions (module 04 + module 30's function-aware
+override - the latter is the live one) and both installer copies. Module 35
+reduced to a thin backward-compat alias (GenerateAndCoverDatabase is now
+predicate-aware on its own).
+
+RESULT (live, pz, 15 procs): plain GenerateAndCoverDatabase = 247.9s
+(~4.1 min) vs ~10 min for the old double-pass orchestrator (~60% faster); the
+10 recognised data-shape gates show 100% branch in that single batch. v0.10
+overhead is now ~0.6s/proc. Unparsed procs hit only the gated EXISTS check
+(no rows -> skip) so the AdventureWorks baseline is byte-for-byte unchanged;
+Invoke-UnitAutogen (which calls GACD) now reflects v0.10 automatically.
+
+STILL OPEN (framework-wide, v0.11): GACD's inherent per-proc cost (~16s/proc
+inside the batch; ~37s cold standalone for RunCoverage) - the XEvent
+instrument/run/teardown. Batching that is a separate, larger initiative and is
+NOT a v0.10 regression (v0.10 adds ~0.6s/proc on top).
+
+FILES: modules/04_Test_Generator_v3.sql, modules/30_Function_Support_v1.sql,
+       modules/35_Predicate_Orchestrator_v1.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+================================================================================
+2026-06-02  PERF Phase 1 - profiled coverage; trimmed WAITFOR (read = v0.11)
+================================================================================
+Profiled RunCoverage per-proc (live, pz/CountEqGate, warm ~14s) by building an
+instrumented copy that timestamps each phase. Breakdown:
+  InstrumentProcedure       ~0.3s
+  create+start XEvent       ~0.04s
+  rename + setup            ~1.4s
+  tSQLt.Run (real work)     ~3.7s
+  WAITFOR DELAY '00:00:03'  ~3.0s   (fixed pre-STOP sleep)
+  read .xel (fn_xe_file...) ~4.6s   (parses ALL sp_statement_completed in the DB
+                                     during the window; session filters by DB
+                                     only, post-filters for RecordCoverageHit)
+  stop + drop session       ~0.1s
+=> ~7.6s of ~14s (54%) is reducible overhead (WAITFOR + read), not test work.
+
+SHIPPED (safe): WAITFOR 3s -> 1s in RunCoverage (live + both installer copies).
+STOP flushes the session and MAX_DISPATCH_LATENCY=1s, so 1s is a safe margin;
+validated coverage UNCHANGED (CountEqGate both arms hit, 2/2). Deterministic
+~2s/proc saving (single-run wall times are too noisy to show it; the .xel read
+varies several seconds run to run).
+
+NOT done on purpose (-> v0.11, needs careful test): cut the ~4.6s read. Two
+routes tried/considered:
+  - Capture-time filter on [statement] LIKE '%RecordCoverageHit%': predicate is
+    syntactically valid ONLY with the [sqlserver].[like_i_sql_unicode_string]
+    comparator (package0 has no such comparator), BUT at runtime it captured
+    ZERO events - the sp_statement_completed [statement] field is not reliably
+    populated at PREDICATE-evaluation time, so the filter silently zeroes
+    coverage. REJECTED - too risky.
+  - ring_buffer target (in-memory, no file I/O / flush): the right rebuild, but
+    ring_buffer's size cap can DROP events on large procs -> undercount; needs
+    overflow safeguards + thorough validation. Scoped to v0.11.
+This profile IS the perf baseline to diff future enhancements against.
+
+FILES: RunCoverage (installer x2), CHANGES.md
+
+================================================================================
+2026-06-02  PERF Phase 2 - object_id-filtered XEvent session (BIG read win)
+================================================================================
+The ~4.6s .xel read was actually unbounded: the session filtered by
+database_name ONLY, so it captured EVERY sp_statement_completed in the DB during
+the run window into the .xel, then post-filtered for RecordCoverageHit. On a busy
+proc the file is huge and the read dominates.
+
+Fix: filter the XEvent session to the INSTRUMENTED proc's object_id, so only its
+statements are captured. RunCoverage computes @covid = OBJECT_ID(@CovFull) right
+after InstrumentProcedure (the synonym <proc> -> <proc>_cov means the executing
+module during the run is _cov), then injects
+  AND [object_id]=(<covid>)
+into the session WHERE via a REPLACE on the built @SQL. object_id IS available at
+predicate-eval time (unlike [statement] text, which silently captured 0 events -
+see Phase 1 notes). If @covid IS NULL it falls back to the DB-only filter (safe).
+
+VALIDATED (live): RunCoverage vs the object_id-filtered build on
+HumanResources.uspUpdateEmployeeHireInfo produced BYTE-IDENTICAL coverage
+(covered exec lines [16,18,24,31] both ways) while time dropped 101.0s -> 18.5s
+(~5.5x). CountEqGate also identical (2/2). The speedup SCALES with proc
+complexity / DB statement volume during the window.
+
+RunCoverageForFunction is a wrapper over RunCoverage, so function coverage
+inherits the win. Applied to live + both installer copies (md5-identical);
+single patch point (one CREATE EVENT SESSION in the engine).
+
+NET PERF (Phase 1 + 2): single-pass GACD (no double measure) + WAITFOR 3s->1s +
+object_id session filter. The dominant remaining per-proc cost is tSQLt.Run
+itself (the real test work) + the fixed ~1.4s rename/setup. ring_buffer is no
+longer needed for the read (object_id filter solved it without event-drop risk).
+
+FILES: RunCoverage (installer x2), CHANGES.md
+
+================================================================================
+2026-06-02  v0.10.1 - WHERE col = @param seeding (reverse-seed from the test arg)
+================================================================================
+Closes the dominant real-world gate the parser previously marked NOT_TESTABLE:
+  IF EXISTS (SELECT 1 FROM T WHERE FK = @param)   (also scalar = @param / IS NULL)
+"Reverse seeding": the parser tells us the gate needs col = @param, so we seed
+col = the exact value the generated test passes for @param.
+
+PARSER (Get-ParsedPredicates.ps1): Get-WhereConjuncts now accepts a
+VariableReference comparand and emits {col, op, val=@name, valKind='param'}
+instead of rejecting the WHERE. Shape stays recognised (EXISTS/SCALAR_CMP/...).
+
+SEEDER (module 32 SatisfyPredicate): reads the predicate's owning proc
+(SchemaName/ProcName); for each WHERE conjunct with valKind='param', resolves
+@name -> the proc parameter's sample literal via GetSampleValueLiteral(...,0) -
+the SAME value module 34 passes as the EXEC arg - so the seeded row matches what
+the test passes. A param that is not a proc parameter (e.g. a local variable)
+-> honest NOT_TESTABLE.
+
+BUG FOUND + FIXED in the same pass (BuildSeedInsert): when the WHERE filters on
+an IDENTITY/computed/rowversion column (e.g. an IDENTITY PK: OrderId = @OrderId),
+the old identity-exclusion dropped that column from the INSERT, so the row never
+matched the @param value and BOTH directions fell to one arm. tSQLt.FakeTable
+DROPS identity/computed/rowversion, so the faked table accepts explicit inserts
+into them - BuildSeedInsert now INCLUDES any column that has an override
+(regardless of identity), keeping the normal exclusion only for non-override
+columns.
+
+VALIDATED (live, pz, clean per-run hit checks): ExistsGate, ScalarCmpGate
+(IDENTITY-PK WHERE) and ScalarNullGate all went 50% -> 100% branch (exec lines
+2/2 each). Reverse-seed emits e.g. INSERT pz.Orders(OrderId,...) VALUES(42,...)
+where 42 = the test's @OrderId arg. UNRECOGNISED now only the 3 truly
+out-of-grammar pz procs (join / OR / param-comparand-threshold).
+
+FILES: powershell/UnitAutogen/Get-ParsedPredicates.ps1,
+       modules/32_Seeder_v1.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+================================================================================
+2026-06-02  v0.10.2 - STRONG assertions on seeded branch tests (no ghost pass)
+================================================================================
+The v0.10 branch tests were reachability/smoke (FakeTable + seed + EXEC, pass on
+no error) - a wrong seed could ghost-pass while the intended arm never ran.
+Replaced with a real assertion that the seed actually drove the gate predicate
+to the intended direction.
+
+SEEDER (module 32 SatisfyPredicate): now also returns @PredicateSql (the gate's
+boolean reconstructed from the structured fields with @params resolved to the
+test's arg values - reliable, since the stored PredicateText omits the EXISTS
+keyword) and @ExpectedBit (1 if the direction makes the gate TRUE). @whereSql is
+built from the original (resolved) conjuncts so the WHERE in the assertion
+matches the gate.
+
+TEST-GEN (module 34): a supported direction now emits
+    DECLARE @uag_actual BIT = CASE WHEN <reconstructed predicate> THEN 1 ELSE 0 END;
+    EXEC tSQLt.AssertEquals @Expected=<bit>, @Actual=@uag_actual, @Message=...;
+    BEGIN TRY EXEC <proc> <args>; END TRY BEGIN CATCH ... Fail ... END CATCH;
+i.e. ASSERT the seed drove the predicate the right way, THEN run the proc so
+coverage records the arm. NO GHOST PASS: if the seed does not satisfy the
+predicate the AssertEquals FAILS (red). If a predicate cannot be reconstructed
+(should not happen for recognised shapes) the test is a [@tSQLt:SkipTest] marker,
+never a silent green.
+
+VALIDATED (live): generated EXISTS test asserts
+  EXISTS (SELECT 1 FROM [pz].[Orders] WHERE [CustomerId] = 42) = 1
+(predicate reconstructed with the EXISTS keyword + @CustomerId resolved to the
+EXEC arg 42). All 22 v0.10 tests across the 11 recognised pz gates PASS, 0 fail.
+ANTI-GHOST proof: an intentionally wrong seed (CustomerId=99 not 42) FAILS the
+assertion ("Expected <1> but was <0>") - exactly the class of bug (e.g. the
+earlier identity-PK seed) that previously ghost-passed.
+
+FILES: modules/32_Seeder_v1.sql, modules/34_Predicate_BranchTests_v1.sql,
+       Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       CHANGES.md
+
+================================================================================
+2026-06-03  v0.11 - JOIN seeding for EXISTS / NOT EXISTS gates
+================================================================================
+Predicate seeding now handles a 2-table INNER equi-join inside the EXISTS /
+NOT EXISTS subquery (previously UNRECOGNISED -> Skip). Bounded, honest cut:
+INNER joins only, equality ON (or AND of equalities), AND-composed per-table
+WHERE. Outer/non-equi/OR/3+-table/comma joins, and joins under aggregate shapes,
+stay UNRECOGNISED in this cut.
+
+PARSER (Get-ParsedPredicates.ps1):
+  - Get-FromTables rewritten: recurses a QualifiedJoin via new Collect-JoinTables
+    + Get-JoinEqualities, capturing all tables (schema/table/alias) and the ON
+    equality keys {lAlias,lCol,rAlias,rCol}. Returns ok=$false (-> UNRECOGNISED)
+    for non-INNER, non-equi ON, derived/TVF, comma-join.
+  - Get-WhereConjuncts now tags each conjunct with its column qualifier (tbl =
+    alias/table) so the seeder can route each conjunct to the right table.
+  - Apply-Subquery gained an allowJoin flag (TRUE only for EXISTS/NOT_EXISTS),
+    emits a multi-table TargetTablesJson + JoinsJson; bounds to exactly 2 tables.
+  - PS 5.1 gotcha: @() wrapping a System.Collections.Generic.List[object] throws
+    "Argument types do not match". The new helpers use plain arrays with +=
+    (the convention the rest of the parser already uses).
+
+SEEDER (module 32 SatisfyPredicate): new join branch, taken when JoinsJson is
+present and Shape IN (EXISTS,NOT_EXISTS), BEFORE the single-table logic:
+  - Reads @JoinsJson; fakes are emitted by module 34 (already loops all
+    TargetTablesJson entries - no change needed there).
+  - Shared join-key value per equality: a WHERE "=" on a join column pins it,
+    else a type-appropriate GetSampleValueLiteral of the left join column; both
+    sides get the SAME literal so the rows join.
+  - TRUE/EXISTS (and FALSE/NOT_EXISTS): one coordinated row per table (join keys
+    equal + each table's WHERE conjuncts satisfied, @params reverse-resolved).
+    FALSE/EXISTS (and TRUE/NOT_EXISTS): leave both faked tables empty.
+  - Reconstructs the FULL joined gate (FROM ... JOIN ... ON ... [WHERE ...]) for
+    the strong AssertEquals (no ghost pass) and sets @ExpectedBit.
+  - GOTCHA: SYSNAME columns are implicitly NOT NULL; the @jt/@jn/@jcj table vars
+    populate alias/effalias/tbl by UPDATE or from nullable JSON, so those columns
+    are declared NVARCHAR(128) NULL (else a 515 NULL-insert error).
+
+FIXTURE (examples/PredicateZoo/01_Procedures.sql): pz.JoinFromGate reformatted
+from the compact one-liner "SELECT 'A'; ELSE SELECT 'B';" to the multi-line
+IF/ELSE its sibling gates use, and its comment updated (now seedable, not
+UNRECOGNISED). REASON: the line-based coverage instrumenter (module 20) cannot
+inject a hit between an IF body and an ELSE that share one line - it orphans the
+ELSE and the _cov copy fails to compile, so EVERY test erroring and coverage
+read 0/0. This is a PRE-EXISTING instrumenter limitation (the unseeded proc had
+the same 0/0-all-error result), independent of join seeding; the one-liner was
+simply never coverable. All sibling gates already use the multi-line form.
+
+VALIDATED (live, AdventureWorks2025 + PredicateZoo):
+  - Parser: pz.JoinFromGate now EXISTS with 2-table TargetTablesJson + JoinsJson
+    + tbl-tagged WhereAstJson (was UNRECOGNISED). Regression spot-checks:
+    single-table EXISTS unchanged; LEFT/non-equi/3-table/comma/aggregate-join all
+    correctly UNRECOGNISED with distinct reasons.
+  - Seed (TRUE): INSERT pz.Orders(CustomerId=42,...) + pz.Students(StudentId=42,
+    Active=1,...) -> join matches -> EXISTS true. (FALSE): both tables empty.
+  - Generated tests assert
+    EXISTS (SELECT 1 FROM [pz].[Orders] [o] JOIN [pz].[Students] [s]
+            ON [s].[StudentId]=[o].[CustomerId] WHERE [s].[Active]=1) = 1/0
+    -> both branch tests PASS; JoinFromGate 0%->100% line AND branch.
+
+INSTALLER: module 32 re-folded into the v0.10 sentinel block of BOTH installer
+copies (kept md5-identical; +175 lines). Parser is a standalone .ps1, not in the
+SQL installer.
+
+FILES: powershell/UnitAutogen/Get-ParsedPredicates.ps1,
+       modules/32_Seeder_v1.sql, examples/PredicateZoo/01_Procedures.sql,
+       Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       CHANGES.md
+
+================================================================================
+2026-06-03  v0.11.1 - zero UNRECOGNISED in PredicateZoo (OR/DNF + param comparand
+                       + a string-gen quoting fix)
+================================================================================
+Goal: every PredicateZoo gate recognised, generated and coverable - no exception.
+Three changes closed the last gaps (the corpus's two remaining UNRECOGNISED gates
+plus a latent string-generator bug that aborted ScalarCmpGate).
+
+1. OR composition (OrCompositionGate). The WHERE parser now produces DISJUNCTIVE
+   NORMAL FORM. PARSER (Get-ParsedPredicates.ps1): Get-WhereConjuncts replaced by
+   Get-WhereLeaf + Get-WhereDnf; AND distributes over OR (cross product), capped
+   at 16 terms; WhereAstJson is now an array of TERMS (each an array of AND
+   conjuncts) - AND-only WHERE = a single term (back-compatible shape, nested one
+   level). SEEDER (module 32): reads the DNF, picks the FIRST fully-seedable
+   disjunct as the matching-row driver (every conjunct in it must yield a value),
+   seeds rows satisfying THAT disjunct (so each seeded row satisfies the whole OR
+   and the row-count case analysis is unchanged), and reconstructs the FULL DNF
+   "(a AND b) OR (c)" - params resolved - for the strong assertion (no ghost). The
+   join path requires a single term (OR in a joined WHERE stays out of this cut).
+
+2. Parameter comparand (ParamComparandGate: COUNT(*) > @Threshold). PARSER: a
+   VariableReference comparand is accepted, stored as '@name'. SEEDER: '@name'
+   resolves to the proc-parameter sample value the test passes (same reverse-seed
+   as WHERE col = @param), so the seeded count and the runtime gate agree.
+
+3. String-generator quoting (module 04, ScalarCmpGate root cause). The branch
+   smoke-test builder emitted "EXEC p @brName = @BranchVal" UNQUOTED for any
+   non-string parameter, assuming a numeric value. ScalarCmpGate's
+   IF (SELECT Status FROM ... WHERE OrderId=@OrderId) = N'OPEN' made the string
+   branch-detector pair the INT @OrderId with the scalar comparand 'OPEN', so it
+   generated "EXEC ... @OrderId = OPEN" -> "Incorrect syntax near 'OPEN'", which
+   aborted the WHOLE procedure's generation (GenSucceeded=0, 0 tests, 0 coverage).
+   FIX: guard with ISNUMERIC(@BranchVal) (mirrors the existing @OtherBranchVal
+   path) - a non-numeric value for a non-string param now falls back to a
+   type-correct sample, so generation succeeds; module 34's predicate tests
+   supply the real branch coverage. This only changes a path that previously
+   produced guaranteed-invalid SQL, so it cannot regress a working procedure.
+
+FIXTURE (examples/PredicateZoo): OrCompositionGate + ParamComparandGate reformatted
+to the multi-line IF/ELSE (so the instrumenter can cover them - see the v0.11
+instrumenter note); the old "UNRECOGNISED" section header retired (all three
+former UNRECOGNISED gates are now recognised). 02_Expected_Shapes.md updated.
+
+VALIDATED (live, AdventureWorks2025 + PredicateZoo): parser -> 0 UNRECOGNISED of
+15 gates. Full GenerateAndCoverDatabase sweep over pz: ALL 15 gates GenSucceeded,
+30/30 branches = 100% (was: ScalarCmpGate 0/0 gen-fail, OrComposition +
+ParamComparand UNRECOGNISED/0%). Seeds verified no-ghost: OR seeds 2 rows on the
+Active=1 disjunct -> COUNT=2; param gate seeds 43 rows -> COUNT 43 > resolved
+@Threshold 42; both reconstruct the full gate for AssertEquals.
+
+INSTALLER: module 32 re-folded into the v0.10 sentinel block; the module 04
+one-line ISNUMERIC guard applied surgically. Both installer copies md5-identical.
+
+FILES: powershell/UnitAutogen/Get-ParsedPredicates.ps1, modules/32_Seeder_v1.sql,
+       modules/04_Test_Generator_v3.sql, examples/PredicateZoo/01_Procedures.sql,
+       examples/PredicateZoo/02_Expected_Shapes.md, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+================================================================================
+2026-06-03  v0.12 (WIP) - unified reverse-seeder: tree engine at PARITY
+================================================================================
+Engine redesign per design/DESIGN_v0_12_UnifiedReverseSeeder.md (design approved
+first). Replaces the piecemeal per-shape seeder with one predicate-TREE + a
+single recursive reverse-seed pass. Phases 1-2 (scaffolding + parity) DONE;
+phases 3-6 (per-table merge, general joins, local substitution, cutover) pending.
+
+WHAT LANDED
+- Inbox (module 31): + PredicateTreeJson, SeedPlanTrueJson, SeedPlanFalseJson
+  (upgrade-safe ALTERs); Shape gains 'PREDTREE'. Flat columns kept one release
+  as fallback.
+- Parser (Get-ParsedPredicates.ps1): builds a predicate TREE - boolean nodes
+  (and/or/not) over data-shape ATOMS, each atom a QUERY (general join capture:
+  N-table, left-deep, INNER/LEFT/RIGHT/FULL, equi + non-equi ON) with a boolean
+  WHERE tree of column predicates. Renders the tree back to SQL for the strong
+  assertion (no DNF -> the 16-term cap is gone). Truth-propagation emits a
+  per-direction, per-PHYSICAL-TABLE seed plan (symbolic value specs + kspecs);
+  the hard recursion stays in PowerShell so the T-SQL side is flat.
+- Seeder (module 32): new TestGen.ExecuteSeedPlan walks the plan; new
+  TestGen.CountForCase (row count per comparator) + TestGen.ResolveVspec
+  (symbolic spec -> literal via the existing GetSampleValueLiteral /
+  SatisfyingValue). SatisfyPredicate routes to the tree path when
+  PredicateTreeJson is present, else the v0.11 flat fallback.
+
+VALIDATED (live, AdventureWorks2025 + PredicateZoo): every pz row now parses to a
+tree (Shape=PREDTREE) and seeds via ExecuteSeedPlan. Full GenerateAndCoverDatabase
+sweep over pz on the TREE path = all 15 gates GenSucceeded, 30/30 branches = 100%
+- identical to the flat engine (parity gate met), with EXISTS/COUNT/IN/BETWEEN/
+SUM/MIN/MAX/AVG/SCALAR/SCALAR_NULL, joins, OR and param-comparand all flowing
+through the one recursive pass.
+
+NEXT (phases 3-6): per-table constraint merge (shared-table + contradiction
+gates); seed the general joins the tree already parses (N-table/outer/non-equi/
+aggregate-over-join); local-variable substitution (inline the defining
+expression); then drop the flat columns, refold the installer, finish docs.
+
+FILES: modules/31_PredicateInbox_v1.sql, modules/32_Seeder_v1.sql,
+       powershell/UnitAutogen/Get-ParsedPredicates.ps1,
+       design/DESIGN_v0_12_UnifiedReverseSeeder.md, design/README.md, CHANGES.md
+
+================================================================================
+2026-06-03  v0.12 - unified reverse-seeder COMPLETE (phases 3-6)
+================================================================================
+The tree engine now seeds everything the parser captures; the only Skips left are
+genuinely irreducible (unsatisfiable predicates, runtime-dependent locals).
+
+PHASE 3 - per-table constraint merge (modules 32). Seeding is table-centric:
+every atom contributes count + row-predicate demands into a per-physical-table
+accumulator, reconciled greedily (most-specific demand first) by
+TestGen.ExecuteSeedPlan + TestGen.OverridesContain. A more-specific row already
+counts toward a broader demand, so a COUNT total is back-filled (1 OPEN + filler
+= total); an over-constrained EXACT/MAX demand is a genuine contradiction ->
+honest Skip. Handles self-joins (two aliases of one table collapse) and two
+atoms over one table. The strong assertion remains the backstop.
+
+PHASE 4 - general joins (parser + module 32). Non-equi ON (b.y sampled, a.x
+satisfies the operator via the new {satisfysample} vspec); outer joins
+(LEFT/RIGHT/FULL - a matching seeded row satisfies them too, the type only
+changes the reconstructed assertion); aggregate-over-join (COUNT/SUM/MIN/MAX/AVG
+- the inner column routed to its alias's table, K coordinated joined rows);
+N-table left-deep chains.
+
+PHASE 5 - local-variable substitution (parser). Collect-ProcLocals maps each
+single-assignment local to its defining expression; Classify-Predicate inlines
+them iteratively (a chain @f <- @n <- (SELECT ...) resolves fully) before
+building the tree, so a local-gated branch becomes an ordinary data-shape
+predicate. A conditionally/repeatedly assigned local (runtime-dependent) is NOT
+inlined -> honest UNRECOGNISED. Get-AggregateInfo / Get-LiteralText now unwrap
+parentheses so an inlined subquery still classifies.
+
+PHASE 6 - cutover. PredicateZoo gains gates per capability: LeftJoinGate,
+NonEquiJoinGate, CountOverJoinGate, SumOverJoinGate, SelfJoinGate,
+SharedTableGate, LocalSubqueryGate, LocalChainGate, plus the honest-residue
+demonstrators ContradictionGate (TRUE arm unsatisfiable) and DynamicLocalGate
+(dynamic local). Modules 31 + 32 re-folded into both installer copies
+(md5-identical). Flat inbox columns kept one release as the documented fallback.
+
+VALIDATED (live, full GenerateAndCoverDatabase over pz, 25 gates): every seedable
+gate 100% branch (22/22 of the seedable ones), all GenSucceeded. Honest residue:
+ContradictionGate 50% (TRUE Skipped - unsatisfiable), DynamicLocalGate 75%
+(dynamic local Skipped) - both with 0 failed / 0 errored tests (no ghost).
+
+GOTCHA (instrumenter, pre-existing, see [[reference-instrumenter-oneline-ifelse]]
+in memory): the line-based coverage instrumenter also needs a multi-line IF
+*condition* on one line; SelfJoin/SharedTable/Contradiction were reformatted so
+the whole IF predicate sits on a single source line.
+
+FILES: powershell/UnitAutogen/Get-ParsedPredicates.ps1, modules/31_PredicateInbox_v1.sql,
+       modules/32_Seeder_v1.sql, examples/PredicateZoo/01_Procedures.sql,
+       Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       design/DESIGN_v0_12_UnifiedReverseSeeder.md, CHANGES.md
+
+================================================================================
+2026-06-03  v0.12.1 - conditionally-assigned locals (path expansion) + merge fixes
+================================================================================
+A local assigned in BOTH arms of an IF/ELSE is NOT irreducible - its value is a
+function of an ancestor branch we already seed. The gate P(@x), with @x = v1
+when C / v2 else, is expanded to (C AND P(v1)) OR (NOT C AND P(v2)) - a boolean
+tree of data-shape atoms the unified engine already seeds (the ancestor C is
+seeded too). The earlier "DynamicLocalGate is irreducible" claim was wrong; it
+was just unhandled.
+
+PARSER (Get-ParsedPredicates.ps1):
+- Collect-ProcLocalConds + Collect-AssignWithGuards: detect a local assigned in
+  the THEN and ELSE of one IF (and nowhere else), capturing the guard condition.
+- Classify-Predicate: expands such a gate over its assignment paths, then the
+  existing tree engine drives it. Iterates with single-local inlining (nested
+  locals resolve too).
+- Constant folding: a comparison of two literals (e.g. the inlined "5 > 3")
+  becomes a {k:'const'} tree node; Propagate treats it as a fixed truth (free,
+  no demand), Render emits "(1 = 1)" / "(1 = 0)".
+- Pick-Cheapest: for AND-false / OR-true, choose the child needing the FEWEST
+  demands (a const is free), so a free falsification is never replaced by an
+  expensive, conflicting seed. (This fixed a real bug where (NOT A AND FALSE)
+  driven false seeded A=true, conflicting with the sibling's A=false.)
+
+SEEDER (module 32, ExecuteSeedPlan merge):
+- Demand "mode" (exact/min/max) now depends on @want: "COUNT > 0" wanted FALSE
+  means "<= 0 rows" (a MAX bound), not min. Without this the merge missed that a
+  later min-demand violated an earlier max/exact demand.
+- Added a validation pass: after emission, every EXACT/MAX demand is checked
+  against the FINAL row set; an exceeded bound is a genuine contradiction /
+  unreachable arm -> honest Skip (not a red test).
+
+FIXTURE: pz.CondLocalGate (conditional local, both arms reachable -> 100%);
+pz.DynamicLocalGate retired (it was just a conditional local with a dead arm),
+replaced by pz.LoopLocalGate (a loop-accumulated local - genuinely not a static
+expression -> honest UNRECOGNISED/Skip). The honest residue is now exactly:
+unsatisfiable predicates (ContradictionGate) and non-static locals (LoopLocalGate).
+
+VALIDATED (live): CondLocalGate both branches x both directions PASS; SharedTable
+/ Contradiction still correct; full pz sweep all seedable gates 100%, 0 errored
+tests, residue Skipped. Module 32 re-folded (both installer copies md5-identical).
+
+FILES: powershell/UnitAutogen/Get-ParsedPredicates.ps1, modules/32_Seeder_v1.sql,
+       examples/PredicateZoo/01_Procedures.sql, Install_UnitAutogen.sql,
+       powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+================================================================================
+2026-06-03  v0.12.2 - parser performance (cold-start diagnosis + warm-path trims)
+================================================================================
+HighValueCustomer surfaced a "~50s to parse one proc" complaint. Profiling the
+parser (Get-ParsedPredicates.ps1) on dbo.AssessCustomer (3 gates, 2/3-table
+joins, a local) showed the truth:
+  - 1st parse in a FRESH process = 52s; 2nd = 3.2s; 3rd = 3.3s.
+So ~49s was ONE-TIME cold start (PowerShell compiling the ~1400-line script +
+ScriptDom loading hundreds of CLR types + JIT). The warm per-proc cost is ~3.3s
+even for this join-heavy proc. The cold start AMORTISES when the parser runs over
+a whole schema in ONE process (`-Schema <name>` with no `-ProcName`, which the
+runbook / a real sweep does) - the per-proc test (`-ProcName X`) paid the full
+cold start for a single proc, which is the artefact behind the "50s".
+
+WARM-PATH TRIMS (kept; correctness re-validated):
+- Flat-skip: when the predicate TREE builds, Classify-Predicate returns
+  immediately - the legacy flat (v0.10/v0.11) classification is dead weight (the
+  seeder only uses it as the fallback when the tree did NOT build).
+- Reflection cache: Get-FragmentChildProps caches, per CLR type, only the
+  properties that can hold child fragments (skips value-type / string /
+  ScriptTokenStream), so the generic AST walks (Visit-Fragment, Get-FragmentVarRefs,
+  Collect-AssignNodes) stop GetValue()-ing irrelevant properties.
+- Get-FragmentText caches the ScriptTokenStream getter (was re-read per token).
+- Collect-AssignWithGuards stores the guard CONDITION FRAGMENT (object identity
+  matches THEN vs ELSE) and renders it to text lazily only for a qualifying
+  conditional local - rendering every guard eagerly was wasteful.
+
+VALIDATED: AssessCustomer 6/6 branch tests pass; full pz sweep = 24/24 seedable
+gates 100%, 0 errored tests, residue unchanged. No regression from any trim.
+
+FOLLOW-UP (not done): cold start is inherent to PowerShell+ScriptDom on first
+invocation; the practical mitigation is to parse once per schema. Integrating the
+parser call into the Invoke-UnitAutogen orchestrator (so a sweep runs it once,
+amortised) would remove the need to invoke it per-proc - a worthwhile enhancement.
+
+FILES: powershell/UnitAutogen/Get-ParsedPredicates.ps1, CHANGES.md
+
+================================================================================
+2026-06-03  v0.12.3 - parser integrated into the Invoke-UnitAutogen orchestrator
+================================================================================
+The orchestrator (UnitAutogen.psm1) ran GenerateAndCoverDatabase but NOT the
+ScriptDom parser, so the PredicateInbox was only populated if the user ran the
+parser separately - and per-proc invocation paid the full cold start each time.
+
+CHANGE: Invoke-UnitAutogen now runs Get-ParsedPredicates.ps1 as STEP 0, ONCE over
+the whole target scope, before GACD - so the PowerShell/ScriptDom cold start is
+paid a single time and amortised across every procedure. Scope = -SchemaFilter if
+given, else '*' (all user schemas). A -SkipPredicateParse switch lets callers who
+pre-parsed skip it.
+
+SUPPORTING CHANGES (Get-ParsedPredicates.ps1):
+- -Schema '*' parses EVERY user procedure in the DB in one process (the new
+  enumeration also skips framework schemas + _cov/_covfn/_orig instrumentation
+  copies). -Clear with '*' clears the whole-DB inbox.
+- Optional -SqlUser / -SqlPassword for SQL auth (the orchestrator forwards a
+  -Credential); default stays Integrated Security.
+- StrictMode safety: pre-initialise $script:ResolvedParserType / uagLocalDefs /
+  uagLocalCond / uagPropCache / rows / branchId at the top. When invoked with &
+  from the module (which runs under Set-StrictMode), reading a not-yet-set
+  $script: variable threw "...has not been set", the parse aborted, the inbox was
+  left empty (cleared but not rewritten), and GACD fell back to string-gen
+  (AssessCustomer -> 50%, false-arms only). Fixed -> AssessCustomer 6/6 = 100%
+  through the one-command path.
+
+NOTE (SSMS): generating tests in SSMS does NOT and CANNOT run the ScriptDom parser
+(T-SQL cannot call a .NET library). SSMS generation READS the inbox; the parser
+(PowerShell) must have populated it first. Generation / coverage / running tests
+are pure T-SQL and incur no parser cost.
+
+VALIDATED: Invoke-UnitAutogen -Database HighValueCustomer -SchemaFilter dbo runs
+parser-then-cover in one shot; AssessCustomer 6/6 branches 100%, 0 errored;
+coverage-report.html / coverage.xml / test-results.xml emitted.
+
+FILES: powershell/UnitAutogen/UnitAutogen.psm1, powershell/UnitAutogen/Get-ParsedPredicates.ps1, CHANGES.md
+
+================================================================================
+v0.13 — SSMS-NATIVE PREDICATE PARSER (ScriptDom hosted in SQLCLR)   2026-06-03
+================================================================================
+WHY: the predicate parser was the ONE step that could not run from T-SQL — it was
+PowerShell (Get-ParsedPredicates.ps1 driving ScriptDom). For an SSMS-only shop that
+was an adoption blocker: without it the inbox is empty and data-shape branch seeding
+degrades to string-gen. The note in the v0.12.3 entry above ("generating tests in
+SSMS does NOT and CANNOT run the ScriptDom parser") is now OVERTURNED.
+
+CHANGE: ScriptDom is hosted INSIDE SQL Server via SQLCLR and the parser logic is
+ported to C#, exposed as two T-SQL procedures:
+    EXEC TestGen.ParseDatabasePredicates  @SchemaFilter = N'dbo';   -- or NULL/'*'
+    EXEC TestGen.ParseProcedurePredicates @Schema = N'dbo', @ProcName = N'...';
+The whole workflow — parse, generate, cover, run — is now pure T-SQL in SSMS, with
+NO PowerShell. The PowerShell parser remains as an alternative (servers that forbid
+UNSAFE CLR); both write the identical TestGen.PredicateInbox.
+
+DESIGN: design/DESIGN_v0_13_SqlClrParser.md (feasibility spike + architecture).
+
+WHAT WAS BUILT (clr/):
+- UnitAutogenClr.cs (~1300 lines): a faithful C# port of Get-ParsedPredicates.ps1
+  — AST helpers, predicate-TREE build (atoms over query nodes with general joins +
+  boolean WHERE trees), truth-propagation + per-table seed-plan merge, local-variable
+  inline / conditional-IF expansion, tree->SQL render, flat-shape fallback, and a
+  hand-rolled JSON writer (the SQLCLR allow-list excludes Newtonsoft/JavaScriptSerializer).
+  Two CLR procs read sys.sql_modules over the context connection and write the inbox
+  via TestGen.AddParsedPredicate. The inbox JSON keys/values match the PS parser, so
+  modules 31-34, the generator and coverage are UNCHANGED.
+- lib/UnitAutogenClr.dll (net472) + lib/Microsoft.SqlServer.TransactSql.ScriptDom.dll
+  (Microsoft MIT, bundled; THIRD-PARTY-NOTICES.txt).
+- Install-UnitAutogenClr.SSMS.sql: self-contained, zero-PowerShell installer —
+  embeds both assemblies as 0x bytes + the SHA-512 trust hashes; trusts via
+  sys.sp_add_trusted_assembly (clr strict ON, NO TRUSTWORTHY), CREATE ASSEMBLY UNSAFE,
+  CREATE PROCEDURE. Build-Clr.ps1 / Emit-InstallerSql.ps1 regenerate it from source.
+
+NOTES / GOTCHAS:
+- csc: needs `using System.Data.SqlTypes` for SqlString; reference System.Data.dll +
+  the bundled ScriptDom; net472 Framework csc at Framework64\v4.0.30319\csc.exe.
+- Registration needs CONTROL SERVER (sp_add_trusted_assembly) -> run the install as
+  sysadmin. ODBC18 sqlcmd needs -C (trust self-signed cert). sqlcmd is slow on the
+  ~12 MB single-line 0x literal — run the installer in SSMS (or via SqlClient), not
+  sqlcmd; SSMS handles it in ~10-15 s.
+- EXTERNAL NAME is [UnitAutogenClr].[UnitAutogenClr].[<method>] (class has no namespace).
+
+VALIDATED 2026-06-03:
+- STRUCTURAL PARITY: CLR-populated inbox vs PowerShell-parser inbox over all 28
+  PredicateZoo (schema pz) gates = ZERO diff on Shape, rendered predicate SQL, and
+  both per-direction skip reasons. Both wrote 28 rows / 1 UNRECOGNISED.
+- FUNCTIONAL (zero PowerShell): on HighValueCustomer, EXEC ParseDatabasePredicates
+  'dbo' then EXEC GenerateAndCoverDatabase 'dbo' -> dbo.AssessCustomer 100% line (7/7)
+  + 100% branch (6/6), 6 predicate-branch tests pass; GetVIPCustomerAnalyticsReport
+  unchanged at 83.3%/0% (its @@TRANCOUNT>0 branch = the 1 correctly-UNRECOGNISED row).
+- The self-contained Install-UnitAutogenClr.SSMS.sql re-installs cleanly (8 batches).
+
+PENDING: optionally fold a pointer to clr/Install-UnitAutogenClr.SSMS.sql into the
+single-file installer/runbook as a post-install step (the main installer is
+line-sliced text; embedding 12 MB of assembly bytes there is left as a follow-up —
+the separate SSMS installer is the supported path).
+
+FILES: clr/UnitAutogenClr.cs, clr/lib/UnitAutogenClr.dll,
+clr/lib/Microsoft.SqlServer.TransactSql.ScriptDom.dll,
+clr/Install-UnitAutogenClr.SSMS.sql, clr/Build-Clr.ps1, clr/Emit-InstallerSql.ps1,
+clr/Register-Clr.ps1, clr/README.md, clr/THIRD-PARTY-NOTICES.txt,
+design/DESIGN_v0_13_SqlClrParser.md, CHANGES.md
+
+--------------------------------------------------------------------------------
+v0.13 FOLLOW-UP — ONE PARSER EVERYWHERE (PowerShell parser retired)  2026-06-03
+--------------------------------------------------------------------------------
+DECISION (user): use the C# (SQLCLR) parser everywhere; do NOT keep a separate
+PowerShell parser in the PowerShell-Gallery deployment. Two parsers that must stay
+behaviourally identical is a maintenance trap.
+
+CONSEQUENCES:
+- powershell/UnitAutogen/Get-ParsedPredicates.ps1 RETIRED -> moved to
+  powershell/legacy/ (unmaintained; kept only as history + a last-resort option for
+  servers that forbid UNSAFE CLR). See powershell/legacy/README.md.
+- The module now installs + uses the in-DB parser:
+  * Install-UnitAutogenDatabase runs the framework installer AND
+    sql/Install-UnitAutogenClr.SSMS.sql (bundled) -> registers the CLR parser.
+    Needs sysadmin (CONTROL SERVER) once + 'clr enabled'=1 (new for the module path).
+  * Invoke-UnitAutogen STEP 0 now runs EXEC TestGen.ParseDatabasePredicates instead
+    of the PowerShell parser (-SkipPredicateParse still honoured). No ScriptDom cold
+    start. Verified Invoke-Sqlcmd handles the ~12 MB embedded-bytes installer (~17 s;
+    unlike sqlcmd.exe, which chokes on the single long binary literal).
+- De-duplicated the module: powershell/UnitAutogen.psm1 (an older standalone COPY
+  that predated the parser and is imported directly by README/USAGE/CI) is now a thin
+  SHIM that imports the canonical powershell/UnitAutogen/ module -Global. One
+  implementation; the v0.13 behaviour applies no matter how the module is loaded.
+  Verified: importing the shim resolves all 5 cmdlets from the canonical module.
+- publish.ps1 now SYNCS both SQL installers (framework + CLR) from their canonical
+  repo sources into the module's sql/ before publishing (single source of truth).
+- Manifest: ModuleVersion 0.9.5 -> 0.9.6 (continues the public beta line; the
+  "v0.13" label is the SQL-framework feature series, a separate scheme), FileList +
+  sql/Install-UnitAutogenClr.SSMS.sql, description + release notes updated. Validated
+  with Test-ModuleManifest.
+- Docs rewritten to the single-parser, two-step (framework + parser) story:
+  INSTALL.md (also fixed the stale Install_All_Combined filename), docs/quickstart.md
+  (+ parser step + ParseProcedurePredicates), README.md (quick start now registers
+  the parser + ParseDatabasePredicates), powershell/USAGE.md.
+- End-user install bundle: Build-ReleaseBundle.ps1 -> dist/UnitAutogen-<ver>-install.zip
+  (1_framework.sql + 2_parser.sql + README-INSTALL.md + LICENSE/COPYRIGHT/THIRD-PARTY).
+  dist/ is gitignored.
+
+NOTE: a server that forbids UNSAFE CLR outright now has no parser (tSQLt itself
+already requires CLR, so this is a narrow edge case). Accepted trade for retiring the
+second parser.
+
+FILES: powershell/UnitAutogen/UnitAutogen.psm1, powershell/UnitAutogen/UnitAutogen.psd1,
+powershell/UnitAutogen/sql/Install-UnitAutogenClr.SSMS.sql, powershell/UnitAutogen.psm1,
+powershell/legacy/Get-ParsedPredicates.ps1, powershell/legacy/README.md, publish.ps1,
+INSTALL.md, README.md, docs/quickstart.md, powershell/USAGE.md, Build-ReleaseBundle.ps1,
+.gitignore, CHANGES.md

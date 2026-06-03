@@ -197,6 +197,34 @@ function Install-UnitAutogenDatabase {
 
     Write-Host ''
     Write-Host "[UnitAutogen] Framework installed successfully."
+
+    # Register the in-database C# (SQLCLR) predicate parser. This is the SINGLE
+    # parser used everywhere (the old PowerShell parser is retired). It populates
+    # TestGen.PredicateInbox so data-shape branches (EXISTS / COUNT / scalar-subquery
+    # gates) get real seeded tests. Idempotent. Needs CONTROL SERVER (sysadmin) once
+    # + 'clr enabled' = 1; it trusts the assemblies by SHA-512 hash via
+    # sys.sp_add_trusted_assembly (no TRUSTWORTHY required).
+    $clrFile = Join-Path $PSScriptRoot 'sql\Install-UnitAutogenClr.SSMS.sql'
+    if (Test-Path -LiteralPath $clrFile) {
+        Write-Host ''
+        Write-Host "[UnitAutogen] Registering the in-database predicate parser (SQLCLR)..."
+        try {
+            Invoke-Sqlcmd @connParams -InputFile $clrFile -Verbose 4>&1 |
+                ForEach-Object { Write-Host $_ }
+            Write-Host "[UnitAutogen] Predicate parser registered (EXEC TestGen.ParseDatabasePredicates)."
+        }
+        catch {
+            Write-Warning "[UnitAutogen] CLR parser registration failed: $_"
+            Write-Warning "[UnitAutogen] This step needs sysadmin (CONTROL SERVER) and 'clr enabled' = 1."
+            Write-Warning "[UnitAutogen] Register it later by running clr/Install-UnitAutogenClr.SSMS.sql in SSMS."
+        }
+    }
+    else {
+        Write-Warning "[UnitAutogen] CLR parser installer not bundled beside the module ($clrFile)."
+        Write-Warning "[UnitAutogen] Register it from clr/Install-UnitAutogenClr.SSMS.sql, or data-shape seeding is disabled."
+    }
+
+    Write-Host ''
     Write-Host "[UnitAutogen] Next step: run Invoke-UnitAutogen to generate tests and measure coverage."
 }
 
@@ -287,7 +315,8 @@ function Invoke-UnitAutogen {
         [string]               $TestResultsFileName = 'test-results.xml',
         [string]               $HtmlReportFileName  = 'coverage-report.html',
         [int]                  $GenerationTimeout   = 3600,
-        [PSCredential]         $Credential          = $null
+        [PSCredential]         $Credential          = $null,
+        [switch]               $SkipPredicateParse
     )
 
     # Ensure output directory exists
@@ -301,6 +330,27 @@ function Invoke-UnitAutogen {
     Write-Host "[UnitAutogen] Auth     : $auth"
     Write-Host "[UnitAutogen] Output   : $(Resolve-Path $OutputPath)"
     Write-Host ''
+
+    # STEP 0: populate TestGen.PredicateInbox via the in-database C# (SQLCLR)
+    # predicate parser - the single parser used everywhere. It is registered by
+    # Install-UnitAutogenDatabase; here we just invoke it from T-SQL. One call
+    # parses the whole target scope (a schema, or '*' = every user schema).
+    if (-not $SkipPredicateParse) {
+        $scopeArg = if ($SchemaFilter) { "N'$SchemaFilter'" } else { "N'*'" }
+        Write-Host "[UnitAutogen] Parsing predicates (in-DB SQLCLR parser) over scope $scopeArg ..."
+        $connParse = Build-ConnParams -ServerInstance $ServerInstance -Database $Database `
+                         -Credential $Credential -QueryTimeout $GenerationTimeout
+        try {
+            Invoke-Sqlcmd @connParse -Query "EXEC TestGen.ParseDatabasePredicates @SchemaFilter = $scopeArg;" -Verbose 4>&1 |
+                ForEach-Object { Write-Host "  $_" }
+        } catch {
+            Write-Warning "[UnitAutogen] Predicate parse failed: $_"
+            Write-Warning "[UnitAutogen] Is the CLR parser installed? Run Install-UnitAutogenDatabase (it registers TestGen.ParseDatabasePredicates)."
+            Write-Warning "[UnitAutogen] Continuing - data-shape branches will fall back to NOT_TESTABLE / string-gen."
+        }
+        Write-Host ''
+    }
+
     Write-Host "[UnitAutogen] Running GenerateAndCoverDatabase..."
 
     $connGen      = Build-ConnParams -ServerInstance $ServerInstance -Database $Database `

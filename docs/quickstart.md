@@ -34,11 +34,28 @@ to run on a fresh database or to re-run for an upgrade.
 
 You should see `Framework installed successfully.` near the end.
 
+## Step 1b — Register the predicate parser
+
+Open `clr/Install-UnitAutogenClr.SSMS.sql` (in the repo root `clr/` folder) in
+SSMS against the **same** database and execute it. This registers the in-database
+C# parser — the single parser UnitAutogen uses — which fills
+`TestGen.PredicateInbox` so data-shape branches (EXISTS / COUNT / scalar-subquery
+gates) get real seeded tests. It needs sysadmin once and `clr enabled = 1`
+(see [`INSTALL.md`](../INSTALL.md)). Run it in SSMS, not `sqlcmd`.
+
+> Prefer one command? `Install-Module UnitAutogen` then
+> `Install-UnitAutogenDatabase` does both steps for you — see [`INSTALL.md`](../INSTALL.md).
+
 For upgrade paths and the modular install option, see [`INSTALL.md`](../INSTALL.md).
 
 ## Step 2 — Generate a test class for one procedure
 
 Pick any procedure in your database. We'll use `dbo.YourProcedure` as a stand-in.
+First parse its predicates (once per procedure or per schema), then generate:
+
+    EXEC TestGen.ParseProcedurePredicates
+         @Schema   = N'dbo',
+         @ProcName = N'YourProcedure';
 
     EXEC TestGen.GenerateTestsForProcedure
          @SchemaName    = N'dbo',

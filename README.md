@@ -37,19 +37,30 @@ The SQL Server testing ecosystem already has unit-testing frameworks (tSQLt, Red
 
 ## Quick start
 
+Run these in SSMS with **SQLCMD Mode** on (Query → SQLCMD Mode) so the `:r`
+includes resolve, from the repo root.
+
 ```sql
 -- 1. Install the framework into your database (idempotent; safe to re-run)
 USE YourDatabase;
 GO
 :r Install_UnitAutogen.sql
 
--- 2. Generate, run, and report coverage for ONE procedure - one call
+-- 1b. Register the single in-database (SQLCLR) predicate parser.
+--     Needs sysadmin once + 'clr enabled' = 1. (Run clr\Install-UnitAutogenClr.SSMS.sql
+--     directly in SSMS if you're not in SQLCMD mode.)
+:r clr\Install-UnitAutogenClr.SSMS.sql
+
+-- 2. Parse predicates (fills TestGen.PredicateInbox for data-shape branch seeding)
+EXEC TestGen.ParseDatabasePredicates @SchemaFilter = N'dbo';   -- or NULL/'*' = all schemas
+
+-- 3. Generate, run, and report coverage for ONE procedure - one call
 EXEC TestGen.GenerateAndRunCoverage
      @SchemaName = N'dbo',
      @ProcName   = N'YourProcedure',
      @OutputMode = N'HTML';     -- or N'TEXT'
 
--- 3. Or do it for the WHOLE database in one call (CI/CD entry point)
+-- 4. Or do it for the WHOLE database in one call (CI/CD entry point)
 EXEC TestGen.GenerateAndCoverDatabase
      @OutputMode = N'HTML';
 ```

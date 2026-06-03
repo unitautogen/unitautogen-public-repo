@@ -1,10 +1,10 @@
 @{
-    ModuleVersion     = '0.9.5'
+    ModuleVersion     = '0.9.6'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
     Copyright         = '(C) 2026 Munaf Ibrahim Khatri. Licensed under AGPL-3.0.'
-    Description       = 'PowerShell module for UnitAutogen — auto-generated tSQLt unit tests with real branch coverage for SQL Server. Installs the framework, runs generation and coverage, and exports Cobertura XML, JUnit XML, and HTML reports for Azure DevOps, GitHub Actions, Jenkins, GitLab CI, and SonarQube.'
+    Description       = 'PowerShell module for UnitAutogen — auto-generated tSQLt unit tests with real branch coverage for SQL Server. Installs the framework AND the in-database (SQLCLR) predicate parser, runs generation and coverage, and exports Cobertura XML, JUnit XML, and HTML reports for Azure DevOps, GitHub Actions, Jenkins, GitLab CI, and SonarQube. As of v0.13 the single C# predicate parser runs inside SQL Server (no PowerShell-side parser); installation registers it and requires sysadmin once plus ''clr enabled''=1.'
     PowerShellVersion = '5.1'
     RootModule        = 'UnitAutogen.psm1'
 
@@ -24,7 +24,8 @@
     FileList = @(
         'UnitAutogen.psd1',
         'UnitAutogen.psm1',
-        'sql\Install_UnitAutogen.sql'
+        'sql\Install_UnitAutogen.sql',
+        'sql\Install-UnitAutogenClr.SSMS.sql'
     )
 
     PrivateData = @{
@@ -38,6 +39,26 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
+## v0.9.6 (beta) — 2026-06-03  (ships the "v0.13" in-database parser)
+
+SSMS-native predicate parser — ONE parser everywhere (the PowerShell ScriptDom
+parser is retired):
+
+- The predicate parser now runs INSIDE SQL Server as a SQLCLR assembly (a C# port
+  of the old PowerShell parser, hosting Microsoft's ScriptDom). It is exposed as
+  EXEC TestGen.ParseDatabasePredicates and is the single parser used by every entry
+  point — SSMS, this module, and CI/CD. No more two-parsers-to-keep-in-sync.
+- Install-UnitAutogenDatabase now also registers the parser (bundled
+  sql\Install-UnitAutogenClr.SSMS.sql). This needs sysadmin (CONTROL SERVER) ONCE
+  and 'clr enabled'=1; it trusts the assemblies by SHA-512 hash via
+  sys.sp_add_trusted_assembly (no TRUSTWORTHY required).
+- Invoke-UnitAutogen calls EXEC TestGen.ParseDatabasePredicates (was: a PowerShell
+  step). -SkipPredicateParse still skips it. No ScriptDom cold start anymore.
+- Servers that forbid UNSAFE CLR entirely have no parser; data-shape branches then
+  fall back to NOT_TESTABLE / string-gen (tSQLt itself already requires CLR).
+- Validated: PredicateZoo parity (CLR == old PowerShell parser on all 28 gates) and
+  AssessCustomer 100% line + 100% branch end-to-end with zero PowerShell parsing.
+
 ## v0.9.5 (beta) — 2026-06-02
 
 Production-safety release.  Two operational fixes:

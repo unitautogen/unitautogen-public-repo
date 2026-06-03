@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "powershell": {
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy", "Bypass",
+        "-File",
+        "D:\\Working Files\\ai\\tsqlt Automation\\tsqltAutoGen\\unitautogen-public-repo\\unitautogen-public-repo\\tools\\mcp_powershell_server.ps1"
+      ],
+      "env": {
+        "UAG_MCP_CWD": "D:\\Working Files\\ai\\tsqlt Automation\\tsqltAutoGen\\unitautogen-public-repo\\unitautogen-public-repo",
+        "UAG_MCP_MAX_TIMEOUT": "600"
+      }
+    }
+  }
+}

@@ -1,6 +1,6 @@
 # DESIGN: v0.10 — Predicate-Aware Data-Shape Seeding
 
-Status: DRAFT (2026-06-02, rev 3 — ScriptDom adopted, registry removed)
+Status: DRAFT (2026-06-02, rev 4 — open questions resolved; implementation started)
 Targets: PowerShell module v0.10.0 + framework v11.1
 Author: Munaf Khatri (draft prepared with Claude)
 Related decision: [DECISION_v0_10_Parser_Choice.md](DECISION_v0_10_Parser_Choice.md)
@@ -238,6 +238,28 @@ ships the DLL. Two packaging options:
 Recommend bundle for v0.10.0 — zero-friction install matters more
 than 2 MB of disk for a tool whose audience values "just works."
 
+**Version policy (decided during implementation, 2026-06-02): latest, not
+just available.** ScriptDom DLLs are cumulative and backward-compatible — the
+latest assembly contains every `TSqlNNNParser` (80→170), so it parses every
+older dialect *plus* the newest syntax. An older DLL simply lacks the newer
+parser classes and would under-parse current SQL. Therefore:
+
+- `Get-ParsedPredicates.ps1` enumerates **all** candidate DLLs and loads the one
+  with the **highest file version**, not the first found.
+- It auto-selects the **highest `TSqlNNNParser`** the loaded assembly exposes
+  (an explicit `-ParserVersion` still wins).
+- In DB mode it reads the database `compatibility_level` and **warns** if the
+  loaded ScriptDom's top parser is older than that level — the staleness signal
+  that says "install a newer ScriptDom."
+
+Nuance: the public NuGet `Microsoft.SqlServer.TransactSql.ScriptDom` is on the
+`161.x` train (tops out at `TSql160Parser` / SQL 2022), whereas the **SqlServer
+PowerShell module 22.x** ships ScriptDom `17.0.x` which includes
+`TSql170Parser` (SQL 2025). So "latest" means *highest available across all
+sources*, which today is the module's 17.x — not the NuGet package. The bundle,
+when cut for release, should therefore source the newest ScriptDom that carries
+the highest `TSqlNNNParser`, refreshed each release.
+
 ### 5.2 Validation databases
 
 Three regression targets:
@@ -289,33 +311,64 @@ LinkedIn outreach, Simple Talk article, or marketplace extension work.
 - v0.10 SQL-only install — continues to deliver v9.x semantics; the
   predicate-aware seeding is a PowerShell-flow feature
 
-## 6. Open questions
+## 6. Open questions — RESOLVED (2026-06-02, rev 4)
 
-Marked for resolution before parser implementation starts.
+All five settled before parser/seeder implementation. Decisions locked
+below; the rationale is kept so the choices are auditable.
 
-1. **Naming for the generated test bodies.** Current draft uses
-   `_BranchN_True` / `_BranchN_False`. Alternative: `_BranchN_Hit` /
-   `_BranchN_Miss`. Reader preference?
-2. **NOT_TESTABLE rendering in the HTML report.** Inline annotation
-   per branch (cleaner per-line) or a separate panel at the bottom
-   listing all NOT_TESTABLE branches with their predicates (easier
-   to triage at a glance)?
-3. **Reseeding semantics.** When a branch test runs, the framework
-   currently uses `FakeTable` to start clean. The new seeder will
-   INSERT engineered rows into the faked table. Confirm interaction
-   with existing seeding pipeline so we don't double-seed or
-   clear-after-seed.
-4. **Identity / computed column handling in INSERT scripts.** The
-   v9.2 lesson on identity/PK/computed/rowversion exclusion in UPDATE
-   set clauses applies equally to INSERT in the new seeder.
-   Confirmed the seeder will reuse the existing helper.
-5. **Multi-join WHERE composition.** When a join brings columns from
-   multiple tables and the outer WHERE references columns from more
-   than one, the seeder must engineer rows that jointly satisfy. For
-   v0.10.0, restrict to WHERE clauses that can be partitioned per
-   table (each AND-clause references one table at a time), or attempt
-   full joint satisfaction? Restriction is cleaner; full satisfaction
-   is more powerful but adds complexity.
+1. **Naming for the generated test bodies — RESOLVED: `True` / `False`.**
+   The generated test suffix is
+   `[test <Proc> executes branch <N> predicate TRUE]` /
+   `[... predicate FALSE]`. Chosen over `Hit`/`Miss` because the
+   existing branch tests already read in the natural-language
+   `executes <param> = <val> path` style (see
+   `04_Test_Generator_v3.sql` §test-name emission), and TRUE/FALSE maps
+   one-to-one onto the `@Direction` argument of
+   `TestGen.SatisfyPredicate` with no translation layer. `Hit`/`Miss`
+   reads as coverage jargon and would diverge from the param-branch
+   names already in the same class.
+2. **NOT_TESTABLE rendering — RESOLVED: bottom panel, primary; inline
+   tooltip, secondary.** The HTML report grows a single
+   "Not-testable predicates" panel at the bottom listing
+   `Schema.Proc — branch N — <verbatim predicate> — <reason>`, sourced
+   from `PredicateInbox` rows where `Shape = 'UNRECOGNISED'`. This is
+   the triage-at-a-glance view. A per-line `title=` tooltip on the
+   branch row is added opportunistically where the reporter already
+   emits a per-line cell, but the panel is the contract — the tooltip
+   degrades gracefully if a future reporter rewrite drops per-line
+   cells. Cobertura/JUnit XML already carry `hits="0"` + the Fail
+   message, so CI visibility does not depend on the HTML choice.
+3. **Reseeding semantics — RESOLVED: seeder appends INSERTs only,
+   after SafeFakeTable, before Act.** The seeder NEVER calls
+   `FakeTable`/`SafeFakeTable` itself. Its output is appended to the
+   existing setup block at the same seam the current EXISTS seed block
+   uses (`@ThisSeedBlock`, injected right after the proc body opens and
+   after all `SafeFakeTable` calls — `04_Test_Generator_v3.sql`
+   ~line 2855). The faked table is already empty at that point, so the
+   seeder's engineered rows are the only rows; there is no double-seed
+   and no clear-after-seed. For the FALSE direction of EXISTS/COUNT=0
+   shapes the seeder emits nothing (empty faked table already satisfies
+   it) — mirroring the existing `EXISTS_FALSE` "no seed" path.
+4. **Identity / computed / PK / rowversion in INSERTs — RESOLVED:
+   reuse the existing exclusion.** The seeder builds its INSERT column
+   list from `sys.columns`/`sys.types` with exactly the v9.2/v9.4
+   exclusion predicate (`is_identity = 0 AND is_computed = 0 AND
+   t.name NOT IN ('timestamp','rowversion')`, see
+   `04_Test_Generator_v3.sql` ~line 3047). No new helper; the seeder
+   calls the same column-shaping logic, so FakeTable's
+   version-dependent identity behaviour is handled identically to the
+   replay path.
+5. **Multi-join WHERE composition — RESOLVED: per-table-partitionable
+   only in v0.10.0.** If every AND-clause of the subquery WHERE
+   references columns from a single table (the predicate is
+   partitionable per table), the seeder engineers one satisfying row
+   per table independently. If any AND-clause references columns from
+   more than one table (cross-table predicate composition that a join
+   must jointly satisfy), the parser marks the row `Shape =
+   UNRECOGNISED` with reason `multi-table WHERE composition` and the
+   branch becomes NOT_TESTABLE. Full joint satisfaction is deferred to
+   v0.11 (already listed in §5.4). This keeps v0.10.0 correct-by-
+   construction and bounds the seeder's case analysis.
 
 ## 7. Risks
 

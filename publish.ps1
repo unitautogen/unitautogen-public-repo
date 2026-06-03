@@ -58,10 +58,25 @@ if (-not (Test-Path -LiteralPath $manifestPath)) {
     throw "Manifest not found: $manifestPath"
 }
 
-$sqlInstaller = Join-Path $modulePath 'sql\Install_UnitAutogen.sql'
-if (-not (Test-Path -LiteralPath $sqlInstaller)) {
-    throw "Bundled SQL installer not found: $sqlInstaller`nRun from the repo root after ensuring sql\ is populated."
+# Sync the bundled SQL from the canonical repo sources so the published module
+# always carries current bytes (single source of truth: root installer + clr/).
+$moduleSql = Join-Path $modulePath 'sql'
+New-Item -ItemType Directory -Force -Path $moduleSql | Out-Null
+$srcFramework = Join-Path $repoRoot 'Install_UnitAutogen.sql'
+$srcClr       = Join-Path $repoRoot 'clr\Install-UnitAutogenClr.SSMS.sql'
+foreach ($src in @($srcFramework, $srcClr)) {
+    if (-not (Test-Path -LiteralPath $src)) {
+        throw "Canonical source not found: $src`nThe module bundles framework + CLR-parser installers; both must exist in the repo."
+    }
+    Copy-Item -LiteralPath $src -Destination $moduleSql -Force
+    Write-Host "Synced  : $(Split-Path $src -Leaf) -> sql\"
 }
+$sqlInstaller = Join-Path $moduleSql 'Install_UnitAutogen.sql'
+$clrInstaller = Join-Path $moduleSql 'Install-UnitAutogenClr.SSMS.sql'
+foreach ($f in @($sqlInstaller, $clrInstaller)) {
+    if (-not (Test-Path -LiteralPath $f)) { throw "Bundled SQL installer not found after sync: $f" }
+}
+Write-Host ""
 
 # ── 2. Validate the manifest ─────────────────────────────────────────────────
 Write-Host "Validating manifest..."

@@ -1989,6 +1989,16 @@ BEGIN
 
         IF @genOK = 1
         BEGIN
+            -- v0.10: add seeded predicate-branch tests BEFORE measuring, so the
+            -- single coverage pass also reaches the data-shape arms (~0.6s/proc).
+            -- Gated on the proc having been parsed (PredicateInbox rows); unparsed
+            -- procs are untouched, so the baseline is unchanged.
+            IF OBJECT_ID('TestGen.GeneratePredicateBranchTests','P') IS NOT NULL
+               AND EXISTS (SELECT 1 FROM TestGen.PredicateInbox pi WHERE pi.SchemaName=@s AND pi.ProcName=@p)
+            BEGIN TRY
+                EXEC TestGen.GeneratePredicateBranchTests @SchemaName=@s, @ProcName=@p;
+            END TRY BEGIN CATCH SET @err=ISNULL(@err+N' | ',N'')+N'V10: '+ERROR_MESSAGE(); END CATCH
+
             -- RunCoverage runs the tests ONCE (instrumented), measures coverage,
             -- AND returns the outcomes via OUTPUT params - no separate test run.
             -- Silent: 'NONE' -> GetCoverageReport emits no per-procedure report.

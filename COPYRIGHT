@@ -49,6 +49,15 @@ framework.  tSQLt is the work of its own authors, is licensed separately
 under its own terms, and is NOT included in or distributed with this
 repository.
 
+UnitAutogen v0.13 bundles and redistributes Microsoft's
+Microsoft.SqlServer.TransactSql.ScriptDom assembly (the NuGet package
+"Microsoft.SqlServer.TransactSql.ScriptDom") in clr/lib/ so the SQLCLR
+predicate parser installs without an external download.  That assembly is
+the work of Microsoft Corporation and is licensed by Microsoft under the
+MIT License, which permits redistribution; it is NOT covered by this
+project's AGPL licence.  Its licence and provenance are recorded in
+clr/THIRD-PARTY-NOTICES.txt.  UnitAutogen does not modify the assembly.
+
 UnitAutogen is developed and tested against the Microsoft AdventureWorks,
 Northwind, and WideWorldImporters sample databases.  These sample
 databases are likewise NOT included in or redistributed with this
