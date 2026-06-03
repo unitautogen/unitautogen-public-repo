@@ -9637,6 +9637,42 @@ BEGIN
     SET @TestClass   = 'test_' + @ProcName;
     SELECT @TestsRun=0, @TestsPassed=0, @TestsFailed=0, @TestsErrored=0, @TestsSkipped=0;
     SET @BackupFull  = QUOTENAME(@SchemaName)+'.'+QUOTENAME(@ProcName+'_orig');
+    SET @OrigFull    = QUOTENAME(@SchemaName)+'.'+QUOTENAME(@ProcName);
+    DECLARE @covErr  NVARCHAR(MAX) = NULL;  -- v0.13.x: remembered run error so the guaranteed restore can still run
+
+    -- v0.13.x: bulletproof self-heal of any leftover from an interrupted/killed run,
+    -- run FIRST (before the testability gate + instrumentation) so a stranded synonym
+    -- is restored to its real body rather than mis-judged NOT_TESTABLE and skipped.
+    -- It NEVER drops the only copy of the real proc body. Order matters.
+    -- (a) a leftover synonym at the base name -> drop it (its _cov target is rebuilt
+    --     later); the base name is then free.
+    BEGIN TRY
+        IF OBJECT_ID(@OrigFull, 'SN') IS NOT NULL
+        BEGIN SET @SQL = N'DROP SYNONYM ' + @OrigFull; EXEC(@SQL); END;
+    END TRY BEGIN CATCH END CATCH;
+    -- (b) base missing but _orig present -> the real body is parked in _orig; restore it.
+    BEGIN TRY
+        IF OBJECT_ID(@OrigFull,'P') IS NULL AND OBJECT_ID(@BackupFull,'P') IS NOT NULL
+        BEGIN
+            SET @SQL = N'EXEC sp_rename ''' + @SchemaName + '.' + @ProcName + '_orig'', ''' + @ProcName + '''';
+            EXEC(@SQL);
+        END;
+    END TRY BEGIN CATCH END CATCH;
+    -- (c) base IS a live proc AND a stale _orig also exists -> _orig is a redundant
+    --     backup (the real body is already at base), so dropping it removes a copy,
+    --     never the only one. Clears the way for a clean instrument/rename later.
+    BEGIN TRY
+        IF OBJECT_ID(@OrigFull,'P') IS NOT NULL AND OBJECT_ID(@BackupFull,'P') IS NOT NULL
+        BEGIN SET @SQL = N'DROP PROCEDURE ' + @BackupFull; EXEC(@SQL); END;
+    END TRY BEGIN CATCH END CATCH;
+    -- (d) safety net: after self-heal the base MUST be a live proc. If it is not
+    --     (no base, no recoverable _orig), ABORT instead of instrumenting/renaming a
+    --     missing object - that is exactly what cascades into object loss.
+    IF OBJECT_ID(@OrigFull,'P') IS NULL
+    BEGIN
+        RAISERROR('TestGen.RunCoverage: %s.%s has no base procedure and no recoverable _orig backup - aborting to avoid object loss. Investigate an interrupted run.', 16, 1, @SchemaName, @ProcName);
+        RETURN;
+    END;
 
     /* v9.4.3: testability gate - a NOT_TESTABLE procedure (no fakeable
        dependencies + system-catalog usage) cannot be meaningfully instrumented
@@ -9693,21 +9729,9 @@ BEGIN
             EXEC('DROP EVENT SESSION TestGenCoverage ON SERVER');
     END TRY BEGIN CATCH END CATCH;
 
-    -- Also clean up any leftover synonym/backup from previous failed run
-    BEGIN TRY
-        IF OBJECT_ID(QUOTENAME(@SchemaName)+'.'+QUOTENAME(@ProcName), 'SN') IS NOT NULL
-        BEGIN
-            SET @SQL = N'DROP SYNONYM ' + QUOTENAME(@SchemaName)+'.'+QUOTENAME(@ProcName);
-            EXEC(@SQL);
-        END;
-    END TRY BEGIN CATCH END CATCH;
-    BEGIN TRY
-        IF OBJECT_ID(@BackupFull,'P') IS NOT NULL AND OBJECT_ID(QUOTENAME(@SchemaName)+'.'+QUOTENAME(@ProcName),'P') IS NULL
-        BEGIN
-            SET @SQL = N'EXEC sp_rename ''' + @SchemaName + '.' + @ProcName + '_orig'', ''' + @ProcName + '''';
-            EXEC(@SQL);
-        END;
-    END TRY BEGIN CATCH END CATCH;
+    -- (v0.13.x: the leftover self-heal now runs at the TOP of the proc, BEFORE the
+    --  testability gate - see the self-heal block near the top. A stranded synonym
+    --  here would otherwise be mis-judged NOT_TESTABLE and skipped un-healed.)
 
     -- Delete previous XEL files - skipped (xp_cmdshell may be disabled)
     -- Unique timestamp in filename prevents stale file conflicts
@@ -9774,31 +9798,29 @@ BEGIN
     DELETE FROM TestGen.CoverageHits
     WHERE SchemaName = @SchemaName AND ProcName = @ProcName;
 
-    SET @OrigFull = QUOTENAME(@SchemaName) + '.' + QUOTENAME(@ProcName);
     SET @SynFull  = @OrigFull;
 
-    -- Rename original to _orig
-    IF OBJECT_ID(@BackupFull, 'P') IS NOT NULL
-    BEGIN
-        SET @SQL = N'DROP PROCEDURE ' + @BackupFull;
-        EXEC(@SQL);
-    END;
-    SET @SQL = N'EXEC sp_rename ''' + @SchemaName + '.' + @ProcName + ''', ''' + @ProcName + '_orig''';
-    EXEC(@SQL);
-    PRINT 'Original renamed to _orig.';
-
-    -- Create synonym: original name -> _cov
-    IF OBJECT_ID(@SynFull, 'SN') IS NOT NULL
-    BEGIN
-        SET @SQL = N'DROP SYNONYM ' + @SynFull;
-        EXEC(@SQL);
-    END;
-    SET @SQL = N'CREATE SYNONYM ' + @SynFull + N' FOR ' + @CovFull;
-    EXEC(@SQL);
-    PRINT 'Synonym created: ' + @ProcName + ' -> ' + @CovProcName;
-
-    PRINT 'Running: ' + @TestClass + ' (via synonym to instrumented proc)';
+    -- v0.13.x: GUARANTEED-restore wrapper. Everything from the rename through the
+    -- test run is inside this TRY; the restore below the matching CATCH ALWAYS runs,
+    -- so a soft error (synonym clash, run abort) can never strand the proc as _orig.
+    -- A hard connection drop that bypasses CATCH is healed by the bulletproof
+    -- self-heal at the top of the NEXT run (Step 2 above).
     BEGIN TRY
+        -- Rename original to _orig. (Step 2 self-heal guarantees the base is the real
+        -- proc and no stale _orig remains, so there is no backup to drop here.)
+        SET @SQL = N'EXEC sp_rename ''' + @SchemaName + '.' + @ProcName + ''', ''' + @ProcName + '_orig''';
+        EXEC(@SQL);
+        PRINT 'Original renamed to _orig.';
+
+        -- Create synonym: original name -> _cov
+        IF OBJECT_ID(@SynFull, 'SN') IS NOT NULL
+        BEGIN SET @SQL = N'DROP SYNONYM ' + @SynFull; EXEC(@SQL); END;
+        SET @SQL = N'CREATE SYNONYM ' + @SynFull + N' FOR ' + @CovFull;
+        EXEC(@SQL);
+        PRINT 'Synonym created: ' + @ProcName + ' -> ' + @CovProcName;
+
+        PRINT 'Running: ' + @TestClass + ' (via synonym to instrumented proc)';
+        BEGIN TRY
         -- v9.4.3: tSQLt.Run RAISES an error when any test fails or errors.
         -- Wrap it so that raise does not skip the outcome capture just below
         -- (the custom-class run further down is already wrapped this way).
@@ -9843,21 +9865,27 @@ BEGIN
     BEGIN CATCH
         PRINT 'tSQLt error: ' + ERROR_MESSAGE();
     END CATCH;
+    END TRY
+    BEGIN CATCH
+        -- v0.13.x: remember any error from the rename/synonym/run; the guaranteed
+        -- restore below still runs so the original is never left stranded as _orig.
+        SET @covErr = ERROR_MESSAGE();
+    END CATCH;
 
     ---------------------------------------------------------------------------
-    -- Step 5: Restore - drop synonym, rename _orig back to original
+    -- Step 5: GUARANTEED, idempotent restore - drop synonym, rename _orig back.
+    -- Runs whether or not the wrapper above succeeded; the rename is guarded on the
+    -- base name being free, so it can never clobber a live base proc.
     ---------------------------------------------------------------------------
     IF OBJECT_ID(@SynFull, 'SN') IS NOT NULL
-    BEGIN
-        SET @SQL = N'DROP SYNONYM ' + @SynFull;
-        EXEC(@SQL);
-    END;
-    IF OBJECT_ID(@BackupFull, 'P') IS NOT NULL
+    BEGIN SET @SQL = N'DROP SYNONYM ' + @SynFull; EXEC(@SQL); END;
+    IF OBJECT_ID(@OrigFull,'P') IS NULL AND OBJECT_ID(@BackupFull, 'P') IS NOT NULL
     BEGIN
         SET @SQL = N'EXEC sp_rename ''' + @SchemaName + '.' + @ProcName + '_orig'', ''' + @ProcName + '''';
         EXEC(@SQL);
     END;
     PRINT 'Original proc restored.';
+    IF @covErr IS NOT NULL PRINT 'Coverage run error (original safely restored): ' + @covErr;
 
     ---------------------------------------------------------------------------
     -- Step 5: Wait for events to flush to disk

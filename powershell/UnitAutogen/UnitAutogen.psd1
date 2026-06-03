@@ -1,5 +1,5 @@
 @{
-    ModuleVersion     = '0.9.7'
+    ModuleVersion     = '0.9.8'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -39,7 +39,7 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
-## v0.9.7 (beta) — 2026-06-03  (ships the "v0.13" in-database parser + fixes)
+## v0.9.8 (beta) — 2026-06-03  (ships the "v0.13" in-database parser + fixes)
 
 Fixes on top of the SSMS-native parser work below:
 
@@ -54,6 +54,11 @@ Fixes on top of the SSMS-native parser work below:
   recovery ("the connection was recovered ... valid rowcount") on the first object's
   generation; the resync probe is now a swallowed real round-trip that reliably
   absorbs that first-query penalty (was a bare assignment that did not).
+- Coverage teardown resilience: RunCoverage now self-heals a proc left stranded by
+  an interrupted/killed run (recovers it from its _orig backup) BEFORE doing anything
+  else, and its restore is wrapped + idempotent so a soft error can never strand the
+  proc as _orig. It never drops the only copy of the real body, and aborts cleanly if
+  a proc is genuinely missing rather than cascading. (No more "the proc disappeared.")
 
 SSMS-native predicate parser — ONE parser everywhere (the PowerShell ScriptDom
 parser is retired):

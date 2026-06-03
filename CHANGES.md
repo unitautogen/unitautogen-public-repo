@@ -6971,3 +6971,41 @@ deploying. The shipped installer runs under QI ON, so end users are unaffected.
 
 FILES: modules/04_Test_Generator_v3.sql, Install_UnitAutogen.sql,
 powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+--------------------------------------------------------------------------------
+v0.13 FIX — coverage teardown resilience (no more stranded/lost procs)  2026-06-03
+--------------------------------------------------------------------------------
+SYMPTOM: RunCoverage renames the target proc to _orig, points a synonym at the
+instrumented _cov, runs the tests, then restores (drop synonym, rename _orig back).
+If anything between the rename and the restore aborted the batch (a connection-
+recovery, a hard error) the restore was skipped and the proc was left stranded as
+_orig + synonym; under some leftover combinations a subsequent run could even DROP
+the real body. (Surfaced today as "AssessCustomer disappeared" mid-sweep.)
+
+FIX (Install_UnitAutogen.sql, TestGen.RunCoverage):
+- BULLETPROOF SELF-HEAL, run FIRST (before the testability gate + instrumentation):
+  (a) drop a leftover synonym at the base name; (b) if base is missing and _orig
+  exists, rename _orig back to base; (c) if base is a live proc and a stale _orig
+  also exists, drop the redundant _orig (never the only copy); (d) if after all that
+  the base is still not a live proc, RAISERROR + RETURN instead of instrumenting a
+  missing object (which is what cascades into loss). Placing this ABOVE the
+  AssessTestability gate was essential - a stranded synonym was otherwise judged
+  NOT_TESTABLE and the proc returned un-healed.
+- GUARANTEED RESTORE: the rename->synonym->run sequence is wrapped in TRY/CATCH; the
+  restore below ALWAYS runs (and is idempotent - only renames _orig back when the
+  base name is free), so a soft error can never strand the proc. A hard connection
+  drop that bypasses CATCH is recovered by the self-heal on the NEXT run.
+- Removed the old unconditional "DROP PROCEDURE _orig" at the rename step (the self-
+  heal handles stale backups safely).
+
+VALIDATED on HighValueCustomer: (1) stranded synonym + body-in-_orig -> RunCoverage
+self-heals, runs 12/12, restores clean (base = real proc, _orig gone); (2) missing
+proc -> clean RAISERROR caught as GACD would, no cascade, neighbours untouched.
+
+PROCESS NOTE: today's repeated "proc vanished" reads were largely diagnostic races -
+MCP timeouts left coverage runs in flight and overlapping queries hit the ~1-2s
+rename window. Let runs quiesce; never launch a second coverage run while one may be
+running; deploy SQL with sqlcmd -I (QUOTED_IDENTIFIER ON).
+
+FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+CHANGES.md
