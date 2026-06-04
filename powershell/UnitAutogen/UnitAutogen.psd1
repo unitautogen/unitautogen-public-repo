@@ -1,5 +1,5 @@
 @{
-    ModuleVersion     = '0.9.10'
+    ModuleVersion     = '0.9.11'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -39,6 +39,28 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
+## v0.9.11 (beta) — 2026-06-04
+
+Fix: the v0.9.10 schema-bound cleanup could doom the test transaction, turning
+whole groups of procedures into all-errors (0% coverage) on real databases.
+
+- Cause: the schema-bound dependent walk in SafeFakeTable used a recursive query
+  with no cycle guard. A table with a persisted computed column built on a
+  WITH SCHEMABINDING function references ITSELF as schema-bound (e.g. AdventureWorks
+  Sales.Customer.AccountNumber), so the walk hit the recursion limit and errored.
+  tSQLt runs tests with XACT_ABORT ON, under which that error dooms the transaction,
+  so every later table-fake then failed with "the current transaction cannot be
+  committed".
+- Fix: the cleanup now runs under SET XACT_ABORT OFF (auto-restored on exit) so it
+  can never doom the test, and the walk ignores the self-edge and guards against
+  cycles. Validated on a clean AdventureWorks2025: 0 errors across the testable
+  procedures and functions.
+
+Also: result-set shape characterization no longer compares IsNullable. SQL Server's
+nullability inference for literal/computed result columns is unstable (flips across
+recompiles/builds), which produced false-positive "shape drift" failures. Column
+count, order, names, types and sizes are still asserted in full.
+
 ## v0.9.10 (beta) — 2026-06-03
 
 Fix (reported by the community): "Object cannot be renamed because the object

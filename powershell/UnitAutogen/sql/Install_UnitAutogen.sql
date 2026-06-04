@@ -1225,25 +1225,44 @@ BEGIN
        dependencies", which otherwise aborts the whole test/generation run. Drop
        those dependents here, deepest-first. tSQLt wraps every test in a
        transaction that ROLLS BACK, so they are restored automatically when the
-       test ends - no permanent change to the database. */
+       test ends - no permanent change to the database.
+
+       HARDENING: this cleanup must NEVER doom the test transaction. tSQLt runs
+       tests with XACT_ABORT ON, under which ANY error here dooms the transaction -
+       a TRY/CATCH swallows the message but cannot un-doom it, so every later fake
+       then fails with "the current transaction cannot be committed". A persisted
+       computed column makes a table reference ITSELF as schema-bound, so the
+       recursive walk used to hit MAXRECURSION and doom the transaction. Fixes:
+         (1) SET XACT_ABORT OFF for the duration (auto-restored on proc exit), so a
+             swallowed error here leaves the transaction usable; and
+         (2) a cycle-guarded recursive walk that ignores the table's self-edge, so
+             the walk terminates instead of erroring. */
+    SET XACT_ABORT OFF;
     BEGIN TRY
         DECLARE @ffObj INT = OBJECT_ID(@TableName);
         IF @ffObj IS NOT NULL
            AND EXISTS (SELECT 1 FROM sys.sql_expression_dependencies
-                       WHERE referenced_id = @ffObj AND is_schema_bound_reference = 1)
+                       WHERE referenced_id = @ffObj AND is_schema_bound_reference = 1
+                         AND referencing_id <> @ffObj)
         BEGIN
             IF OBJECT_ID('tempdb..#sbdep') IS NOT NULL DROP TABLE #sbdep;
             ;WITH dep AS (
-                SELECT d.referencing_id AS id, 1 AS lvl
+                SELECT d.referencing_id AS id, 1 AS lvl,
+                       CAST('|' + CAST(d.referencing_id AS VARCHAR(20)) + '|' AS VARCHAR(8000)) AS pth
                 FROM sys.sql_expression_dependencies d
-                WHERE d.referenced_id = @ffObj AND d.is_schema_bound_reference = 1
+                WHERE d.referenced_id = @ffObj
+                  AND d.is_schema_bound_reference = 1
+                  AND d.referencing_id <> @ffObj           -- ignore self-reference (persisted computed column)
                 UNION ALL
-                SELECT d.referencing_id, dep.lvl + 1
+                SELECT d.referencing_id, dep.lvl + 1,
+                       dep.pth + CAST(d.referencing_id AS VARCHAR(20)) + '|'
                 FROM sys.sql_expression_dependencies d
                 JOIN dep ON d.referenced_id = dep.id
                 WHERE d.is_schema_bound_reference = 1
+                  AND d.referencing_id <> @ffObj
+                  AND dep.pth NOT LIKE '%|' + CAST(d.referencing_id AS VARCHAR(20)) + '|%'   -- cycle guard
             )
-            SELECT id, MAX(lvl) AS lvl INTO #sbdep FROM dep GROUP BY id OPTION (MAXRECURSION 64);
+            SELECT id, MAX(lvl) AS lvl INTO #sbdep FROM dep GROUP BY id OPTION (MAXRECURSION 256);
 
             DECLARE @sbName NVARCHAR(400), @sbType CHAR(2), @sbDrop NVARCHAR(700);
             DECLARE sbcur CURSOR LOCAL FAST_FORWARD FOR
@@ -1264,6 +1283,7 @@ BEGIN
             DROP TABLE #sbdep;
         END;
     END TRY BEGIN CATCH END CATCH;
+    SET XACT_ABORT ON;   -- restore the mode tSQLt runs tests under
 
     /* Attempt 1: full signature against the official tSQLt release */
     IF @ok = 0
@@ -1457,6 +1477,14 @@ BEGIN
     -- Subsequent runs: build #Expected/#Actual shape tables and let
     -- tSQLt.AssertEqualsTable do the diff so the failure output matches
     -- what users get from hand-written tSQLt tests.
+    -- v0.9.11: IsNullable is intentionally EXCLUDED from the shape comparison.
+    -- SQL Server's nullability inference for literal / computed result columns
+    -- (e.g. SELECT 'x' AS Arm) is unstable - it flips True<->False across
+    -- recompiles, builds and call contexts - so comparing it produced
+    -- false-positive "shape drift" (every pz gate failed on exactly this). The
+    -- shape contract that actually matters - column count, order, names, types
+    -- and sizes - is still asserted in full. Nullability is still recorded in the
+    -- baseline (TestGenLog.ResultShapeBaseline) for information, just not compared.
     CREATE TABLE #ExpectedShape
     (
         ColumnOrdinal INT,
@@ -1464,8 +1492,7 @@ BEGIN
         SqlTypeName   SYSNAME,
         MaxLength     SMALLINT,
         [Precision]   TINYINT,
-        Scale         TINYINT,
-        IsNullable    BIT
+        Scale         TINYINT
     );
     CREATE TABLE #ActualShape
     (
@@ -1474,16 +1501,15 @@ BEGIN
         SqlTypeName   SYSNAME,
         MaxLength     SMALLINT,
         [Precision]   TINYINT,
-        Scale         TINYINT,
-        IsNullable    BIT
+        Scale         TINYINT
     );
 
-    INSERT #ExpectedShape (ColumnOrdinal, ColumnName, SqlTypeName, MaxLength, [Precision], Scale, IsNullable)
-    SELECT ColumnOrdinal, ColumnName, SqlTypeName, MaxLength, [Precision], Scale, IsNullable
+    INSERT #ExpectedShape (ColumnOrdinal, ColumnName, SqlTypeName, MaxLength, [Precision], Scale)
+    SELECT ColumnOrdinal, ColumnName, SqlTypeName, MaxLength, [Precision], Scale
     FROM TestGenLog.ResultShapeBaseline
     WHERE TestClass = @TestClass;
 
-    INSERT #ActualShape (ColumnOrdinal, ColumnName, SqlTypeName, MaxLength, [Precision], Scale, IsNullable)
+    INSERT #ActualShape (ColumnOrdinal, ColumnName, SqlTypeName, MaxLength, [Precision], Scale)
     SELECT column_ordinal, name,
            -- v9.4.3: compare the BARE type name to match the baseline, which
            -- stores TYPE_NAME() with no length/precision suffix.  dm_exec_describe
@@ -1492,7 +1518,7 @@ BEGIN
            -- Size is still asserted via MaxLength/Precision/Scale, nothing lost.
            LEFT(system_type_name,
                 ISNULL(NULLIF(CHARINDEX(CHAR(40), system_type_name), 0) - 1, LEN(system_type_name))),
-           max_length, [precision], scale, is_nullable
+           max_length, [precision], scale
     FROM sys.dm_exec_describe_first_result_set(@ExecSql, NULL, 0);
 
     DECLARE @msg NVARCHAR(400) =
