@@ -7203,3 +7203,24 @@ errors, full reason text intact. Lesson: any text put into a tSQLt SkipTest/
 annotation must double single quotes.
 
 FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+--------------------------------------------------------------------------------
+v0.9.13 RELEASE FIX - psd1 ReleaseNotes exceeded PSGallery's 10600-char limit
+--------------------------------------------------------------------------------
+The 0.9.13 publish workflow FAILED at Publish-Module with HTTP 400:
+"A package's ReleaseNotes property extracted from the PowerShell manifest may not be
+more than 10600 characters long." Cause: every release prepended a new version
+section to UnitAutogen.psd1 ReleaseNotes without ever trimming, so the cumulative
+notes (v0.9.0 -> v0.9.13, 10 sections) hit exactly the 10600 cap. The package itself
+was valid - only the notes field was too long.
+
+FIX: trimmed ReleaseNotes to the latest THREE versions in full (now ~3,200 chars);
+older history (v0.9.10 back to v0.9.0) replaced by a pointer to CHANGES.md and the
+GitHub Releases page. The tag had to be MOVED to the corrected commit to re-publish
+(git tag -d / push :refs/tags / re-tag / push) - the workflow checks out the tag.
+
+POLICY (to prevent recurrence): keep only the most recent ~3 version sections in
+the psd1 ReleaseNotes; the full, permanent changelog lives here in CHANGES.md and on
+GitHub Releases. PSGallery hard limit is 10600 chars on ReleaseNotes.
+
+FILES: powershell/UnitAutogen/UnitAutogen.psd1, CHANGES.md
