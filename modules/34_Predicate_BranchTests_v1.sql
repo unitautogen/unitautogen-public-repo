@@ -95,7 +95,7 @@ BEGIN
     WHILE @@FETCH_STATUS = 0
     BEGIN
         SET @fakes = N'';
-        SELECT @fakes = @fakes + N'    EXEC tSQLt.FakeTable @TableName = N'''
+        SELECT @fakes = @fakes + N'    EXEC TestGen.SafeFakeTable N'''
              + ISNULL(JSON_VALUE([value], '$.schema'), 'dbo') + N'.' + JSON_VALUE([value], '$.table')
              + N''';' + @crlf
         FROM OPENJSON(@TablesJson)

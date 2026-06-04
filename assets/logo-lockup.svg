@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 100" width="440" height="100" role="img" aria-label="UnitAutogen logo: a checkmark in a full coverage ring next to the UnitAutogen wordmark">
+  <g transform="translate(58,50) scale(0.55)">
+    <circle r="70" fill="none" stroke="#1a7f37" stroke-width="16"/>
+    <path d="M-27 3 L-7 26 L30 -22" fill="none" stroke="#1a7f37" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="112" y="66" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="44" font-weight="600"><tspan fill="#000000">Unit</tspan><tspan fill="#1a7f37">Autogen</tspan></text>
+</svg>

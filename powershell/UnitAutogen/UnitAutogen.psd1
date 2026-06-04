@@ -1,5 +1,5 @@
 @{
-    ModuleVersion     = '0.9.9'
+    ModuleVersion     = '0.9.10'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -39,6 +39,21 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
+## v0.9.10 (beta) — 2026-06-03
+
+Fix (reported by the community): "Object cannot be renamed because the object
+participates in enforced dependencies" (Msg 15336) aborted generation/testing.
+
+- Cause: tSQLt.FakeTable renames the table to isolate it, and SQL Server blocks the
+  rename when the table is referenced by a SCHEMA-BOUND object - an indexed view, a
+  WITH SCHEMABINDING view/function, or a schema-bound computed column. (Not plain
+  foreign keys - tSQLt handles those.)
+- Fix: TestGen.SafeFakeTable now drops those schema-bound dependents before faking;
+  tSQLt's per-test transaction rolls back and restores them automatically (no
+  permanent change). Predicate-branch tests now route through SafeFakeTable too.
+- Limitation: if the procedure itself uses a schema-bound object over a faked table,
+  that proc is still not auto-testable (clear-failure rather than a cryptic abort).
+
 ## v0.9.9 (beta) — 2026-06-03  (ships the "v0.13" in-database parser + fixes; first auto-published release)
 
 Fixes on top of the SSMS-native parser work below:

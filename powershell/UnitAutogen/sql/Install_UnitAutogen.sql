@@ -1219,6 +1219,52 @@ BEGIN
     DECLARE @lastErr NVARCHAR(2000) = N'';
     DECLARE @ok BIT = 0;
 
+    /* v0.13.x: a table referenced by a SCHEMA-BOUND object (indexed view, a
+       WITH SCHEMABINDING view/function, or a schema-bound computed column) cannot
+       be renamed by tSQLt.FakeTable -> Msg 15336 "participates in enforced
+       dependencies", which otherwise aborts the whole test/generation run. Drop
+       those dependents here, deepest-first. tSQLt wraps every test in a
+       transaction that ROLLS BACK, so they are restored automatically when the
+       test ends - no permanent change to the database. */
+    BEGIN TRY
+        DECLARE @ffObj INT = OBJECT_ID(@TableName);
+        IF @ffObj IS NOT NULL
+           AND EXISTS (SELECT 1 FROM sys.sql_expression_dependencies
+                       WHERE referenced_id = @ffObj AND is_schema_bound_reference = 1)
+        BEGIN
+            IF OBJECT_ID('tempdb..#sbdep') IS NOT NULL DROP TABLE #sbdep;
+            ;WITH dep AS (
+                SELECT d.referencing_id AS id, 1 AS lvl
+                FROM sys.sql_expression_dependencies d
+                WHERE d.referenced_id = @ffObj AND d.is_schema_bound_reference = 1
+                UNION ALL
+                SELECT d.referencing_id, dep.lvl + 1
+                FROM sys.sql_expression_dependencies d
+                JOIN dep ON d.referenced_id = dep.id
+                WHERE d.is_schema_bound_reference = 1
+            )
+            SELECT id, MAX(lvl) AS lvl INTO #sbdep FROM dep GROUP BY id OPTION (MAXRECURSION 64);
+
+            DECLARE @sbName NVARCHAR(400), @sbType CHAR(2), @sbDrop NVARCHAR(700);
+            DECLARE sbcur CURSOR LOCAL FAST_FORWARD FOR
+                SELECT QUOTENAME(s.name) + N'.' + QUOTENAME(o.name), o.type
+                FROM #sbdep x
+                JOIN sys.objects o ON o.object_id = x.id
+                JOIN sys.schemas s ON s.schema_id = o.schema_id
+                WHERE o.type IN ('V','FN','IF','TF','FS','FT')   -- schema-bound view / function
+                ORDER BY x.lvl DESC;                              -- deepest dependents first
+            OPEN sbcur; FETCH NEXT FROM sbcur INTO @sbName, @sbType;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                SET @sbDrop = CASE WHEN @sbType = 'V' THEN N'DROP VIEW ' ELSE N'DROP FUNCTION ' END + @sbName;
+                BEGIN TRY EXEC (@sbDrop); END TRY BEGIN CATCH END CATCH;
+                FETCH NEXT FROM sbcur INTO @sbName, @sbType;
+            END;
+            CLOSE sbcur; DEALLOCATE sbcur;
+            DROP TABLE #sbdep;
+        END;
+    END TRY BEGIN CATCH END CATCH;
+
     /* Attempt 1: full signature against the official tSQLt release */
     IF @ok = 0
     BEGIN
@@ -14958,7 +15004,7 @@ BEGIN
     WHILE @@FETCH_STATUS = 0
     BEGIN
         SET @fakes = N'';
-        SELECT @fakes = @fakes + N'    EXEC tSQLt.FakeTable @TableName = N'''
+        SELECT @fakes = @fakes + N'    EXEC TestGen.SafeFakeTable N'''
              + ISNULL(JSON_VALUE([value], '$.schema'), 'dbo') + N'.' + JSON_VALUE([value], '$.table')
              + N''';' + @crlf
         FROM OPENJSON(@TablesJson)

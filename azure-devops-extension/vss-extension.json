@@ -1,0 +1,50 @@
+{
+  "manifestVersion": 1,
+  "id": "unitautogen-coverage",
+  "name": "UnitAutogen - tSQLt Test Generation & Coverage",
+  "version": "0.9.9",
+  "publisher": "YOUR_PUBLISHER_ID",
+  "public": false,
+  "description": "Auto-generate tSQLt unit tests with real branch coverage for SQL Server stored procedures, right in your pipeline. Emits Cobertura XML, JUnit XML and an HTML report for the native Publish Code Coverage Results / Publish Test Results tasks.",
+  "categories": ["Azure Pipelines"],
+  "targets": [
+    { "id": "Microsoft.VisualStudio.Services" }
+  ],
+  "tags": [
+    "SQL Server", "tSQLt", "unit testing", "code coverage", "branch coverage",
+    "database DevOps", "CI/CD", "Cobertura", "JUnit", "database testing"
+  ],
+  "icons": {
+    "default": "images/icon.png"
+  },
+  "content": {
+    "details": { "path": "overview.md" }
+  },
+  "links": {
+    "home":       { "uri": "https://github.com/unitautogen/unitautogen-public-repo" },
+    "repository": { "uri": "https://github.com/unitautogen/unitautogen-public-repo" },
+    "issues":     { "uri": "https://github.com/unitautogen/unitautogen-public-repo/issues" }
+  },
+  "repository": {
+    "type": "git",
+    "uri": "https://github.com/unitautogen/unitautogen-public-repo"
+  },
+  "branding": {
+    "color": "#1a7f37",
+    "theme": "dark"
+  },
+  "files": [
+    { "path": "UnitAutogenCoverage" },
+    { "path": "images", "addressable": true }
+  ],
+  "contributions": [
+    {
+      "id": "unitautogen-coverage-task",
+      "type": "ms.vss-distributed-task.task",
+      "targets": ["ms.vss-distributed-task.tasks"],
+      "properties": {
+        "name": "UnitAutogenCoverage"
+      }
+    }
+  ]
+}

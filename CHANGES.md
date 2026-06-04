@@ -7009,3 +7009,40 @@ running; deploy SQL with sqlcmd -I (QUOTED_IDENTIFIER ON).
 
 FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
 CHANGES.md
+
+--------------------------------------------------------------------------------
+v0.13 FIX — schema-bound dependencies no longer block FakeTable   2026-06-03
+--------------------------------------------------------------------------------
+REPORTED (GitHub discussion): "Object cannot be renamed because the object
+participates in enforced dependencies" (Msg 15336) aborted generation/testing on a
+real database.
+
+ROOT CAUSE (reproduced + confirmed): tSQLt.FakeTable isolates a table by sp_rename;
+SQL Server raises 15336 when the table is referenced by a SCHEMA-BOUND object - an
+indexed view, a WITH SCHEMABINDING view/function, or a schema-bound/persisted
+computed column. NOT plain foreign keys (tested: tSQLt handles inbound FKs itself).
+A single such table made the raw CLR error abort the whole run.
+
+FIX (TestGen.SafeFakeTable, the central fake wrapper): before the FakeTable attempts,
+enumerate the table's schema-bound dependents via sys.sql_expression_dependencies
+(is_schema_bound_reference = 1), transitively (recursive CTE), and DROP them
+deepest-first (DROP VIEW / DROP FUNCTION). tSQLt wraps every test in a transaction
+that ROLLS BACK, so the dependents are restored automatically when the test ends -
+zero permanent change (verified: the schema-bound view was present again after the
+run). Also routed the predicate-branch tests (module 34 / GeneratePredicateBranchTests)
+through SafeFakeTable instead of calling tSQLt.FakeTable directly, so they get the
+same protection. The base generator's mock block already used SafeFakeTable.
+
+VALIDATED on HighValueCustomer: with a WITH SCHEMABINDING view over dbo.Orders (a
+table AssessCustomer fakes) present - the exact 15336 trigger - generate+cover now
+runs 12/12, 100% line + branch, 0 errors; the view is intact afterward.
+
+KNOWN LIMITATION (honest residue): if the procedure UNDER TEST itself uses a
+schema-bound object over a faked table (e.g. reads the indexed view, or calls a
+schema-bound function on the faked table), dropping the dependent will make the proc
+fail with a missing-object error rather than the cryptic rename error. A future
+refinement is to detect proc-usage and mark such procs NOT_TESTABLE with a clear
+reason. Nested schema-bound chains beyond MAXRECURSION 64 are also not unwound.
+
+FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+modules/34_Predicate_BranchTests_v1.sql, CHANGES.md

@@ -1,0 +1,97 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/azure-pipelines-task-lib/master/tasks.schema.json",
+  "id": "1699bdbe-b526-43c9-8812-f7b9cc96dd14",
+  "name": "UnitAutogenCoverage",
+  "friendlyName": "UnitAutogen - tSQLt test generation + coverage",
+  "description": "Generates tSQLt unit tests with real branch coverage for SQL Server stored procedures and emits Cobertura XML, JUnit XML, and an HTML report - ready for the native Publish Code Coverage Results / Publish Test Results tasks.",
+  "helpMarkDown": "[UnitAutogen docs](https://github.com/unitautogen/unitautogen-public-repo). Requires a Windows agent that can reach your SQL Server, with tSQLt installed in the target database.",
+  "category": "Test",
+  "author": "Munaf Ibrahim Khatri",
+  "version": { "Major": 0, "Minor": 9, "Patch": 9 },
+  "instanceNameFormat": "UnitAutogen coverage: $(database)",
+  "groups": [
+    { "name": "auth", "displayName": "Authentication", "isExpanded": false },
+    { "name": "advanced", "displayName": "Advanced", "isExpanded": false }
+  ],
+  "inputs": [
+    {
+      "name": "serverInstance",
+      "type": "string",
+      "label": "SQL Server instance",
+      "required": true,
+      "helpMarkDown": "e.g. 'sql01', 'sql01\\\\PROD', or 'sql01,1433'."
+    },
+    {
+      "name": "database",
+      "type": "string",
+      "label": "Database",
+      "required": true,
+      "helpMarkDown": "Target database. tSQLt must already be installed in it."
+    },
+    {
+      "name": "schemaFilter",
+      "type": "string",
+      "label": "Schema filter (optional)",
+      "required": false,
+      "helpMarkDown": "Restrict to one schema, e.g. 'dbo'. Leave blank for all user schemas."
+    },
+    {
+      "name": "installFramework",
+      "type": "boolean",
+      "label": "Install/upgrade the UnitAutogen framework first",
+      "defaultValue": "false",
+      "helpMarkDown": "Runs Install-UnitAutogenDatabase (framework + in-database parser) before the run. Needs sysadmin (CONTROL SERVER) once and 'clr enabled' = 1. Idempotent."
+    },
+    {
+      "name": "outputPath",
+      "type": "string",
+      "label": "Output path",
+      "defaultValue": "$(Build.ArtifactStagingDirectory)",
+      "helpMarkDown": "Where coverage.xml, test-results.xml and coverage-report.html are written."
+    },
+    {
+      "name": "sqlAuth",
+      "type": "boolean",
+      "label": "Use SQL Server authentication",
+      "defaultValue": "false",
+      "groupName": "auth",
+      "helpMarkDown": "Off = Windows auth (the agent identity). On = supply a SQL login below."
+    },
+    {
+      "name": "sqlUser",
+      "type": "string",
+      "label": "SQL login",
+      "required": false,
+      "groupName": "auth",
+      "visibleRule": "sqlAuth = true"
+    },
+    {
+      "name": "sqlPassword",
+      "type": "string",
+      "label": "SQL password (map a SECRET pipeline variable here)",
+      "required": false,
+      "groupName": "auth",
+      "visibleRule": "sqlAuth = true",
+      "helpMarkDown": "Pass a secret variable, e.g. $(SqlPassword). Never hard-code a password."
+    },
+    {
+      "name": "generationTimeout",
+      "type": "string",
+      "label": "Generation timeout (seconds)",
+      "defaultValue": "3600",
+      "groupName": "advanced"
+    },
+    {
+      "name": "failOnError",
+      "type": "boolean",
+      "label": "Fail the step if generation/coverage errors",
+      "defaultValue": "true",
+      "groupName": "advanced"
+    }
+  ],
+  "execution": {
+    "PowerShell3": {
+      "target": "run.ps1"
+    }
+  }
+}

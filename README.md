@@ -104,6 +104,25 @@ Ready-to-use pipeline files are in the [`ci/`](ci/) folder:
 [`ci/azure-pipelines.yml`](ci/azure-pipelines.yml) and
 [`ci/github-actions.yml`](ci/github-actions.yml).
 
+### Azure DevOps Pipelines task
+
+Prefer a first-class pipeline step over a script block? UnitAutogen ships an
+**Azure Pipelines task** — add a single `UnitAutogenCoverage@0` step that runs
+generation + coverage and emits Cobertura + JUnit + HTML for the native
+**Publish Code Coverage Results** / **Publish Test Results** tasks:
+
+```yaml
+- task: UnitAutogenCoverage@0
+  inputs:
+    serverInstance: 'sql01'
+    database: 'YourDatabase'
+    schemaFilter: 'dbo'
+```
+
+Source and the package/publish guide are in
+[`azure-devops-extension/`](azure-devops-extension/) (it publishes to the
+Visual Studio Marketplace — the Azure DevOps tab).
+
 Full usage guide: [`powershell/USAGE.md`](powershell/USAGE.md).
 
 ## Documentation
