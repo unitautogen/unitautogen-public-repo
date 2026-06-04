@@ -1,5 +1,5 @@
 @{
-    ModuleVersion     = '0.9.11'
+    ModuleVersion     = '0.9.12'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -39,6 +39,20 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
+## v0.9.12 (beta) — 2026-06-04
+
+Two fixes from broad-database validation on WideWorldImporters (both v0.9.11 fixes
+held there - 0 failures, no doomed transactions):
+
+- Result-row baseline now quotes JSON keys, so result columns with spaces or special
+  characters in their names (e.g. "Quantity On Hand") work. Previously an unquoted
+  OPENJSON path raised "JSON path is not properly formatted" (Msg 13607) and the test
+  errored. Common in real-world schemas; AdventureWorks' tight names never hit it.
+- Functions/procedures declared WITH EXECUTE AS OWNER (or CALLER/SELF/'user') now
+  build their coverage shadow correctly. The header splitter was matching the AS
+  inside "EXECUTE AS OWNER" and failing with "Incorrect syntax near 'OWNER'". A
+  self-contained EXECUTE AS OWNER function now reaches 100% line / 100% branch.
+
 ## v0.9.11 (beta) — 2026-06-04
 
 Fix: the v0.9.10 schema-bound cleanup could doom the test transaction, turning

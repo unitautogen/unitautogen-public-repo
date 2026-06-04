@@ -1699,9 +1699,14 @@ BEGIN
         @columnDdl    = @columnDdl    + N',' + QUOTENAME(ColumnName) + N' '
                                       + dbo.TestGen_RebuildTypeName(SqlTypeName, MaxLength, [Precision], Scale)
                                       + CASE WHEN IsNullable = 1 THEN N' NULL' ELSE N' NOT NULL' END,
+        -- v0.9.12: quote the JSON key. Column names with spaces or special
+        -- characters (e.g. WideWorldImporters' "Quantity On Hand") make an
+        -- unquoted OPENJSON path '$.Quantity On Hand' invalid (Msg 13607
+        -- "JSON path is not properly formatted"). A quoted key '$."Quantity On
+        -- Hand"' is valid; embedded double-quotes are escaped to \".
         @openJsonCols = @openJsonCols + N',' + QUOTENAME(ColumnName) + N' '
                                       + dbo.TestGen_RebuildTypeName(SqlTypeName, MaxLength, [Precision], Scale)
-                                      + N' ''$.' + ColumnName + N'''',
+                                      + N' ''$."' + REPLACE(ColumnName, N'"', N'\"') + N'"''',
         @insertCols   = @insertCols   + N',' + QUOTENAME(ColumnName)
     FROM TestGenLog.ResultShapeBaseline
     WHERE TestClass = @TestClass
@@ -11499,7 +11504,7 @@ CREATE FUNCTION TestGen.FindTopLevelAs
 RETURNS INT     -- position of the body-introducing AS (paren depth 0), else 0
 AS
 BEGIN
-    DECLARE @len INT = LEN(@Def), @i INT = 1, @paren INT = 0;
+    DECLARE @len INT = LEN(@Def), @i INT = 1, @paren INT = 0, @j INT = 0;
     DECLARE @inLine BIT=0,@inBlock BIT=0,@inStr BIT=0,@inBr BIT=0;
     DECLARE @ch NCHAR(1),@nx NCHAR(1),@pv NCHAR(1),@af NCHAR(1);
     WHILE @i <= @len
@@ -11521,7 +11526,20 @@ BEGIN
             SET @pv = CASE WHEN @i=1 THEN N' ' ELSE SUBSTRING(@Def,@i-1,1) END;
             SET @af = CASE WHEN @i+2<=@len THEN SUBSTRING(@Def,@i+2,1) ELSE N' ' END;
             IF PATINDEX(N'%[^A-Za-z0-9_@#]%',@pv)=1 AND PATINDEX(N'%[^A-Za-z0-9_@#]%',@af)=1
-                RETURN @i;
+            BEGIN
+                -- v0.9.12: skip the AS that belongs to a WITH EXECUTE AS
+                -- <OWNER|CALLER|SELF|'user'> clause - the body-introducing AS is the
+                -- one whose preceding word is NOT EXECUTE. Without this, a function/proc
+                -- declared WITH EXECUTE AS OWNER split at the wrong AS and the shadow
+                -- body began at 'OWNER' (Msg 102 "Incorrect syntax near 'OWNER'").
+                SET @j = @i - 1;
+                WHILE @j >= 1 AND SUBSTRING(@Def,@j,1) IN (N' ', NCHAR(9), NCHAR(10), NCHAR(13))
+                    SET @j -= 1;
+                IF NOT (@j >= 7
+                        AND UPPER(SUBSTRING(@Def,@j-6,7)) = N'EXECUTE'
+                        AND (@j-7 < 1 OR PATINDEX(N'%[^A-Za-z0-9_@#]%',SUBSTRING(@Def,@j-7,1))=1))
+                    RETURN @i;
+            END;
         END;
         SET @i+=1;
     END;

@@ -7120,3 +7120,40 @@ procedure pz.DynamicLocalGate" - an ORPHAN test class whose base proc does not e
 
 FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
 CHANGES.md
+
+--------------------------------------------------------------------------------
+v0.9.12 FIX - WideWorldImporters surfaced two real edge cases   2026-06-04
+--------------------------------------------------------------------------------
+Broad-DB validation on WideWorldImporters (gnarlier schema than AdventureWorks):
+both v0.9.11 fixes held (0 fails, no doom-cascade). Two genuine issues found + fixed.
+
+(1) ERROR on Integration.GetStockHoldingUpdates - "JSON path is not properly
+    formatted. Unexpected character 'O' is found at position 11" (Msg 13607).
+    ROOT CAUSE: TestGen.AssertResultRowsMatchBaseline built the OPENJSON WITH path
+    as '$.' + ColumnName, UNQUOTED. WWI uses friendly column names with spaces
+    ("Quantity On Hand", "Bin Location"), so '$.Quantity On Hand' is an invalid JSON
+    path. AdventureWorks' tight names never exposed it.
+    FIX: quote the key -> '$."' + REPLACE(ColumnName,'"','\"') + '"'. Count/order/
+    names/types/sizes still asserted. Validated: GetStockHoldingUpdates 1 err -> 0
+    (4 pass + 1 designed skip). Quoted keys are valid for plain names too (no
+    AdventureWorks regression).
+
+(2) GEN FAILURE on Website.CalculateCustomerPrice - "shadow compile failed:
+    Incorrect syntax near 'OWNER'". ROOT CAUSE: the function is declared
+    RETURNS decimal(18,2) WITH EXECUTE AS OWNER AS BEGIN... . TestGen.FindTopLevelAs
+    returned the FIRST top-level AS, which is the AS inside "EXECUTE AS OWNER", so
+    the shadow body wrongly began at 'OWNER'.
+    FIX: FindTopLevelAs now skips an AS whose preceding word is EXECUTE (the WITH
+    EXECUTE AS <owner|caller|self|'user'> clause); the body-introducing AS is the
+    next one. Validated: a self-contained WITH EXECUTE AS OWNER scalar function now
+    gens + instruments to 100% line / 100% branch. On WWI's CalculateCustomerPrice
+    the shadow now builds and the function is correctly reclassified to the HONEST
+    reason (depends on a system-versioned temporal table -> NOT_TESTABLE) instead of
+    a misleading syntax error.
+
+NOT fixed (deferred, by request): inline TVFs (RETURNS TABLE AS RETURN ...) still
+report a generic "deferred" rather than a clean NOT_TESTABLE reason (e.g.
+Application.DetermineCustomerAccess). Polish, not a correctness bug.
+
+FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+CHANGES.md
