@@ -29,6 +29,22 @@ The SQL Server testing ecosystem already has unit-testing frameworks (tSQLt, Red
 
 ![Branch coverage: 50% with line-only tools versus 94.4% with UnitAutogen on the same tests](assets/branch-before-after.png)
 
+## How it works: reverse predicate seeding
+
+Mocking a table is the easy half — and on its own it isn't enough. `tSQLt.FakeTable` hands you an **empty** table, which only ever exercises the "no rows" arm of a branch. To reach the *other* arm, someone has to insert rows that actually satisfy the procedure's conditions. Every other tool leaves that to you.
+
+UnitAutogen does it automatically. It parses each branch predicate — `WHERE`, `IF` / `CASE`, `JOIN` / `EXISTS` / `NOT EXISTS`, aggregate gates (`COUNT` / `SUM` / `MIN` / `MAX`), `OR` / DNF compositions, `NULL` checks, parameter comparisons — and works **backwards** from it to synthesize the exact seed rows that drive that branch to a chosen direction, both the TRUE and the FALSE side.
+
+```sql
+-- a gate inside your procedure:
+IF (SELECT COUNT(*) FROM Sales.Orders WHERE CustomerID = @CustomerID) > 5
+    ...
+```
+
+Faking `Sales.Orders` gives you an empty table, so you only ever hit the `<= 5` arm (~50% branch coverage). UnitAutogen reads the gate and manufactures two seeds — one with 6 matching orders to drive the `> 5` arm, one with fewer to drive the `<= 5` arm — so **both** branches run. Every seed carries a **strong assertion** that it actually drove the predicate the intended way, so a wrong seed fails loudly instead of ghost-passing.
+
+That reverse step — deriving satisfying data from arbitrary T-SQL (joins, aggregates, DNF, `NULL` semantics, local-variable data-flow) — is the hard part, and it's what turns "we faked the table" into "we exercised the branch." When a direction genuinely can't be satisfied (a contradiction, an unreachable arm), it's reported as `NOT_TESTABLE` with the reason — never faked into a pass.
+
 ## Requirements
 
 - SQL Server 2017 (MSSQL14) or later
