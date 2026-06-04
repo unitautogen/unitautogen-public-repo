@@ -1,5 +1,5 @@
 ﻿@{
-    ModuleVersion     = '0.9.13'
+    ModuleVersion     = '0.9.14'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -39,7 +39,7 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
-## v0.9.13 (beta) — 2026-06-04
+## v0.9.14 (beta) — 2026-06-04
 
 Reporting-quality refinements (no coverage-number change - all are genuinely
 not-auto-coverable cases, now reported honestly):

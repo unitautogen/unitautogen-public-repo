@@ -7224,3 +7224,14 @@ the psd1 ReleaseNotes; the full, permanent changelog lives here in CHANGES.md an
 GitHub Releases. PSGallery hard limit is 10600 chars on ReleaseNotes.
 
 FILES: powershell/UnitAutogen/UnitAutogen.psd1, CHANGES.md
+
+--------------------------------------------------------------------------------
+v0.9.14 - clean re-cut of the unpublished v0.9.13   2026-06-04
+--------------------------------------------------------------------------------
+v0.9.13 never reached PSGallery (its publish failed on the ReleaseNotes 10600-char
+limit; fixed above). Rather than move the tag, re-cut the identical content as
+v0.9.14 with a fresh tag. v0.9.14 == intended v0.9.13: JSON-path quoting, EXECUTE AS
+shadow split, CATCH/ROLLBACK + inline-TVF honest reasons, SkipTest apostrophe-escape,
+plus the trimmed psd1 ReleaseNotes. No code difference from the validated build.
+
+FILES: powershell/UnitAutogen/UnitAutogen.psd1, VERSION, CHANGES.md
