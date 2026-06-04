@@ -10,7 +10,7 @@ It is built on top of the open-source [tSQLt](https://tsqlt.org) framework. The 
 
 ---
 
-**Status: Beta** — see [Releases](https://github.com/unitautogen/unitautogen-public-repo/releases) for the current version, or install the latest from the [PowerShell Gallery](https://www.powershellgallery.com/packages/UnitAutogen).
+**Website:** [unitautogen.com](https://unitautogen.com) · **Status: Beta** — see [Releases](https://github.com/unitautogen/unitautogen-public-repo/releases) for the current version, or install the latest from the [PowerShell Gallery](https://www.powershellgallery.com/packages/UnitAutogen).
 Validated end-to-end against AdventureWorks, Northwind, and WideWorldImporters. Expect rough edges on production schemas it hasn't seen. See [docs/what-works.md](docs/what-works.md) for the honest scope.
 
 ---
