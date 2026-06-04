@@ -1,4 +1,4 @@
-# Coverage Patch — Files Modified vs v9.1 FINAL_40
+﻿# Coverage Patch â€” Files Modified vs v9.1 FINAL_40
 
 Base file: `Install_All_Combined_v9_1_FINAL_40.sql`
 Target final file: `Install_All_Combined_v9_2.sql` (will be assembled at the end)
@@ -7,36 +7,36 @@ Target final file: `Install_All_Combined_v9_2.sql` (will be assembled at the end
 
 | Section in base file (approx line range) | Module name in base | Replaced by | Status |
 |---|---|---|---|
-| 4682–4929 | `20_Coverage_Instrumenter.sql` (v3) | `20_Coverage_Instrumenter_v4_1_final.sql` | drafted, awaiting diag confirmation |
-| 5317–end of GetCoverageReport | inline `GetCoverageReport` (v1) | `22_Coverage_Reporter_v2.sql` | drafted |
-| RunCoverage (5006–5267) | inline | unchanged | — |
-| RecordCoverageHit stub (4984–5001) | inline | unchanged | — |
-| BootstrapCoverage / PatchTestsForCoverage (4929–4982) | `21_Coverage_TestPatcher.sql` | unchanged | — |
+| 4682â€“4929 | `20_Coverage_Instrumenter.sql` (v3) | `20_Coverage_Instrumenter_v4_1_final.sql` | drafted, awaiting diag confirmation |
+| 5317â€“end of GetCoverageReport | inline `GetCoverageReport` (v1) | `22_Coverage_Reporter_v2.sql` | drafted |
+| RunCoverage (5006â€“5267) | inline | unchanged | â€” |
+| RecordCoverageHit stub (4984â€“5001) | inline | unchanged | â€” |
+| BootstrapCoverage / PatchTestsForCoverage (4929â€“4982) | `21_Coverage_TestPatcher.sql` | unchanged | â€” |
 
 ## Pending issues to resolve before assembly
 
 1. Instrumenter still produces 2 IsExec / 1 injection on AdventureWorks2025
-   → Diag_Splitter.sql sent to user; awaiting output.
+   â†’ Diag_Splitter.sql sent to user; awaiting output.
 2. Other unrelated issues seen but NOT addressed yet:
    - `TestGen.CaptureResultShape` insert: NULL into `SqlTypeName` (NOT NULL violation).
-   - `_cov` not found by tSQLt synonym path — likely downstream of (1); recheck after (1) is fixed.
+   - `_cov` not found by tSQLt synonym path â€” likely downstream of (1); recheck after (1) is fixed.
 
 ## Files staged for delivery
 
-- `20_Coverage_Instrumenter_v4_1_final.sql` — DROP+CREATE for TestGen.InstrumentProcedure
-- `22_Coverage_Reporter_v2.sql`            — DROP+CREATE for TestGen.GetCoverageReport
-- `Diag_Splitter.sql`                       — diagnostic, not for install
-- `Verify_Coverage_v4_diag.sql`             — diagnostic, not for install
+- `20_Coverage_Instrumenter_v4_1_final.sql` â€” DROP+CREATE for TestGen.InstrumentProcedure
+- `22_Coverage_Reporter_v2.sql`            â€” DROP+CREATE for TestGen.GetCoverageReport
+- `Diag_Splitter.sql`                       â€” diagnostic, not for install
+- `Verify_Coverage_v4_diag.sql`             â€” diagnostic, not for install
 
 ## Installation instructions (to embed in final script)
 
 These will be reconstructed from earlier chat:
   1. Run base install once.
-  2. Apply coverage patch (v4.1 + reporter v2) — single script.
+  2. Apply coverage patch (v4.1 + reporter v2) â€” single script.
   3. Recreate target stored procedures.
   4. Bless baseline.
-  5. Generate tests: `EXEC TestGen.GenerateTestsForProcedure …`
-  6. Run coverage: `EXEC TestGen.RunCoverage …`
+  5. Generate tests: `EXEC TestGen.GenerateTestsForProcedure â€¦`
+  6. Run coverage: `EXEC TestGen.RunCoverage â€¦`
 
 ## 2026-05-21 update
 
@@ -74,9 +74,9 @@ Diag_Walker.sql was created but is NO LONGER NEEDED for this run.
 
 ## Files currently staged for delivery
 
-- `20_Coverage_Instrumenter_v4_2.sql`  — v4 + the loop-DECLARE fix
-- `22_Coverage_Reporter_v2.sql`         — unchanged from earlier draft
-- `Verify_Coverage_v4_2.sql`            — uses PRINT for all output so it shows in Messages tab
+- `20_Coverage_Instrumenter_v4_2.sql`  â€” v4 + the loop-DECLARE fix
+- `22_Coverage_Reporter_v2.sql`         â€” unchanged from earlier draft
+- `Verify_Coverage_v4_2.sql`            â€” uses PRINT for all output so it shows in Messages tab
 
 ## 2026-05-21 second iteration
 
@@ -130,16 +130,16 @@ Verify_Coverage_v4_3.sql: identical to v4_2, just renamed references.
 
 ## Files staged for delivery (current)
 
-- `20_Coverage_Instrumenter_v4_3.sql`  — patched (DATALENGTH/2 fix)
-- `22_Coverage_Reporter_v2.sql`         — unchanged
-- `Verify_Coverage_v4_3.sql`            — unchanged from v4_2 except names
+- `20_Coverage_Instrumenter_v4_3.sql`  â€” patched (DATALENGTH/2 fix)
+- `22_Coverage_Reporter_v2.sql`         â€” unchanged
+- `Verify_Coverage_v4_3.sql`            â€” unchanged from v4_2 except names
 
 ## 2026-05-21 fourth iteration
 
 User confirmed v4.3 walker now gives:
-   IsExec lines: 28  ✓
-   IsBranch lines: 15  ✓
-   Injections: 28  ✓
+   IsExec lines: 28  âœ“
+   IsBranch lines: 15  âœ“
+   Injections: 28  âœ“
 
 Registry dump shows all the right statement-start lines.  The classification
 logic is complete.
@@ -164,18 +164,18 @@ splitter sees 155 = 7 header + 148 body).
 
 ## Files staged for delivery (current)
 
-- `20_Coverage_Instrumenter_v4_4.sql`  — patched (header-line exclusion + TRY/CATCH)
-- `22_Coverage_Reporter_v2.sql`         — unchanged
-- `Verify_Coverage_v4_4.sql`            — unchanged from v4_3 except names/expected count
+- `20_Coverage_Instrumenter_v4_4.sql`  â€” patched (header-line exclusion + TRY/CATCH)
+- `22_Coverage_Reporter_v2.sql`         â€” unchanged
+- `Verify_Coverage_v4_4.sql`            â€” unchanged from v4_3 except names/expected count
 
 ## 2026-05-21 fifth iteration - INSTRUMENTER COMPLETE
 
 Verification PASSED:
-   Total lines registered : 148  ✓
-   IsExec lines           : 28   ✓
-   IsBranch lines         : 15   ✓
-   Injections present     : 28   ✓
-   Injections missing     : 0    ✓
+   Total lines registered : 148  âœ“
+   IsExec lines           : 28   âœ“
+   IsBranch lines         : 15   âœ“
+   Injections present     : 28   âœ“
+   Injections missing     : 0    âœ“
    PASS - registry and instrumented body agree.
 
 Next: run TestGen.RunCoverage to verify the FULL coverage pipeline:
@@ -279,9 +279,9 @@ The remaining 10 uncovered lines = TestGen issue (#2 from the plan).
 
 ### Files staged for delivery (current)
 
-- `20_Coverage_Instrumenter_v5.sql`     — control-transfer fix
-- `22_Coverage_Reporter_v2.sql`          — unchanged
-- `Verify_Coverage_v5.sql`               — unchanged from v4_4 except names
+- `20_Coverage_Instrumenter_v5.sql`     â€” control-transfer fix
+- `22_Coverage_Reporter_v2.sql`          â€” unchanged
+- `Verify_Coverage_v5.sql`               â€” unchanged from v4_4 except names
 
 ## 2026-05-21 eighth iteration - v5 verified, attacking TestGen issue
 
@@ -360,10 +360,10 @@ assuming all other branches were already exercised.
 
 ### Files staged for delivery
 
-- `17_Branch_Path_Analyzer_v3_1.sql`  — NEW (the AND-predicate fix)
-- `20_Coverage_Instrumenter_v5.sql`    — control-transfer fix
-- `22_Coverage_Reporter_v2.sql`         — branch-cov inference rule
-- `Verify_Coverage_v5.sql`              — diagnostic
+- `17_Branch_Path_Analyzer_v3_1.sql`  â€” NEW (the AND-predicate fix)
+- `20_Coverage_Instrumenter_v5.sql`    â€” control-transfer fix
+- `22_Coverage_Reporter_v2.sql`         â€” branch-cov inference rule
+- `Verify_Coverage_v5.sql`              â€” diagnostic
 
 ### Bug #2 (weak assertion) NOT fixed yet
 
@@ -393,7 +393,7 @@ Sent Diag_PremiumState.sql to check both:
 ## 2026-05-21 twelfth iteration
 
 Diag_PremiumState confirms:
-  - Analyzer IS v3.1 (one PathID for both Premium conditions). ✓
+  - Analyzer IS v3.1 (one PathID for both Premium conditions). âœ“
   - Test source has NOT been regenerated - still single-column seed.
 
 Sent Regen_and_RunCoverage.sql which drops the test class, regenerates
@@ -425,12 +425,12 @@ so picking the first is sufficient to make the predicate TRUE.
 
 ### Files staged for delivery (current)
 
-- `04_Test_Generator_v2.sql`           — IN-list / OR-on-same-column dedupe
-- `17_Branch_Path_Analyzer_v3_1.sql`   — one-PathID-per-EXISTS fix
-- `20_Coverage_Instrumenter_v5.sql`    — control-transfer fix
-- `22_Coverage_Reporter_v2.sql`         — branch-coverage inference
-- `Regen_and_RunCoverage.sql`           — convenience driver
-- `Verify_Coverage_v5.sql`              — diagnostic
+- `04_Test_Generator_v2.sql`           â€” IN-list / OR-on-same-column dedupe
+- `17_Branch_Path_Analyzer_v3_1.sql`   â€” one-PathID-per-EXISTS fix
+- `20_Coverage_Instrumenter_v5.sql`    â€” control-transfer fix
+- `22_Coverage_Reporter_v2.sql`         â€” branch-coverage inference
+- `Regen_and_RunCoverage.sql`           â€” convenience driver
+- `Verify_Coverage_v5.sql`              â€” diagnostic
 
 ## 2026-05-21 fourteenth iteration - 71% reached, three quality bugs left
 
@@ -514,12 +514,12 @@ Total expected: +8 lines, taking us from 20/28 (71%) to 28/28 (100%).
 
 ### Files staged for delivery (current)
 
-- `04_Test_Generator_v3.sql`           — EXISTS_FALSE delete + IN-list dedupe
-- `17_Branch_Path_Analyzer_v3_2.sql`   — LIKE handling + alias map + one-PathID-per-block
-- `20_Coverage_Instrumenter_v5.sql`    — control-transfer fix
-- `22_Coverage_Reporter_v2.sql`         — branch-coverage inference
-- `Regen_and_RunCoverage.sql`           — driver
-- `Verify_Coverage_v5.sql`              — diagnostic
+- `04_Test_Generator_v3.sql`           â€” EXISTS_FALSE delete + IN-list dedupe
+- `17_Branch_Path_Analyzer_v3_2.sql`   â€” LIKE handling + alias map + one-PathID-per-block
+- `20_Coverage_Instrumenter_v5.sql`    â€” control-transfer fix
+- `22_Coverage_Reporter_v2.sql`         â€” branch-coverage inference
+- `Regen_and_RunCoverage.sql`           â€” driver
+- `Verify_Coverage_v5.sql`              â€” diagnostic
 
 ## 2026-05-21 sixteenth iteration - 78.6%/66.7%, three branches still missed
 
@@ -546,19 +546,19 @@ whether the generator is emitting the seed correctly.
 
 ## 2026-05-22 seventeenth iteration - three more fixes for 100%
 
-(A) Standard ELSE (38/39) — Analyzer: EXISTS_FALSE.TableName must point at
+(A) Standard ELSE (38/39) â€” Analyzer: EXISTS_FALSE.TableName must point at
     the EXISTS subquery's PRIMARY table (so generator DELETEs the right
     table).  Was using @ElseTable (the ELSE block's INSERT target).  Fix
     in analyzer.  Generator now also keeps a separate @AssertReadFullName
     for the post-EXEC row-growth assertion (still uses the ELSE target).
 
-(B) Search EXISTS (79/80) — Value helper: GetSampleValueLiteral returned
+(B) Search EXISTS (79/80) â€” Value helper: GetSampleValueLiteral returned
     fixed 'SampleText' for string types regardless of @MaxLength.  For
     @Region NCHAR(3), the EXEC arg was 'SampleText' but the seed had to
     truncate to 'Sam'.  Predicate compared 'Sam' = 'SampleText' = false.
     Fix in 03_Value_Helpers_v2.sql: clamp Variant 0 to @MaxLength.
 
-(C) Express High-US (118/119) — Generator: when the branch param is a
+(C) Express High-US (118/119) â€” Generator: when the branch param is a
     CASE-derived LOCAL (e.g. @Priority = CASE @Status WHEN 3 THEN 'High'),
     the EXEC arglist must set the source param to the matching WHEN value.
     Added #CaseLocalAssigns (LocalVar, SourceParam, WhenValue, ResultValue),
@@ -567,22 +567,22 @@ whether the generator is emitting the seed correctly.
 
 ### Files staged for delivery (current)
 
-- `03_Value_Helpers_v2.sql`             — string sample clamped to MaxLength
-- `04_Test_Generator_v3.sql`            — CaseLocalAssigns + AssertReadFullName
-- `17_Branch_Path_Analyzer_v3_2.sql`    — EXISTS_FALSE.TableName = PrimaryTbl
-- `20_Coverage_Instrumenter_v5.sql`     — unchanged
-- `22_Coverage_Reporter_v2.sql`         — unchanged
-- `Regen_and_RunCoverage.sql`           — unchanged
-- `Verify_Coverage_v5.sql`              — unchanged
+- `03_Value_Helpers_v2.sql`             â€” string sample clamped to MaxLength
+- `04_Test_Generator_v3.sql`            â€” CaseLocalAssigns + AssertReadFullName
+- `17_Branch_Path_Analyzer_v3_2.sql`    â€” EXISTS_FALSE.TableName = PrimaryTbl
+- `20_Coverage_Instrumenter_v5.sql`     â€” unchanged
+- `22_Coverage_Reporter_v2.sql`         â€” unchanged
+- `Regen_and_RunCoverage.sql`           â€” unchanged
+- `Verify_Coverage_v5.sql`              â€” unchanged
 
 ## 2026-05-22 eighteenth iteration
 
 After third triple-fix attempt:
    Same coverage 22/28 line, 10/15 branch BUT:
-   - Standard ELSE (38, 39) is now COVERED ✓ (fix A worked)
-   - Express ELSE (141, 142) REGRESSED (was covered, now not) ✗
-   - Search EXISTS (79, 80) still uncovered ✗
-   - High-US (118, 119) still uncovered ✗
+   - Standard ELSE (38, 39) is now COVERED âœ“ (fix A worked)
+   - Express ELSE (141, 142) REGRESSED (was covered, now not) âœ—
+   - Search EXISTS (79, 80) still uncovered âœ—
+   - High-US (118, 119) still uncovered âœ—
 
 Suspicious - my fix shouldn't have regressed Express ELSE because the
 DELETE FROM SalesOrderHeader is exactly what the old code did too.
@@ -618,7 +618,7 @@ Sent Diag_Express_State.sql to see analyzer + both test sources.
 
 ## 2026-05-22 twentieth iteration - root-causing the three remaining gaps
 
-### Express ELSE — analyzer ELSE-detection bug
+### Express ELSE â€” analyzer ELSE-detection bug
 The analyzer used CHARINDEX('ELSE', @AfterSubq) which returns the first
 ELSE keyword anywhere - including ELSE keywords INSIDE the THEN block
 (such as the inner High-priority ELSE).  For Express's outer EXISTS,
@@ -629,16 +629,16 @@ both EXISTS_FALSE on Customer; PathIDs 2 and 4 both inner EXISTS_TRUE).
 Fix: walk after-subquery chars, track BEGIN/END depth, find the ELSE at
 depth 0 after the THEN block's closing END.
 
-### Search EXISTS — value helper file wasn't installed (user)
+### Search EXISTS â€” value helper file wasn't installed (user)
 Test's EXEC arg is still 'SampleText' (full 10-char string).  My
 03_Value_Helpers_v2.sql fix that clamps to MaxLength didn't take effect,
 so 'SampleText' goes through to NCHAR(3) which truncates to 'Sam' in
 seed but EXEC has 'SampleText'.  Need user to install 03_Value_Helpers_v2.sql.
 
-### High EXISTS — JOIN seed mismatch
+### High EXISTS â€” JOIN seed mismatch
 The seed inserts NEW rows into Customer and SalesTerritory but they
 don't share a TerritoryID, so the JOIN c.TerritoryID = st.TerritoryID
-fails (NULL ≠ NULL).  The FK seed has linked row #1 in each table via
+fails (NULL â‰  NULL).  The FK seed has linked row #1 in each table via
 TerritoryID=1; we need to update those linked rows to match the
 predicate.
 
@@ -655,13 +655,13 @@ too.  No downside.
 
 ### Files staged for delivery
 
-- `03_Value_Helpers_v2.sql`            — string sample clamped to MaxLength
-- `04_Test_Generator_v3.sql`           — INSERT + UPDATE EXISTS_TRUE seed
-- `17_Branch_Path_Analyzer_v3_2.sql`   — depth-tracking outer-ELSE finder
-- `20_Coverage_Instrumenter_v5.sql`    — unchanged
-- `22_Coverage_Reporter_v2.sql`        — unchanged
-- `Regen_and_RunCoverage.sql`          — unchanged
-- `Verify_Coverage_v5.sql`             — unchanged
+- `03_Value_Helpers_v2.sql`            â€” string sample clamped to MaxLength
+- `04_Test_Generator_v3.sql`           â€” INSERT + UPDATE EXISTS_TRUE seed
+- `17_Branch_Path_Analyzer_v3_2.sql`   â€” depth-tracking outer-ELSE finder
+- `20_Coverage_Instrumenter_v5.sql`    â€” unchanged
+- `22_Coverage_Reporter_v2.sql`        â€” unchanged
+- `Regen_and_RunCoverage.sql`          â€” unchanged
+- `Verify_Coverage_v5.sql`             â€” unchanged
 
 ## 2026-05-22 twenty-first iteration - UPDATE causes identity errors
 
@@ -689,13 +689,13 @@ UPDATE on SalesTerritory's CountryRegionCode is safe and works.
 
 ### Files staged
 
-- `03_Value_Helpers_v2.sql`           — string sample clamped to MaxLength
-- `04_Test_Generator_v3.sql`          — TRY/CATCH UPDATE, skip identity+PK
-- `17_Branch_Path_Analyzer_v3_2.sql`  — depth-tracking outer-ELSE finder
-- `20_Coverage_Instrumenter_v5.sql`   — unchanged
-- `22_Coverage_Reporter_v2.sql`       — unchanged
-- `Regen_and_RunCoverage.sql`         — unchanged
-- `Verify_Coverage_v5.sql`            — unchanged
+- `03_Value_Helpers_v2.sql`           â€” string sample clamped to MaxLength
+- `04_Test_Generator_v3.sql`          â€” TRY/CATCH UPDATE, skip identity+PK
+- `17_Branch_Path_Analyzer_v3_2.sql`  â€” depth-tracking outer-ELSE finder
+- `20_Coverage_Instrumenter_v5.sql`   â€” unchanged
+- `22_Coverage_Reporter_v2.sql`       â€” unchanged
+- `Regen_and_RunCoverage.sql`         â€” unchanged
+- `Verify_Coverage_v5.sql`            â€” unchanged
 
 ## 2026-05-22 twenty-second iteration - 24/28 (85.7%) reached
 
@@ -758,7 +758,7 @@ doesn't regress anything.
 
 ### Files staged
 
-- `03_Value_Helpers_v2.sql`   — default now 'Sam' (3 chars, fits anywhere ≥3)
+- `03_Value_Helpers_v2.sql`   â€” default now 'Sam' (3 chars, fits anywhere â‰¥3)
 - (all others unchanged from prev iteration)
 
 ## 2026-05-22 final - 100% COVERAGE ACHIEVED
@@ -782,55 +782,55 @@ not a coverage issue).
    INSERT+UPDATE seed (TRY/CATCH on UPDATE), skip identity/PK/computed/rowversion
    from SET clause, restrict EXISTS_FALSE pathidcur to outermost depth
 8. Value helpers v2 (final): default to short 'Sam' (3 chars) so EXEC arg
-   fits in any column ≥3 chars; matches seed value -> predicate matches
+   fits in any column â‰¥3 chars; matches seed value -> predicate matches
 
 ### Final deliverables
 
-- Install_All_Combined_v9_2_FINAL.sql  — single installer (252KB base + ~55KB updates)
-- README_v9_2.md                        — usage guide
+- Install_All_Combined_v9_2_FINAL.sql  â€” single installer (252KB base + ~55KB updates)
+- README_v9_2.md                        â€” usage guide
 - Plus all 5 modular files (for those who want to install piecemeal)
 
-## 2026-05-22 — NEW PROC: uspGetBillOfMaterials reports 0% coverage
+## 2026-05-22 â€” NEW PROC: uspGetBillOfMaterials reports 0% coverage
 
 User ran `TestGen.RunCoverage` on `dbo.uspGetBillOfMaterials` (AdventureWorks2025).
 Result: 5/7 functional tests pass; 2 NULL-rejection tests fail (same proc-design
-gap already known for uspV9ValidationTest — the proc doesn't validate NULL
+gap already known for uspV9ValidationTest â€” the proc doesn't validate NULL
 inputs). But LINE COVERAGE = 0/23, BRANCH 0/0, "XEvent rows captured: 0",
 "No RecordCoverageHit statements found", "Coverage hits recorded: 0".
 
 Root cause (from static read of Instrumenter v5 + RunCoverage, not yet
 confirmed empirically):
-  - uspGetBillOfMaterials' executable body is a SINGLE statement — a recursive
+  - uspGetBillOfMaterials' executable body is a SINGLE statement â€” a recursive
     CTE: WITH BOM_cte AS (SELECT ... UNION ALL SELECT ...) SELECT ...
     OPTION (MAXRECURSION 25).
   - The walker injects EXEC TestGen.RecordCoverageHit only at a ';'-terminated
-    statement boundary at paren depth 0. This proc has no internal ';' — the
+    statement boundary at paren depth 0. This proc has no internal ';' â€” the
     only semicolons are SET NOCOUNT ON; (classified as noise) and END;.
   - A CTE + its consuming SELECT is syntactically indivisible: there is NO
     legal point to inject an EXEC between WITH...AS(...) and the SELECT, between
     the UNION ALL legs, or inside. Line-level instrumentation cannot apply to a
     single set-based statement.
-  - Net: _cov ends up with 0 (or 1) hit recorders → XEvent capture finds
-    nothing matching '%RecordCoverageHit%' → 0% coverage.
+  - Net: _cov ends up with 0 (or 1) hit recorders â†’ XEvent capture finds
+    nothing matching '%RecordCoverageHit%' â†’ 0% coverage.
   - Contributing factor: RunCoverage only re-instruments when _cov is missing
     (IF OBJECT_ID(@CovFull) IS NULL), so a stale _cov / CoverageLines from an
     earlier run may also be in play.
 
 The framework was tuned end-to-end against ONE procedure, dbo.uspV9ValidationTest
-(a procedural IF/CASE/SET/INSERT/UPDATE/RETURN body — ideal for line
+(a procedural IF/CASE/SET/INSERT/UPDATE/RETURN body â€” ideal for line
 instrumentation). uspGetBillOfMaterials is the opposite shape (one set-based
 recursive query) and is the framework's worst case.
 
 Diagnostic returned (2026-05-22):
-  - _cov injection count = 0  → CONFIRMED: no hit recorders, hence 0% coverage.
+  - _cov injection count = 0  â†’ CONFIRMED: no hit recorders, hence 0% coverage.
   - CoverageLines = 23 IsExec + 15 non-exec rows.
   - Installed TestGen.InstrumentProcedure = v5 (current).
-  - dbo.uspGetBillOfMaterials_cov create_date = 2026-05-20 20:01 — TWO DAYS
+  - dbo.uspGetBillOfMaterials_cov create_date = 2026-05-20 20:01 â€” TWO DAYS
     before the 2026-05-22 coverage run.
 
-Key finding — STALE _cov: RunCoverage only re-instruments when _cov is
+Key finding â€” STALE _cov: RunCoverage only re-instruments when _cov is
 MISSING (IF OBJECT_ID(@CovFull) IS NULL). The 2026-05-22 run reused the
-2026-05-20 _cov (built by a pre-v5 instrumenter — explains the 23 IsExec
+2026-05-20 _cov (built by a pre-v5 instrumenter â€” explains the 23 IsExec
 rows, which the v5 walker would NOT produce for a single-statement CTE).
 So the "0/23" report reflects stale instrumentation, not current v5 logic.
 
@@ -839,7 +839,7 @@ Two distinct defects:
       the instrumenter or the source proc, not only when _cov is absent.
   (2) CTE limitation: even fresh v5 cannot inject inside a recursive CTE.
       Best case v5 collapses the proc to ONE coverage unit + one recorder
-      after END; (meaningful 1/1 = statement coverage) — but only if the
+      after END; (meaningful 1/1 = statement coverage) â€” but only if the
       proc body ends in 'END;'. If it ends in 'END' (no semicolon) v5 still
       injects 0.
 
@@ -847,22 +847,22 @@ Next: user to DROP dbo.uspGetBillOfMaterials_cov and re-run RunCoverage to
 see what fresh v5 instrumentation actually produces. No framework files
 changed this iteration.
 
-## 2026-05-22 — RESOLVED: stale _cov was the only defect; RunCoverage patched
+## 2026-05-22 â€” RESOLVED: stale _cov was the only defect; RunCoverage patched
 
 Confirmed via fresh re-instrumentation:
   - Installed TestGen.InstrumentProcedure = v5 (current).
-  - dbo.uspGetBillOfMaterials_cov create_date was 2026-05-20 — built TWO DAYS
+  - dbo.uspGetBillOfMaterials_cov create_date was 2026-05-20 â€” built TWO DAYS
     before the 2026-05-22 coverage run, by a pre-v5 instrumenter.
   - User dropped the stale _cov and re-ran RunCoverage. Fresh v5 produced:
         XEvent rows captured   : 6
         Coverage hits recorded : 1
         LINE COVERAGE   : 1/1 lines -> 100.0%
-        BRANCH COVERAGE : 0/0  (proc has no procedural branches — expected)
+        BRANCH COVERAGE : 0/0  (proc has no procedural branches â€” expected)
 
 So there was NO v5 instrumenter bug for this proc. v5 correctly collapses the
 single recursive-CTE statement into ONE coverage unit, injects one recorder
 after the proc's closing END;, the recorder fires, and coverage = 1/1 = 100%.
-That is statement coverage — the framework cannot see inside a set-based
+That is statement coverage â€” the framework cannot see inside a set-based
 statement, which is the honest ceiling for a CTE proc. The "CTE limitation"
 considered earlier in this investigation is a non-issue.
 
@@ -870,10 +870,10 @@ ROOT CAUSE of the misleading "0/23" report: TestGen.RunCoverage instrumented
 the target proc only when _cov was MISSING:
     IF OBJECT_ID(@CovFull,'P') IS NULL  EXEC TestGen.InstrumentProcedure ...
 So after the v9.2 (v5) upgrade it silently reused the 2026-05-20 _cov (0 usable
-injections) and the 2026-05-20 CoverageLines (23 IsExec rows — pre-v5
+injections) and the 2026-05-20 CoverageLines (23 IsExec rows â€” pre-v5
 "every-line" classification).
 
-FIX applied this iteration — TestGen.RunCoverage, three changes:
+FIX applied this iteration â€” TestGen.RunCoverage, three changes:
   1. Instrumentation is now UNCONDITIONAL: re-instrument on every run so _cov
      and CoverageLines always reflect the current proc body and the current
      instrumenter version. Removed the IF OBJECT_ID(@CovFull) IS NULL guard.
@@ -885,20 +885,20 @@ FIX applied this iteration — TestGen.RunCoverage, three changes:
      "No RecordCoverageHit statements found" message no longer misfires.
 
 Files changed:
-  - Install_All_Combined_v9_2_FINAL.sql — RunCoverage section patched in place.
-  - scripts\Patch_RunCoverage_AlwaysReinstrument.sql — NEW: standalone
+  - Install_All_Combined_v9_2_FINAL.sql â€” RunCoverage section patched in place.
+  - scripts\Patch_RunCoverage_AlwaysReinstrument.sql â€” NEW: standalone
     DROP+CREATE patch to apply the fix to an already-installed database.
-  - scripts\Diag_BOM_Coverage.sql — NEW: diagnostic used to root-cause this.
+  - scripts\Diag_BOM_Coverage.sql â€” NEW: diagnostic used to root-cause this.
 
-NOT changed: the instrumenter (v5), analyzer, reporter, generator — all
+NOT changed: the instrumenter (v5), analyzer, reporter, generator â€” all
 correct. With this fix the next RunCoverage on each proc rebuilds its _cov
-automatically, so stale pre-v5 _cov copies are corrected on their next run —
+automatically, so stale pre-v5 _cov copies are corrected on their next run â€”
 no manual cleanup needed. The README troubleshooting entry "No
 RecordCoverageHit statements found ... Cosmetic message" is now obsolete.
 
-## 2026-05-23 — NEW BUG: instrumenter emits non-compiling _cov for bare-body IF/ELSE
+## 2026-05-23 â€” NEW BUG: instrumenter emits non-compiling _cov for bare-body IF/ELSE
 
-User ran coverage on dbo.uspLevel3ValidationTest — a PROCEDURAL proc (18 exec
+User ran coverage on dbo.uspLevel3ValidationTest â€” a PROCEDURAL proc (18 exec
 lines, 11 branches: IF / EXISTS / SET / UPDATE / INSERT / RETURN / ELSE), i.e.
 the framework's target shape, NOT a CTE case.  Result: 0% coverage,
 "XEvent rows captured: 0", and the 14 tests split 3 pass / 6 fail / 5 error.
@@ -925,7 +925,7 @@ the ELSE:
    because it is written before the _cov CREATE.
 
 Secondary (latent) bug: even a bare IF body NOT followed by ELSE is mis-
-instrumented — the injected EXEC sits AFTER the IF's single-statement scope,
+instrumented â€” the injected EXEC sits AFTER the IF's single-statement scope,
 so the hit fires unconditionally and the line reads as covered even when the
 branch was not taken.
 
@@ -946,12 +946,12 @@ path won't trigger).
 Status: root cause confirmed; awaiting user go-ahead before patching
 InstrumentProcedure.  scripts\Diag_Level3_Coverage.sql created.
 
-## 2026-05-23 — RESOLVED: instrumenter v5.1 wraps bare branch bodies
+## 2026-05-23 â€” RESOLVED: instrumenter v5.1 wraps bare branch bodies
 
 User approved the fix.  TestGen.InstrumentProcedure upgraded v5 -> v5.1.
 
-Change (walker — 4 code edits + banner + trailing PRINT):
-  - New @StmtWrap BIT.  Set = 1 when the @Pending path opens a statement —
+Change (walker â€” 4 code edits + banner + trailing PRINT):
+  - New @StmtWrap BIT.  Set = 1 when the @Pending path opens a statement â€”
     that statement is, by construction, a BARE branch body (a BEGIN-bodied
     branch clears @Pending via the BEGIN handler before this path runs).
   - Emitter: when @StmtWrap = 1, prepend a synthetic 'BEGIN' before the
@@ -960,9 +960,9 @@ Change (walker — 4 code edits + banner + trailing PRINT):
   - End-of-walk safety net: if @StmtWrap is still 1 (a bare body with no
     terminating ';'), emit a closing 'END' so _cov stays balanced.
   Result: IF cond BEGIN <stmt>; EXEC RecordCoverageHit...; END ELSE BEGIN
-  <stmt>; EXEC RecordCoverageHit...; END  — compiles; hit scoped to branch.
+  <stmt>; EXEC RecordCoverageHit...; END  â€” compiles; hit scoped to branch.
 
-Verified against the uspLevel3ValidationTest source: 3 bare bodies — the
+Verified against the uspLevel3ValidationTest source: 3 bare bodies â€” the
 EXISTS-Customer SET (no ELSE) and the IF @Priority='High' / ELSE UPDATE pair
 (the compile breaker).  Every other branch body is a BEGIN/END block.
 
@@ -974,31 +974,31 @@ byte-identical to before.  Wrapping a bare statement in BEGIN/END is
 semantically transparent, so no test's pass/fail can change.
 
 Files changed:
-  - modules\20_Coverage_Instrumenter_v5.sql  — v5.1 (filename kept as _v5)
-  - Install_All_Combined_v9_2_FINAL.sql       — same edits applied inline
-  - scripts\Patch_InstrumentProcedure_BareBranchBody.sql  — NEW standalone
+  - modules\20_Coverage_Instrumenter_v5.sql  â€” v5.1 (filename kept as _v5)
+  - Install_All_Combined_v9_2_FINAL.sql       â€” same edits applied inline
+  - scripts\Patch_InstrumentProcedure_BareBranchBody.sql  â€” NEW standalone
     DROP+CREATE patch for an already-installed database
 Verified: InstrumentProcedure byte-identical across module, installer and
 patch script (531 lines, clean diff); 7 @StmtWrap references in each.
 
 Verified 2026-05-23 (uspLevel3ValidationTest re-run): _cov now COMPILES.
 0 tests errored (was 5); 11/14 pass; coverage = 12/18 line (66.7%),
-4/11 branch (36.4%) — real numbers, was 0%.  The instrumenter compile bug
+4/11 branch (36.4%) â€” real numbers, was 0%.  The instrumenter compile bug
 is fixed.
 
   - The 3 failing tests are the NULL-rejection tests: the proc does not
     validate NULL inputs (same proc-design gap as uspV9ValidationTest's
-    open item — NOT a framework bug).
+    open item â€” NOT a framework bug).
   - Remaining uncovered lines 36/47/52/56/89/91 are EXISTS-TRUE branch
     bodies.  The generated VIP/Express EXISTS-path tests pass but their seed
     data does not satisfy the proc's complex predicates: 3-condition AND,
     YEAR(OrderDate)=YEAR(GETDATE()), 2- and 3-table JOINs, Status IN (1,2,3).
-    This is a TEST-GENERATION gap (analyzer/generator), NOT instrumentation —
+    This is a TEST-GENERATION gap (analyzer/generator), NOT instrumentation â€”
     the same class of work as the uspV9 analyzer iterations 9-23.
 
 uspV9ValidationTest no-regression re-run still pending from the user.
 
-## 2026-05-23 — INVESTIGATION: why uspLevel3 sits at 66.7% (test-gen gaps)
+## 2026-05-23 â€” INVESTIGATION: why uspLevel3 sits at 66.7% (test-gen gaps)
 
 Ran Diag_Level3_TestGen.sql (AnalyzeBranchPaths output + the generated
 EXISTS-path test sources).  The 6 uncovered lines are blocked by FOUR
@@ -1042,13 +1042,13 @@ whole 3-table predicate.
 Recommended order: GAP C + GAP D first (contained analyzer string-parsing
 bug fixes), then GAP A, then GAP E.  Awaiting user go-ahead.
 
-## 2026-05-23 — IMPLEMENTED: complex-predicate fixes (Phases 1-3)
+## 2026-05-23 â€” IMPLEMENTED: complex-predicate fixes (Phases 1-3)
 
 User approved all three phases.  Applied to TestGen.AnalyzeBranchPaths
 (analyzer) and TestGen.GenerateTestsForProcedure (generator), in both the
 module files and the installer.
 
-Phase 1 — analyzer parsing bugs:
+Phase 1 â€” analyzer parsing bugs:
   GAP D - WHERE clause was cut at the FIRST ')' (an IN-list's paren), so
           conditions after "IN (...)" were dropped.  Now taken to the
           subquery block's balanced final ')':
@@ -1068,7 +1068,7 @@ Phase 2:
   GAP E2 - EXISTS_TRUE test names now append ' #'+PathID, so multiple EXISTS
           predicates in one branch no longer overwrite each other.
 
-Phase 3 — generator seedcur2:
+Phase 3 â€” generator seedcur2:
   The cursor now seeds @GenPathID PLUS every ancestor PathID, found via a
   recursive CTE walking ParentPathID (a PathDistinct CTE collapses
   #BranchPaths to one row per PathID so the recursive member is legal - no
@@ -1097,12 +1097,12 @@ remains the documented gap.  To apply: run the patch, then DropClass +
 GenerateTestsForProcedure + RunCoverage.  uspV9ValidationTest still needs a
 no-regression re-run.
 
-## 2026-05-23 — FOLLOW-UP F1/F2: datetime seed-value truncation
+## 2026-05-23 â€” FOLLOW-UP F1/F2: datetime seed-value truncation
 
 First re-test after Phases 1-3:
-  - uspV9ValidationTest: 28/28 line, 15/15 branch, 0 errored — 100% HELD
+  - uspV9ValidationTest: 28/28 line, 15/15 branch, 0 errored â€” 100% HELD
     (no regression; GAP E2's ' #'+PathID test names are visible there too).
-  - uspLevel3ValidationTest: 14/18 (77.8%) — GAP C+D recovered the Express
+  - uspLevel3ValidationTest: 14/18 (77.8%) â€” GAP C+D recovered the Express
     path (lines 89, 91), but the tests "VIP EXISTS path #1" and "#5" ERRORED
     and lines 36/47/52 stayed uncovered.
 
@@ -1110,7 +1110,7 @@ Root cause: GAP A now seeds an OrderDate value, which exposed a latent
 generator bug.  The seed-value truncation (IF LEN(@bpVal) > @bpColMax) clamps
 to the column's max_length.  For a datetime column max_length is 8 (BYTES),
 so the datetime literal was chopped to 8 chars ('2026-05-') and the
-INSERT/UPDATE threw a conversion error — the test errored before reaching the
+INSERT/UPDATE threw a conversion error â€” the test errored before reaching the
 branch body.
 
 Fixes:
@@ -1129,7 +1129,7 @@ Expected on re-test: tests #1/#5 no longer error; lines 36, 47, 52 covered ->
 17/18 (94%).  Line 56 (the ELSE of the plain nested IF @Priority='High')
 remains the documented limitation.
 
-## 2026-05-23 — CONFIRMED: complex-predicate work complete
+## 2026-05-23 â€” CONFIRMED: complex-predicate work complete
 
 Re-test after F1/F2 (patch re-applied, test class regenerated):
   uspLevel3ValidationTest: 17/18 line (94.4%), 10/11 branch (90.9%),
@@ -1156,20 +1156,20 @@ Standalone patch scripts (apply to an already-installed database, in order):
 All changes are also folded into Install_All_Combined_v9_2_FINAL.sql for
 fresh installs.
 
-## 2026-05-23 — IF_ELSE: test category for the ELSE of a plain nested IF
+## 2026-05-23 â€” IF_ELSE: test category for the ELSE of a plain nested IF
 
-User asked to close the last gap — line 56 of uspLevel3ValidationTest, the
+User asked to close the last gap â€” line 56 of uspLevel3ValidationTest, the
 ELSE of IF @Priority='High' nested inside the VIP EXISTS block.  The
 framework generated only the TRUE side of a plain IF @param='value' branch,
 never the ELSE side.
 
 New IF_ELSE path type:
-  Analyzer — section 2C (NEW): while the queue walks each block (including the
+  Analyzer â€” section 2C (NEW): while the queue walks each block (including the
     EXISTS THEN-blocks it re-scans), detect a plain  IF @param = 'literal'
     that has an ELSE (bare single-statement body OR BEGIN/END block; skips
     the branch's own header and compound AND/OR predicates).  Emit an
     IF_ELSE #Paths row with ParentPathID = @QParent (the enclosing EXISTS).
-  Generator — 5 splices, each scoped so EXISTS/CASE behaviour is byte-identical:
+  Generator â€” 5 splices, each scoped so EXISTS/CASE behaviour is byte-identical:
     - seedcur2 PathType filter: an IF_ELSE test also pulls its ancestor
       EXISTS_TRUE rows -- PathType = @GenPathType OR (@GenPathType='IF_ELSE'
       AND PathType='EXISTS_TRUE').
@@ -1184,7 +1184,7 @@ New IF_ELSE path type:
 Scope / risk: the generator splices change behaviour ONLY for PathType
 'IF_ELSE'; every existing path type is byte-identical.  The only way uspV9
 (or any other proc) is affected is if section 2C finds a plain nested
-IF...ELSE in it — which merely adds a test, and a new test cannot lower
+IF...ELSE in it â€” which merely adds a test, and a new test cannot lower
 coverage.
 
 Files changed: modules\17_Branch_Path_Analyzer_v3_2.sql,
@@ -1197,41 +1197,41 @@ patch, both procedures present).
 Expected on re-test: uspLevel3ValidationTest 18/18 (100%); uspV9ValidationTest
 must hold 100%.
 
-## 2026-05-23 — CONFIRMED: uspLevel3ValidationTest at 100%
+## 2026-05-23 â€” CONFIRMED: uspLevel3ValidationTest at 100%
 
 Re-test after the IF_ELSE feature (patch re-applied, test class regenerated):
   uspLevel3ValidationTest: 18/18 line (100%), 11/11 branch (100%), 0 errored.
-  15 pass, 3 fail (the NULL-rejection tests — proc-design gap, not a
-  framework issue).  The two new IF_ELSE tests — "@Priority <> High path #5"
-  and "#8" — cover line 56; #8 (ParentPathID=1) seeds pred-1 via the
+  15 pass, 3 fail (the NULL-rejection tests â€” proc-design gap, not a
+  framework issue).  The two new IF_ELSE tests â€” "@Priority <> High path #5"
+  and "#8" â€” cover line 56; #8 (ParentPathID=1) seeds pred-1 via the
   ancestor chain and reaches the nested ELSE.  The earlier documented
   limitation is now closed.
 
-## 2026-05-23 — VERIFIED COMPLETE: full framework run
+## 2026-05-23 â€” VERIFIED COMPLETE: full framework run
 
 uspV9ValidationTest re-run after the IF_ELSE feature: 28/28 line (100%),
 15/15 branch (100%), 0 errored.  NO REGRESSION.
 
 Section 2C found a plain nested IF...ELSE in uspV9 as well and generated two
-IF_ELSE tests ("@Priority <> High path #5" and "#8") — both PASS.  So the new
+IF_ELSE tests ("@Priority <> High path #5" and "#8") â€” both PASS.  So the new
 test category added 2 tests to uspV9 and it still held 100%.
 
-=== Final state — all three exercised procedures ===
-  uspV9ValidationTest      100%  (28/28 line, 15/15 branch)  — held, no regression
-  uspLevel3ValidationTest  100%  (18/18 line, 11/11 branch)  — was 0%
-  uspGetBillOfMaterials    100%  (1/1 — single set-based recursive CTE)  — was 0%
+=== Final state â€” all three exercised procedures ===
+  uspV9ValidationTest      100%  (28/28 line, 15/15 branch)  â€” held, no regression
+  uspLevel3ValidationTest  100%  (18/18 line, 11/11 branch)  â€” was 0%
+  uspGetBillOfMaterials    100%  (1/1 â€” single set-based recursive CTE)  â€” was 0%
 
-Remaining test FAILURES — uspV9 (4) and uspLevel3 (3) — are all NULL-rejection
+Remaining test FAILURES â€” uspV9 (4) and uspLevel3 (3) â€” are all NULL-rejection
 tests: those procedures do not validate NULL inputs, a procedure-design gap,
 NOT a framework gap (consistent with the CLAUDE.md open item).
 
 Eight framework bugs fixed across this effort, in three procedures:
-  RunCoverage          — reused a stale _cov instead of re-instrumenting
-  InstrumentProcedure  — non-compiling _cov for bare-body IF/ELSE branches
-  AnalyzeBranchPaths   — WHERE truncated at first ')'; multi-word value
+  RunCoverage          â€” reused a stale _cov instead of re-instrumenting
+  InstrumentProcedure  â€” non-compiling _cov for bare-body IF/ELSE branches
+  AnalyzeBranchPaths   â€” WHERE truncated at first ')'; multi-word value
                          truncated at first space; function-wrapped column
                          dropped
-  GenerateTestsForProcedure — clobbered same-named EXISTS tests; seeded only
+  GenerateTestsForProcedure â€” clobbered same-named EXISTS tests; seeded only
                          one PathID for nested predicates; chopped datetime
                          literals to a column's byte length
 Plus one new capability: the IF_ELSE test category (ELSE side of a plain
@@ -4940,7 +4940,7 @@ FILES: modules/30_Function_Support_v1.sql (new),
        docs/functions.md (new), CHANGES.md
 
 --------------------------------------------------------------------------------
-2026-05-29  v11 fix — RunCoverageForFunction stranded the instrumented _cov copy
+2026-05-29  v11 fix â€” RunCoverageForFunction stranded the instrumented _cov copy
 --------------------------------------------------------------------------------
 Symptom (reported on AdventureWorks2025): teardown failed with
   Msg 3729 ... Cannot drop schema 'uat' because it is being referenced by
@@ -5014,7 +5014,7 @@ The WAITFOR coverage fix, non-fatal FakeTable wrapping, and shadow-compile
 diagnostic are all present.
 
 --------------------------------------------------------------------------------
-2026-05-30  v11 ROOT CAUSE — function coverage always 0% (double-@ in driver)
+2026-05-30  v11 ROOT CAUSE â€” function coverage always 0% (double-@ in driver)
 --------------------------------------------------------------------------------
 Symptom: every function (FN/IF/TF) reported 0% coverage even though the shadow
 proc executed and was correctly instrumented (RecordCoverageHit injected, test
@@ -5053,7 +5053,7 @@ FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
        powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
 
 --------------------------------------------------------------------------------
-2026-05-30  v11 VERIFIED on AdventureWorks2025 — function coverage works
+2026-05-30  v11 VERIFIED on AdventureWorks2025 â€” function coverage works
 --------------------------------------------------------------------------------
 After the double-@ driver fix (+ multi-line RETURN emit + END-aware capture),
 scripts/Verify_Functions.sql gives real line AND branch coverage for every shape:
@@ -5075,7 +5075,7 @@ for deeper branch coverage on complex bodies; TVF row-value blessing; widen
 GenerateAndCoverDatabase to enumerate FN/IF/TF.
 
 --------------------------------------------------------------------------------
-2026-05-30  v11 — GenerateAndCoverDatabase widened to functions (VERIFIED)
+2026-05-30  v11 â€” GenerateAndCoverDatabase widened to functions (VERIFIED)
 --------------------------------------------------------------------------------
 GenerateAndCoverDatabase now enumerates sys.objects type IN ('P','FN','IF','TF')
 (is_ms_shipped=0, excluding TestGen/tSQLt/TestGenLog schemas, test_% classes,
@@ -5103,7 +5103,7 @@ FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
        powershell/UnitAutogen/sql/Install_UnitAutogen.sql, docs/functions.md, CHANGES.md
 
 --------------------------------------------------------------------------------
-2026-05-30  v11 Batch B — TVF row blessing (kept); multi-variant seeding (reverted)
+2026-05-30  v11 Batch B â€” TVF row blessing (kept); multi-variant seeding (reverted)
 --------------------------------------------------------------------------------
 ITEM 4 (KEPT, VERIFIED on AdventureWorks2025): GenerateTestsForTableFunction now
 blesses PURE table-valued functions (Fn_HasTableDependency=0).  At generation
@@ -5134,14 +5134,14 @@ FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
        scripts/Patch_v11_BatchB.sql, CHANGES.md
 
 ================================================================================
-2026-05-30  v11 Step 1 — self-capping shadow loops (coverage probe can't hang)
+2026-05-30  v11 Step 1 â€” self-capping shadow loops (coverage probe can't hang)
 ================================================================================
 GOAL (DESIGN_v11_BranchSeeding.md, Layer A): make a function coverage run
 provably non-hanging, as the safety foundation for future aggressive per-branch
 seeding (Step 2).  This is the headline reliability property for DevOps gating:
 the harness cannot run away on any input.
 
-FIRST ATTEMPT (statement budget) — TRIED, then REPLACED.  RecordCoverageHit
+FIRST ATTEMPT (statement budget) â€” TRIED, then REPLACED.  RecordCoverageHit
 gained an opt-in SESSION_CONTEXT statement budget, armed/disarmed by
 RunCoverageForFunction around the probe.  It worked (a 100M-iteration test
 function aborted at 9.4s instead of hanging) but had two faults: (1) SLOW -
@@ -5214,7 +5214,7 @@ FILES: modules/30_Function_Support_v1.sql, Install_UnitAutogen.sql,
        scripts/Patch_v11_LoopGuard.sql, CHANGES.md
 
 ================================================================================
-2026-05-30  v11 gap fix — one-line compound loop/branch bodies now instrument
+2026-05-30  v11 gap fix â€” one-line compound loop/branch bodies now instrument
 ================================================================================
 SURFACED during the Step-1 loop-guard proof: a function whose loop body is
 written on ONE line,
@@ -6819,9 +6819,9 @@ coverage-report.html / coverage.xml / test-results.xml emitted.
 FILES: powershell/UnitAutogen/UnitAutogen.psm1, powershell/UnitAutogen/Get-ParsedPredicates.ps1, CHANGES.md
 
 ================================================================================
-v0.13 — SSMS-NATIVE PREDICATE PARSER (ScriptDom hosted in SQLCLR)   2026-06-03
+v0.13 â€” SSMS-NATIVE PREDICATE PARSER (ScriptDom hosted in SQLCLR)   2026-06-03
 ================================================================================
-WHY: the predicate parser was the ONE step that could not run from T-SQL — it was
+WHY: the predicate parser was the ONE step that could not run from T-SQL â€” it was
 PowerShell (Get-ParsedPredicates.ps1 driving ScriptDom). For an SSMS-only shop that
 was an adoption blocker: without it the inbox is empty and data-shape branch seeding
 degrades to string-gen. The note in the v0.12.3 entry above ("generating tests in
@@ -6831,7 +6831,7 @@ CHANGE: ScriptDom is hosted INSIDE SQL Server via SQLCLR and the parser logic is
 ported to C#, exposed as two T-SQL procedures:
     EXEC TestGen.ParseDatabasePredicates  @SchemaFilter = N'dbo';   -- or NULL/'*'
     EXEC TestGen.ParseProcedurePredicates @Schema = N'dbo', @ProcName = N'...';
-The whole workflow — parse, generate, cover, run — is now pure T-SQL in SSMS, with
+The whole workflow â€” parse, generate, cover, run â€” is now pure T-SQL in SSMS, with
 NO PowerShell. The PowerShell parser remains as an alternative (servers that forbid
 UNSAFE CLR); both write the identical TestGen.PredicateInbox.
 
@@ -6839,7 +6839,7 @@ DESIGN: design/DESIGN_v0_13_SqlClrParser.md (feasibility spike + architecture).
 
 WHAT WAS BUILT (clr/):
 - UnitAutogenClr.cs (~1300 lines): a faithful C# port of Get-ParsedPredicates.ps1
-  — AST helpers, predicate-TREE build (atoms over query nodes with general joins +
+  â€” AST helpers, predicate-TREE build (atoms over query nodes with general joins +
   boolean WHERE trees), truth-propagation + per-table seed-plan merge, local-variable
   inline / conditional-IF expansion, tree->SQL render, flat-shape fallback, and a
   hand-rolled JSON writer (the SQLCLR allow-list excludes Newtonsoft/JavaScriptSerializer).
@@ -6848,7 +6848,7 @@ WHAT WAS BUILT (clr/):
   modules 31-34, the generator and coverage are UNCHANGED.
 - lib/UnitAutogenClr.dll (net472) + lib/Microsoft.SqlServer.TransactSql.ScriptDom.dll
   (Microsoft MIT, bundled; THIRD-PARTY-NOTICES.txt).
-- Install-UnitAutogenClr.SSMS.sql: self-contained, zero-PowerShell installer —
+- Install-UnitAutogenClr.SSMS.sql: self-contained, zero-PowerShell installer â€”
   embeds both assemblies as 0x bytes + the SHA-512 trust hashes; trusts via
   sys.sp_add_trusted_assembly (clr strict ON, NO TRUSTWORTHY), CREATE ASSEMBLY UNSAFE,
   CREATE PROCEDURE. Build-Clr.ps1 / Emit-InstallerSql.ps1 regenerate it from source.
@@ -6858,7 +6858,7 @@ NOTES / GOTCHAS:
   the bundled ScriptDom; net472 Framework csc at Framework64\v4.0.30319\csc.exe.
 - Registration needs CONTROL SERVER (sp_add_trusted_assembly) -> run the install as
   sysadmin. ODBC18 sqlcmd needs -C (trust self-signed cert). sqlcmd is slow on the
-  ~12 MB single-line 0x literal — run the installer in SSMS (or via SqlClient), not
+  ~12 MB single-line 0x literal â€” run the installer in SSMS (or via SqlClient), not
   sqlcmd; SSMS handles it in ~10-15 s.
 - EXTERNAL NAME is [UnitAutogenClr].[UnitAutogenClr].[<method>] (class has no namespace).
 
@@ -6874,7 +6874,7 @@ VALIDATED 2026-06-03:
 
 PENDING: optionally fold a pointer to clr/Install-UnitAutogenClr.SSMS.sql into the
 single-file installer/runbook as a post-install step (the main installer is
-line-sliced text; embedding 12 MB of assembly bytes there is left as a follow-up —
+line-sliced text; embedding 12 MB of assembly bytes there is left as a follow-up â€”
 the separate SSMS installer is the supported path).
 
 FILES: clr/UnitAutogenClr.cs, clr/lib/UnitAutogenClr.dll,
@@ -6884,7 +6884,7 @@ clr/Register-Clr.ps1, clr/README.md, clr/THIRD-PARTY-NOTICES.txt,
 design/DESIGN_v0_13_SqlClrParser.md, CHANGES.md
 
 --------------------------------------------------------------------------------
-v0.13 FOLLOW-UP — ONE PARSER EVERYWHERE (PowerShell parser retired)  2026-06-03
+v0.13 FOLLOW-UP â€” ONE PARSER EVERYWHERE (PowerShell parser retired)  2026-06-03
 --------------------------------------------------------------------------------
 DECISION (user): use the C# (SQLCLR) parser everywhere; do NOT keep a separate
 PowerShell parser in the PowerShell-Gallery deployment. Two parsers that must stay
@@ -6932,7 +6932,7 @@ INSTALL.md, README.md, docs/quickstart.md, powershell/USAGE.md, Build-ReleaseBun
 .gitignore, CHANGES.md
 
 --------------------------------------------------------------------------------
-v0.13 FIX — drop redundant legacy smoke-skip branch tests   2026-06-03
+v0.13 FIX â€” drop redundant legacy smoke-skip branch tests   2026-06-03
 --------------------------------------------------------------------------------
 SYMPTOM: a procedure with data-shape gates (e.g. HighValueCustomer.dbo.AssessCustomer)
 showed 3 SKIPPED tests ("executes <branch> path", "MANUAL TEST REQUIRED: no
@@ -6973,7 +6973,7 @@ FILES: modules/04_Test_Generator_v3.sql, Install_UnitAutogen.sql,
 powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
 
 --------------------------------------------------------------------------------
-v0.13 FIX — coverage teardown resilience (no more stranded/lost procs)  2026-06-03
+v0.13 FIX â€” coverage teardown resilience (no more stranded/lost procs)  2026-06-03
 --------------------------------------------------------------------------------
 SYMPTOM: RunCoverage renames the target proc to _orig, points a synonym at the
 instrumented _cov, runs the tests, then restores (drop synonym, rename _orig back).
@@ -7011,7 +7011,7 @@ FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.s
 CHANGES.md
 
 --------------------------------------------------------------------------------
-v0.13 FIX — schema-bound dependencies no longer block FakeTable   2026-06-03
+v0.13 FIX â€” schema-bound dependencies no longer block FakeTable   2026-06-03
 --------------------------------------------------------------------------------
 REPORTED (GitHub discussion): "Object cannot be renamed because the object
 participates in enforced dependencies" (Msg 15336) aborted generation/testing on a
@@ -7157,3 +7157,49 @@ Application.DetermineCustomerAccess). Polish, not a correctness bug.
 
 FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
 CHANGES.md
+
+--------------------------------------------------------------------------------
+v0.9.13 POLISH - honest classification for two un-coverable cases   2026-06-04
+--------------------------------------------------------------------------------
+Two "known gap" reporting refinements (no coverage-number change - both cases are
+genuinely not auto-coverable; the fix is an accurate reason instead of a generic one):
+
+(1) Procedures with an error-handling CATCH that runs its own ROLLBACK TRANSACTION
+    (e.g. HumanResources.uspUpdateEmployeeHireInfo) cannot have their error path
+    auto-driven: the proc's ROLLBACK unwinds tSQLt's per-test transaction (proved:
+    Msg 266 "transaction count ... mismatch"). The framework already excludes these
+    from forced-error tests (@v943CatchRollback); now the SKIP reason says exactly
+    that ("error-handling (CATCH) path ... ROLLBACK ... Msg 266 ... cover by hand")
+    instead of the generic "no analysable branches were found".
+
+(2) Inline TVFs (type 'IF': RETURNS TABLE AS RETURN (<select>)) have no procedural
+    body to instrument, so a _cov can never be produced. Previously reported as
+    "coverage deferred: instrumenter could not produce a compiling _cov" (sounds like
+    a bug to report). Now classified NOT_TESTABLE with the accurate reason: "inline
+    table-valued function ... no procedural statements or branches to instrument ...
+    coverage does not apply; exercise via its callers". Multi-statement TVFs ('TF')
+    still get the instrumenter-limitation message.
+
+VALIDATED on live DBs: uspUpdateEmployeeHireInfo (AdventureWorks) now shows the
+CATCH/ROLLBACK reason; Application.DetermineCustomerAccess (WideWorldImporters) now
+shows the inline-TVF reason. Both generator procs recompiled cleanly.
+
+FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+CHANGES.md
+
+--------------------------------------------------------------------------------
+v0.9.13 FIX - SkipTest reason must escape apostrophes   2026-06-04
+--------------------------------------------------------------------------------
+Caught by the AdventureWorks broad sweep right after the v0.9.12 classification
+polish: uspUpdateEmployeeHireInfo flipped from 1 skip to 1 ERROR -
+"Annotation has unmatched quote". The new CATCH/ROLLBACK skip reason contained an
+apostrophe ("tSQLt's"), and the v9.4 skip path emitted the reason into the
+--[@tSQLt:SkipTest]('...') annotation WITHOUT doubling quotes (module 34's
+NOT_TESTABLE path already did). tSQLt's annotation parser then saw an unmatched
+quote and errored the test instead of skipping it.
+FIX: both v9.4 SkipTest emit sites now REPLACE(reason, '''', '''''') (double the
+apostrophes). Re-validated: uspUpdateEmployeeHireInfo back to 11 pass + 1 skip, 0
+errors, full reason text intact. Lesson: any text put into a tSQLt SkipTest/
+annotation must double single quotes.
+
+FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md

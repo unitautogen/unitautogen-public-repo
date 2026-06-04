@@ -10,7 +10,7 @@ It is built on top of the open-source [tSQLt](https://tsqlt.org) framework. The 
 
 ---
 
-**Status: Beta — v0.9.0**
+**Status: Beta** — see [Releases](https://github.com/unitautogen/unitautogen-public-repo/releases) for the current version, or install the latest from the [PowerShell Gallery](https://www.powershellgallery.com/packages/UnitAutogen).
 Validated end-to-end against AdventureWorks, Northwind, and WideWorldImporters. Expect rough edges on production schemas it hasn't seen. See [docs/what-works.md](docs/what-works.md) for the honest scope.
 
 ---
@@ -37,8 +37,10 @@ The SQL Server testing ecosystem already has unit-testing frameworks (tSQLt, Red
 
 ## Quick start
 
-Run these in SSMS with **SQLCMD Mode** on (Query → SQLCMD Mode) so the `:r`
-includes resolve, from the repo root.
+Run these in SSMS from the repo root. The two install files are each
+self-contained, so the simplest path is to just **open each `.sql` file in SSMS and
+press F5** — no SQLCMD Mode needed. The script below uses `:r` includes purely as a
+convenience; for those, turn on **SQLCMD Mode** first (Query → SQLCMD Mode).
 
 ```sql
 -- 1. Install the framework into your database (idempotent; safe to re-run)

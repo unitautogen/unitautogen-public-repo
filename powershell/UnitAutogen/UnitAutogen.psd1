@@ -1,5 +1,5 @@
 @{
-    ModuleVersion     = '0.9.12'
+    ModuleVersion     = '0.9.13'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -39,6 +39,21 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
+## v0.9.13 (beta) — 2026-06-04
+
+Reporting-quality refinements (no coverage-number change - all are genuinely
+not-auto-coverable cases, now reported honestly):
+
+- A procedure whose error-handling CATCH runs its own ROLLBACK TRANSACTION now skips
+  its error path with an exact reason (the ROLLBACK would unwind tSQLt's per-test
+  transaction - Msg 266) instead of a generic "no analysable branches" message.
+- Inline table-valued functions (RETURNS TABLE AS RETURN ...) are now reported as a
+  clean NOT_TESTABLE ("a single set query - no statements or branches to instrument;
+  coverage does not apply") rather than a generic instrumenter "deferred".
+- Fix: a SkipTest reason containing an apostrophe (e.g. "tSQLt's") no longer errors
+  the test with "Annotation has unmatched quote" - the reason text is now
+  quote-escaped at both emit sites.
+
 ## v0.9.12 (beta) — 2026-06-04
 
 Two fixes from broad-database validation on WideWorldImporters (both v0.9.11 fixes

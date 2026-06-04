@@ -7169,7 +7169,10 @@ BEGIN
                     -- v9.4.2+: a branch with no auto-assertion is reported Skipped via the tSQLt
                     -- SkipTest annotation, inserted just before its CREATE PROCEDURE.
                     IF @v94SkipReason IS NOT NULL AND @v94CpPos > 0 AND @v94CpPos <= DATALENGTH(@S)/2
-                        SET @S = STUFF(@S, @v94CpPos, 0, N'--[@tSQLt:SkipTest](''' + @v94SkipReason + N''')' + @CRLF);
+                        -- v0.9.12: escape apostrophes in the reason (double them) so a
+                        -- reason containing ' (e.g. "tSQLt's") does not break the
+                        -- SkipTest annotation parser ("Annotation has unmatched quote").
+                        SET @S = STUFF(@S, @v94CpPos, 0, N'--[@tSQLt:SkipTest](''' + REPLACE(@v94SkipReason, NCHAR(39), NCHAR(39)+NCHAR(39)) + N''')' + @CRLF);
                     SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
                     SET @GenTestCount = @GenTestCount + 1;
 
@@ -7245,12 +7248,26 @@ BEGIN
                     IF NOT (@v94RsActive = 1 AND @v94RsExp IS NOT NULL)
                     BEGIN
                         SET @S = @S + N'    -- (no automated assertion - test carries the [@tSQLt:SkipTest] annotation above)' + @CRLF;
-                        SET @v94SkipReason = N'MANUAL TEST REQUIRED: no analysable branches were found in this part of the procedure - only a smoke run was generated. Assert its behaviour by hand.';
+                        -- v0.9.12: when the only un-analysable region is an
+                        -- error-handling CATCH that issues its own ROLLBACK, say so
+                        -- specifically. Such a path cannot be auto-driven: the proc's
+                        -- ROLLBACK TRANSACTION unwinds tSQLt's per-test transaction
+                        -- (Msg 266, BEGIN/COMMIT count mismatch), so it is a genuine
+                        -- manual test, not merely "no branches found".
+                        SET @v94SkipReason = CASE
+                            WHEN @SrcU LIKE N'%CATCH%'
+                             AND @SrcU LIKE N'%[^A-Z0-9_]ROLLBACK[^A-Z0-9_]%'
+                            THEN N'MANUAL TEST REQUIRED: error-handling (CATCH) path. The procedure runs its own ROLLBACK TRANSACTION on error, which would unwind tSQLt''s per-test transaction (Msg 266 - transaction count mismatch), so the error path cannot be exercised by an auto-generated test. Cover it with a hand-written test that forces the error and asserts the handling.'
+                            ELSE N'MANUAL TEST REQUIRED: no analysable branches were found in this part of the procedure - only a smoke run was generated. Assert its behaviour by hand.'
+                        END;
                     END;
                     -- v9.4.2+: a smoke-only fallback with no real assertion is reported
                     -- Skipped via the tSQLt SkipTest annotation before CREATE PROCEDURE.
                     IF @v94SkipReason IS NOT NULL AND @v94CpPos > 0 AND @v94CpPos <= DATALENGTH(@S)/2
-                        SET @S = STUFF(@S, @v94CpPos, 0, N'--[@tSQLt:SkipTest](''' + @v94SkipReason + N''')' + @CRLF);
+                        -- v0.9.12: escape apostrophes in the reason (double them) so a
+                        -- reason containing ' (e.g. "tSQLt's") does not break the
+                        -- SkipTest annotation parser ("Annotation has unmatched quote").
+                        SET @S = STUFF(@S, @v94CpPos, 0, N'--[@tSQLt:SkipTest](''' + REPLACE(@v94SkipReason, NCHAR(39), NCHAR(39)+NCHAR(39)) + N''')' + @CRLF);
                     SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
 
                     -- v0.13 de-dup: when the in-database predicate parser produced rows
@@ -12771,11 +12788,37 @@ BEGIN
     DECLARE @deferred BIT = CASE WHEN OBJECT_ID(@covChk,'P') IS NULL THEN 1 ELSE 0 END;
     IF @deferred = 1
     BEGIN
+        -- v0.9.12: an inline TVF (type 'IF': RETURNS TABLE AS RETURN (<select>))
+        -- has no procedural body - it is a single set expression with no statements
+        -- or branches to instrument, so it can NEVER produce a _cov. That is not an
+        -- instrumenter limitation to "please report"; it is coverage-not-applicable.
+        -- Classify it as a clean NOT_TESTABLE with an accurate reason instead of a
+        -- generic deferral. (Multi-statement TVFs - type 'TF' - DO have a body and
+        -- keep the instrumenter-limitation message.)
+        DECLARE @isInlineTvf BIT =
+            CASE WHEN EXISTS (SELECT 1 FROM sys.objects WHERE object_id=@objid AND type=N'IF')
+                 THEN 1 ELSE 0 END;
+        DECLARE @defReason NVARCHAR(400) = CASE WHEN @isInlineTvf=1
+            THEN N'inline table-valued function (RETURNS TABLE AS RETURN ...): a single set query with no procedural statements or branches to instrument, so line/branch coverage does not apply. Exercise its logic through the procedures or queries that call it.'
+            ELSE N'coverage deferred: instrumenter could not produce a compiling _cov' END;
+        DECLARE @defErrText NVARCHAR(200) = CASE WHEN @isInlineTvf=1
+            THEN N'inline TVF: no procedural body to instrument (coverage n/a)'
+            ELSE N'instrumented _cov failed to compile' END;
         PRINT '=============================================================';
-        PRINT ' COVERAGE DEFERRED: '+@SchemaName+'.'+@FunctionName;
-        PRINT ' The instrumented shadow copy ('+@shadow+'_cov) did not compile,';
-        PRINT ' so no coverage could be measured.  Reported DEFERRED, not 0%';
-        PRINT ' (instrumenter limitation - please report this function body).';
+        IF @isInlineTvf=1
+        BEGIN
+            PRINT ' NOT TESTABLE (coverage not applicable): '+@SchemaName+'.'+@FunctionName;
+            PRINT ' Inline table-valued function - a single set query with no';
+            PRINT ' procedural statements or branches to instrument.  Test its logic';
+            PRINT ' through its callers; no line/branch coverage applies.';
+        END
+        ELSE
+        BEGIN
+            PRINT ' COVERAGE DEFERRED: '+@SchemaName+'.'+@FunctionName;
+            PRINT ' The instrumented shadow copy ('+@shadow+'_cov) did not compile,';
+            PRINT ' so no coverage could be measured.  Reported DEFERRED, not 0%';
+            PRINT ' (instrumenter limitation - please report this function body).';
+        END;
         PRINT '=============================================================';
         IF @BatchId IS NOT NULL
             INSERT TestGen.CoverageResult
@@ -12783,8 +12826,8 @@ BEGIN
                  TotalBranches,CoveredBranches,BranchPct,TestsRun,TestsPassed,TestsFailed,
                  TestsErrored,TestsSkipped,TestsPreserved,ErrorText,Testability,NotTestableReason,RunAt)
             VALUES (@BatchId,@SchemaName,@FunctionName,0,NULL,NULL,NULL,NULL,NULL,NULL,0,0,0,0,0,0,
-                 N'instrumented _cov failed to compile',N'NOT_TESTABLE',
-                 N'coverage deferred: instrumenter could not produce a compiling _cov',SYSUTCDATETIME());
+                 @defErrText,N'NOT_TESTABLE',
+                 @defReason,SYSUTCDATETIME());
     END;
 
     -- 4. compute coverage from the shadow's line catalogue + hits (same rule as
