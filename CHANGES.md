@@ -7235,3 +7235,342 @@ shadow split, CATCH/ROLLBACK + inline-TVF honest reasons, SkipTest apostrophe-es
 plus the trimmed psd1 ReleaseNotes. No code difference from the validated build.
 
 FILES: powershell/UnitAutogen/UnitAutogen.psd1, VERSION, CHANGES.md
+
+--------------------------------------------------------------------------------
+PHASE 1 (unreleased, pending broad-sweep) - count-changing procs must modify data
+--------------------------------------------------------------------------------
+The "touches only mocked tables" isolation test for an INSERT/DELETE/MERGE proc
+previously only PRINTed the per-table before/after row counts - no assertion - so a
+side-effect write (e.g. an audit-log INSERT) went unverified: a regression removing
+it, or a seed that fails to drive the DML, passed silently.
+
+CHANGE (GenerateTestsForProcedure, the count-changing ELSE branch): replace the
+print-only fallback with an assertion that AT LEAST ONE faked table's row count
+changed on the seeded happy path (the count-changing analog of the existing UPDATE
+content assertion). If nothing changed, the seed did not drive the proc's
+INSERT/DELETE/MERGE or the DML was removed - both real failures.
+
+VERIFIED on HighValueCustomer.GetVIPCustomerAnalyticsReport: the audit-log insert is
+now asserted (test passes because AuditExecutionLog grows 5->6); negative proof
+(no change) fails with "Expected <1> but was <0>".
+
+EXPECTED on the broad sweep: some count-changing procs whose seeded happy path does
+NOT trigger their DML (conditional INSERT/DELETE not reached, MERGE that only
+updates, DELETE matching nothing) will FLIP from print-pass to FAIL. Triage each:
+genuine seeding gap (the intended behaviour to surface) vs. a case where the DML
+rightly does not fire on the happy path. NOT versioned/shipped until that sweep is
+clean. Phase 2 = exact per-table +N delta (INSERT...SELECT capture, branch DELETE);
+phase 3 = MERGE.
+
+FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql, CHANGES.md
+
+PHASE 1 REFINEMENT (still unreleased): the count-changing assertion is now
+CONTENT-AWARE. A count-only check false-FAILS when a proc holds a table's row count
+while changing its rows (a delete+insert, or a balanced MERGE). Fix: capture content
+hashes (CHECKSUM_AGG, the same machinery UPDATE procs already use) for count-changing
+procs too, and assert at least one faked table changed by ROW COUNT **or** CONTENT.
+Verified: net-zero delete+insert now passes via the content hash; the demo proc still
+passes; "nothing changed" still fails. (NOTE the per-table check already handled the
+two-table A-1/B+1 case - both tables show a changed count; the real hole was the
+single-table net-zero, now closed.) Residual: "at least one changed" still cannot
+detect a PARTIAL regression (proc should write 2 tables, now writes 1) - that is
+phase 2's exact per-table delta.
+
+## 2026-06-05 - DML EFFECT ASSERTIONS PHASE 2 (capture-based exact per-table counts) - UNRELEASED
+
+Replaces phase 1's "at least one faked table changed (count OR content)" heuristic, for
+count-changing procs, with EXACT per-table row-count assertions derived from a
+generation-time capture run.
+
+MECHANISM (new proc TestGen.CaptureExpectedCounts): at generation time, for a
+count-CHANGING proc, the generator runs the test's OWN Arrange (SafeFakeTable + the
+reverse-predicate seed = @MockBlock) + the procedure once, inside its own BEGIN TRAN,
+records each faked table's COUNT(*) before and after into a TABLE VARIABLE (survives
+the ROLLBACK), then rolls back - fakes/seed/writes undone, real tables restored. The
+counts come back through an OUTPUT param. Validated on
+HighValueCustomer.GetVIPCustomerAnalyticsReport: AuditExecutionLog captured 5->6, all
+read-only tables held at 5, @@TRANCOUNT cleanly 0, real tables restored, no leftover
+fakes.
+
+EMITTED TEST (count-changing case): one tSQLt.AssertEquals per faked table, @Expected =
+the captured AFTER count, @Actual read from the test's own #v94_RcAfter capture. This
+pins the procedure's EXACT write footprint - a broken/removed write under-counts; a
+stray write to another table over-counts. GetVIPCustomerAnalyticsReport now emits
+AuditExecutionLog = 6 (the audit insert that previously went UNASSERTED - the user's
+original finding) and every other table = 5 (held). Class result: "touches only mocked
+tables" PASSES; AssessCustomer (count-stable) still 6/6 - no regression.
+
+SKIP-AND-HIGHLIGHT: if the capture shows NO faked table changed (the seed drove no
+write), the generator emits the COMPLETE test (all per-table assertions, for reference)
+but STUFFs a --[@tSQLt:SkipTest](...) annotation before its CREATE PROCEDURE naming the
+gap, so the developer fixes the seed or the procedure. Honest NOT_TESTABLE rather than a
+misleading pass or a blame-the-proc fail. (Reuses the existing branch-test SkipTest
+insert-point + quote-escaping pattern.)
+
+SIDE-EFFECT GUARD: the capture is SKIPPED (falls back to the phase-1 heuristic, no
+behaviour change) when the proc body contains a non-transactional effect a ROLLBACK
+cannot undo - sp_send_dbmail, NEXT VALUE FOR (sequence), xp_cmdshell, OPENROWSET/
+OPENQUERY (linked server), or a global ##temp. Also skipped when already inside a
+transaction (@@TRANCOUNT <> 0), so the capture's ROLLBACK can never unwind a caller.
+Any capture error -> @CapErr set, exact path skipped, phase-1 heuristic used. Never
+throws, never corrupts.
+
+DETERMINISM: capture and test use the IDENTICAL Arrange string, so the measured counts
+are exactly reproducible at run time. Residual: a write count that depends on a
+non-deterministic value (rare for COUNT) could drift - those procs fall back to phase 1
+naturally only if they also hit the side-effect/branch guards; flagged for the sweep.
+
+STILL TO DO IN PHASE 2: extend TestGen.ExtractLeafDml (recognises UPDATE + INSERT VALUES
+only) to INSERT...SELECT and DELETE so PREDICATE-GATED branch DML gets exact, reverse-
+seeded per-branch assertions (the gated-write locality from the design doc). MERGE =
+phase 3. NOT versioned/shipped until the broad AdventureWorks + WideWorldImporters
+sweep is clean - one bump, all phases.
+
+FILES: Install_UnitAutogen.sql (TestGen.CaptureExpectedCounts new; TestGen.
+GenerateTestsForProcedure "touches only mocked tables" count-changing branch),
+powershell/UnitAutogen/sql/Install_UnitAutogen.sql (synced), CHANGES.md,
+design/DESIGN_DML_Effect_Assertions.md, design/DESIGN_Error_Expectation_Tests.md (new -
+separate over-generation fix, queued).
+
+## 2026-06-05 - PHASE 2 cont. - leaf parser + branch replay extended to DELETE and INSERT...SELECT - UNRELEASED
+
+TestGen.ExtractLeafDml (leaf body-DML capture for the v9.4 snapshot-and-replay branch
+assertions) now recognises a single-target DELETE and INSERT...SELECT, in addition to
+UPDATE and INSERT...VALUES. MERGE stays deferred to phase 3.
+
+Parser (ExtractLeafDml):
+ - keyword guard: exactly one of UPDATE/INSERT/DELETE (was UPDATE/INSERT only); MERGE
+   still rejected.
+ - INSERT...SELECT no longer rejected (the replay snapshots the target and replays the
+   INSERT...SELECT onto it).
+ - DELETE...JOIN rejected (two table refs; the single-target {{TARGET}} rewrite + whole-
+   table replay cannot handle a joined delete).
+ - target parse skips the optional FROM (DELETE) as well as INTO (INSERT).
+ UNIT-VERIFIED on HighValueCustomer: simple DELETE -> DELETE/Orders, {{TARGET}} rewrite
+ correct; INSERT...SELECT -> INSERT/AuditLog, col list preserved; DELETE...JOIN -> NULL;
+ UPDATE + INSERT VALUES still parse; two-DML body -> NULL.
+
+Branch replay (TestGen.GenerateTestsForProcedure v9.4 snapshot-and-replay):
+ - @v94HasBodyDml now includes DELETE (gets the before/after delta assertion).
+ - WHERE-nondeterminism guard now also applies to DELETE (a GETDATE/NEWID/RAND in the
+   DELETE WHERE blocks replay, same as for UPDATE).
+ - INSERT column-list capture now bounds on VALUES *or* SELECT, so an INSERT...SELECT's
+   explicit column list is captured (omitted columns stay out of the compare).
+ - delta assertion: new DELETE branch asserts the target SHRANK (count after < before);
+   INSERT...SELECT reuses the INSERT "grew" branch.
+ The whole-table characterization (#v94_ExpProj vs #v94_ActProj via AssertEqualsTable)
+ is unchanged and now covers DELETE/INSERT...SELECT replays automatically.
+
+SCOPE NOTE: the snapshot-and-replay path only engages for branches AnalyzeBranchPaths
+emits a REPLAY path for (table/column/EXISTS-gated branches - the reverse-seeding cases).
+A branch gated purely on IF @param = <literal> with a DML body produces no REPLAY path
+(pre-existing, same for UPDATE/INSERT) and falls back to the smoke/SkipTest marker. So
+end-to-end DELETE/INSERT...SELECT branch assertions land on real column-gated procs in
+the broad sweep; the parser + replay code itself is unit-verified and compiles/runs with
+no regression (AssessCustomer 6/6; GetVIPCustomerAnalyticsReport phase-2 exact counts
+still pass).
+
+INCIDENT: the Edit tool silently TRUNCATED Install_UnitAutogen.sql at line 15469 mid-way
+through these edits (file ended mid-comment, lint caught it as an unterminated block
+comment far from the edit site). Recovered by restoring from the in-sync bundle copy and
+re-applying all leaf edits via a deterministic Python script (exact-match, CRLF-preserving,
+count-checked), then re-verifying line count + tail + lint. Reinforces the standing rule:
+verify file size/tail/lint after editing this large module.
+
+FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql (synced,
+identical), CHANGES.md, design/DESIGN_DML_Effect_Assertions.md.
+
+## 2026-06-05 - WWI sweep gap fixes: TVP -> NOT_TESTABLE + SafeFakeTable drops SECURITY POLICY - UNRELEASED
+
+The WWI sweep (after turning SYSTEM_VERSIONING OFF so DML procs became testable) surfaced
+two pre-existing gaps - both now fixed. Neither is related to the phase-2 / leaf-parser work.
+
+1) TABLE-VALUED PARAMETERS (Website.InsertCustomerOrders: 8/8 fail).
+   The proc takes TVPs (@Orders = Website.OrderList, @OrderLines = OrderLineList). The
+   framework passed them as NULL/scalar -> "Operand type clash: NULL is incompatible with
+   OrderList" on EVERY test (incl. executes-valid + touches-only), before the body ran.
+   FIX: TestGen.AssessTestability now detects a table-valued parameter (sys.parameters JOIN
+   sys.types WHERE is_table_type = 1) and classifies the proc NOT_TESTABLE with a clear
+   reason (honest silence) instead of emitting guaranteed-fail tests. Future enhancement:
+   build a table variable of the type, seed it, and pass it. VERIFIED: InsertCustomerOrders
+   8 fails -> 1 NOT_TESTABLE skip.
+
+2) SECURITY POLICY (RLS) IN THE SCHEMA-BOUND CHAIN (Website.ActivateWebsiteLogon,
+   ChangePassword: 7 errors each - "SafeFakeTable: all attempts to fake Application.Cities
+   failed ... transaction cannot be committed").
+   Root cause: Application.Cities is locked by a chain - SECURITY POLICY
+   Application.FilterCustomersBySalesTerritoryRole (type 'SP') schema-binds the predicate
+   inline-TVF Application.DetermineCustomerAccess, which schema-binds Cities. tSQLt fakes by
+   RENAMING the table, which fails with "participates in enforced dependencies". SafeFakeTable
+   already walks the schema-bound chain deepest-first and drops dependents, BUT its drop
+   cursor filtered o.type IN ('V','FN','IF','TF','FS','FT') - which EXCLUDES 'SP'. So the
+   policy was never dropped, the TVF could not be dropped (the policy referenced it), Cities
+   could not be renamed, and the transaction doomed.
+   FIX: add 'SP' to the drop-cursor type filter and emit DROP SECURITY POLICY (vs DROP
+   FUNCTION/VIEW). The existing lvl-DESC order drops the policy (lvl 2) before its predicate
+   function (lvl 1). VERIFIED: SafeFakeTable 'Application.Cities' -> faked OK; ActivateWebsite
+   Logon 7 framework errors -> the proc now RUNS (remaining "Invalid PersonID" failures are a
+   SEPARATE happy-path seeding-vs-validation gap, logged for backlog, not this fix nor ours).
+
+NOTE: the standalone TestGen.ClearSchemaBoundReferences helper (emitted into MockBlocks) is
+single-level and not 'SP'-aware, but it only ever sees a table's DIRECT dependents (never the
+lvl-2 policy) and SafeFakeTable's recursive walk is the authority - so it is harmless
+redundancy. Minor cleanup candidate (make it defer to SafeFakeTable, or recurse + SP-aware).
+
+BACKLOG surfaced by the same sweep (NOT fixed here): (a) happy-path seed not satisfying a
+proc's existence-check validation (ActivateWebsiteLogon "Invalid PersonID"); (b) FOR JSON
+result sets break INSERT...EXEC baseline capture (SearchForStockItems*); (c) boundary/NULL
+fed into a TOP/FETCH rowcount param (negative/NULL) - same over-generation family as the
+error-expectation tests.
+
+FILES: Install_UnitAutogen.sql (TestGen.SafeFakeTable drop cursor; TestGen.AssessTestability
+TVP check), powershell/UnitAutogen/sql/Install_UnitAutogen.sql (synced, identical), CHANGES.md.
+
+## 2026-06-05 - CLEANUP SPRINT: clear all false-red baggage surfaced by the sweeps - UNRELEASED
+
+Goal: no procedure should report a FAILURE/ERROR for a framework reason; every such case
+is now either a real pass or an honest, actionable Skip/NOT_TESTABLE.  All verified live.
+
+1) ERROR-PATH DETECTION (TestGen.ExtractErrorPaths) - the linchpin for both over- and
+   under-generation of error-expectation tests. Three fixes:
+   a) Blank BEGIN CATCH..END CATCH before scanning, so a catch-rethrow
+      (RAISERROR(ERROR_MESSAGE()...) / bare THROW;) is NOT counted as an input-validation
+      error path.  -> GetVIPCustomerAnalyticsReport: 3 false "rejects/raises error" fails
+      GONE; now 7/7 green.
+   b) Parse parenthesis-less THROW (THROW errno,'msg',state;) - it was completely missed
+      (the scanner required a '(').  -> ActivateWebsiteLogon's "Invalid PersonID" THROW is
+      now detected, so boundary/NULL tests correctly EXPECT the throw (pass).
+   c) Tolerate an N'...' nvarchar literal prefix on the message arg (both RAISERROR + THROW).
+
+2) HONEST-SKIP FOR HAPPY-PATH VALIDATION (new TestGen.ProbeHappyPath + generator wiring).
+   When the generated happy-path inputs do not satisfy the procedure's OWN validation (it
+   raises a detected guard error), the framework cannot construct valid inputs - so the
+   happy-path-success tests (executes-valid / touches-only / OUTPUT / baseline rows) now
+   carry a [@tSQLt:SkipTest] annotation with a clear reason instead of FAILING by
+   construction.  Decided at generation time by running the proc under the seed in a
+   rolled-back transaction (tSQLt has no runtime SkipTest, only the annotation).  Side-
+   effect/transaction guarded.  -> ActivateWebsiteLogon, ChangePassword: 7 errors each ->
+   3 pass + 2 honest skip, 0 fail.
+
+3) BOUNDARY/NULL "ACCEPTS" PROBE-SKIP.  An "accepts low/high boundary" or "accepts NULL"
+   test whose generated value is outside the proc's domain (e.g. negative/NULL into a
+   TOP/FETCH rowcount) now SkipTest-annotates that one test (probed at gen time) instead
+   of failing.  -> SearchForStockItems(+ByTags): negative/NULL TOP fails -> honest skips.
+
+4) FOR JSON / FOR XML result sets.  The row-baseline test (INSERT #base EXEC) cannot
+   capture them ("FOR JSON clause is not allowed in an INSERT").  That single test is now
+   skipped for such procs (shape test still applies).  -> SearchForStockItems* baseline
+   error GONE.
+
+5) ClearSchemaBoundReferences emission RETIRED.  TestGen.SafeFakeTable now walks the full
+   schema-bound chain itself (recursive, cycle-guarded, SECURITY-POLICY-aware), so the
+   old single-level, non-SP-aware upfront pre-pass was redundant and a source of "Could
+   not drop" noise - removed from the MockBlock.
+
+NOT FIXED (honest, transparent - not a false red): Website.CalculateCustomerPrice still
+reports "coverage deferred: instrumenter could not produce a compiling _cov".  It is a
+multi-statement scalar function WITH EXECUTE AS OWNER whose shadow-proc transform the v11
+function instrumenter cannot yet build; the framework already DEFERS it cleanly (gen=N),
+which is honest behaviour, not baggage.  Logged as a future v11 shadow-transform
+enhancement, not a bug.
+
+VERIFIED live on WWI (versioning OFF): ActivateWebsiteLogon 3P/2S, ChangePassword 3P/2S,
+SearchForStockItems 5P/3S, SearchForStockItemsByTags 5P/3S, InsertCustomerOrders 1 skip
+(TVP NOT_TESTABLE) - 0 failures, 0 errors across all.  GetVIPCustomerAnalyticsReport
+(HighValueCustomer) 7/7.  Re-install the updated installer on each DB and re-sweep to
+confirm database-wide.
+
+FILES: Install_UnitAutogen.sql (TestGen.ExtractErrorPaths; new TestGen.ProbeHappyPath;
+TestGen.GenerateTestsForProcedure happy/boundary/NULL probe-skip + FOR JSON gate +
+ClearSchemaBoundReferences retirement), powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(synced), CHANGES.md.
+
+## 2026-06-05 - TVP CONSTRUCTION: table-valued parameters now auto-tested (was NOT_TESTABLE) - UNRELEASED
+
+A procedure with a table-valued parameter (TVP) used to be classified NOT_TESTABLE because
+the generator could only pass scalars/NULL -> "Operand type clash: NULL is incompatible with
+<type>". Now the generator CONSTRUCTS the argument:
+
+NEW TestGen.BuildTvpSetup(@TypeSchema,@TypeName,@VarName,@SetupSql OUT): reads the table
+type's columns (via sys.table_types.type_table_object_id), excludes identity/computed/
+rowversion, and emits  DECLARE @var AS <schema>.<type>;  INSERT @var (cols) VALUES (one
+type-valid, seed-aligned row);  - values follow the table-seeder's row-1 convention
+(int=1, string='SampleText_1', date='2024-06-15', etc.) so they line up with the faked-table
+seeds. (Empty-TVP fallback: DECLARE only, when the type has no insertable columns.)
+
+GENERATOR wiring (TestGen.GenerateTestsForProcedure): @Params already carried IsTableType +
+TypeSchema; the arg-build loop now has a TVP branch that calls BuildTvpSetup, appends the
+DECLARE+INSERT to @OutputDecls (so it flows to every test AND ProbeHappyPath AND
+CaptureExpectedCounts), and passes  @param = @tvp_<param>  in the happy/boundary/high arg
+lists. NULL-injection loop skips TVP params (a TVP can't be NULL). The TVP -> NOT_TESTABLE
+gate in TestGen.AssessTestability is REMOVED. Safety net: if the proc validates the TVP
+contents and the seed doesn't satisfy it, the happy-path probe honest-skips (no false red).
+
+VERIFIED on WWI: Website.InsertCustomerOrders -> from NOT_TESTABLE to 6 tests, 6 pass, 0 skip,
+0 fail (the OrderList + OrderLineList TVPs are built, seeded, and the proc runs + asserts its
+effect). The TVP gate was also MASKING the real status of two other procs: InvoiceCustomerOrders
+now correctly reports its temporal-table blocker, RecordColdRoomTemperatures its memory-optimized
+blocker - both real reasons that were hidden behind the TVP gate before.
+
+FILES: Install_UnitAutogen.sql (new TestGen.BuildTvpSetup; GenerateTestsForProcedure TVP arg
+branch + NULL-loop skip; AssessTestability TVP gate removed), powershell/UnitAutogen/sql/
+Install_UnitAutogen.sql (synced), CHANGES.md.
+
+## 2026-06-05 - TVP fix #2: coverage instrumenter must emit table params schema-qualified + READONLY - UNRELEASED
+
+The first TVP change made the generated TESTS pass (6/6 via tSQLt.Run), but the full sweep
+(coverage path) flipped InsertCustomerOrders to 6 FAIL / 0% line.  Root cause: a SECOND bug.
+TestGen.InstrumentProcedure rebuilds the proc header from sys.parameters when it creates the
+instrumented <proc>_cov copy, and it emitted a table-valued parameter as just  @Orders OrderList
+- WITHOUT the schema qualifier and WITHOUT the mandatory READONLY.  So the _cov failed to
+compile and every test failed under coverage (the original proc was renamed away for
+instrumentation).  Direct tSQLt.Run passed because it runs the ORIGINAL proc, not the _cov -
+which is why isolated validation missed it; only the coverage sweep surfaced it.
+
+FIX: the instrumenter's param-list builder now carries t.is_table_type + SCHEMA_NAME(t.schema_id)
+and, for a table-type parameter, emits  @p [schema].[type] READONLY  (no length suffix, no
+= NULL default, no OUTPUT - none apply to a TVP).  VERIFIED: [Website].[InsertCustomerOrders]_cov
+now compiles (header: @Orders [Website].[OrderList] READONLY, @OrderLines [Website].[OrderLineList]
+READONLY, ...) and EXEC TestGen.RunCoverage 'Website','InsertCustomerOrders' -> 6 tests 6 pass,
+72.7% line coverage (Orders faked-table 5->6).  Re-sweep WWI: InsertCustomerOrders moves from the
+6-fail row to a green ~72% row.
+
+FILES: Install_UnitAutogen.sql (TestGen.InstrumentProcedure param-list builder),
+powershell/UnitAutogen/sql/Install_UnitAutogen.sql (synced), CHANGES.md.
+
+## ============================================================================
+## RELEASE v0.10.0 (beta) — 2026-06-05   (bump from 0.9.14)
+## ============================================================================
+
+Consolidates all the unreleased work above into the single v0.10.0 release.
+
+NEW CAPABILITIES
+- DML effect assertions: exact per-table row-count assertions for modifying procs,
+  measured at generation time under the reverse-predicate seed (phase 1 + phase 2);
+  INSERT (VALUES + SELECT), UPDATE, DELETE; skip-and-highlight when no write fires.
+- DELETE + INSERT...SELECT branch coverage (ExtractLeafDml + snapshot-and-replay).
+- Table-valued parameters: constructed + seeded + passed (was NOT_TESTABLE); coverage
+  instrumenter emits table params schema-qualified + READONLY.
+- SafeFakeTable drops SECURITY POLICY (RLS) predicate-function chains before faking.
+
+HONESTY / NO-FALSE-RED CLEANUP
+- Error-expectation over-generation fixed (catch-rethrow blanking + parenless THROW +
+  N'...' literal handling in ExtractErrorPaths).
+- ProbeHappyPath: happy/boundary/NULL inputs that can't satisfy a proc's own validation
+  -> [@tSQLt:SkipTest] annotation instead of a false failure.
+- FOR JSON / FOR XML row-baseline test suppressed (can't INSERT...EXEC capture).
+- Retired the redundant ClearSchemaBoundReferences MockBlock emission.
+
+KNOWN / HONEST DEFERRALS (not failures, transparently reported)
+- Website.CalculateCustomerPrice: v11 scalar-function shadow transform can't build a
+  compiling _cov for this multi-statement EXECUTE AS OWNER fn (future enhancement).
+- Unseeded single branches on a couple of procs (reverse-seed-the-branch territory).
+
+VALIDATION (full GenerateAndCoverDatabase sweeps, 2026-06-05): HighValueCustomer 19 pass
+/ 0 fail / 0 err (89.5% line, 85.7% branch); AdventureWorks2025 81 pass / 0 fail / 0 err
+(94.9% / 94.4%); WideWorldImporters 57 pass / 0 fail / 0 err (91.2% line). Zero false red
+across all three.
+
+RELEASE MECHANICS: ModuleVersion 0.10.0 (psd1); VERSION v0.10.0-beta; ReleaseNotes 2492
+chars (< 10600 PSGallery limit); installer root + powershell bundle copy identical + lint
+clean. Tag v0.10.0 to publish.

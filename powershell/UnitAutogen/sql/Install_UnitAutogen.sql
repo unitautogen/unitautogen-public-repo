@@ -871,6 +871,93 @@ GO
 PRINT 'TestGen.BuildSeedInsertForTable installed.';
 GO
 
+/*****************************************************************************
+ * TestGen.BuildTvpSetup
+ * ---------------------------------------------------------------------------
+ * Builds the Arrange snippet that constructs + seeds a table variable of a
+ * given table type, so a procedure with a table-valued parameter (TVP) can be
+ * called.  Returns:  DECLARE @var AS <schema>.<type>;
+ *                    INSERT @var (cols) VALUES (one type-valid, seed-aligned row);
+ * The target tables the proc writes the TVP rows into are faked (FKs dropped),
+ * so type-valid rows are enough to make the proc run; values follow the table-
+ * seeder's row-1 convention (int=1, string='SampleText_1', ...) so they line up
+ * with the faked-table seeds for any lookup the proc does.
+ *****************************************************************************/
+IF OBJECT_ID('TestGen.BuildTvpSetup', 'P') IS NOT NULL
+    DROP PROCEDURE TestGen.BuildTvpSetup;
+GO
+
+CREATE PROCEDURE TestGen.BuildTvpSetup
+    @TypeSchema SYSNAME,
+    @TypeName   SYSNAME,
+    @VarName    SYSNAME,
+    @SetupSql   NVARCHAR(MAX) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET @SetupSql = NULL;
+    DECLARE @CRLF NCHAR(2) = CHAR(13) + CHAR(10);
+
+    DECLARE @ttObj INT =
+        (SELECT tt.type_table_object_id FROM sys.table_types tt
+         WHERE tt.schema_id = SCHEMA_ID(@TypeSchema) AND tt.name = @TypeName);
+    IF @ttObj IS NULL RETURN;
+
+    DECLARE @full NVARCHAR(300) = QUOTENAME(@TypeSchema) + N'.' + QUOTENAME(@TypeName);
+
+    DECLARE @colList NVARCHAR(MAX) = N'', @valList NVARCHAR(MAX) = N'';
+    DECLARE @cn SYSNAME, @tn SYSNAME, @cmax SMALLINT, @cprec TINYINT, @cscale TINYINT, @v NVARCHAR(400);
+    DECLARE cc CURSOR LOCAL FAST_FORWARD FOR
+        SELECT c.name, ty.name, c.max_length, c.precision, c.scale
+        FROM sys.columns c
+        JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+        WHERE c.object_id = @ttObj
+          AND c.is_computed = 0
+          AND c.is_identity = 0
+          AND ty.name NOT IN ('timestamp','rowversion')
+        ORDER BY c.column_id;
+    OPEN cc;
+    FETCH NEXT FROM cc INTO @cn, @tn, @cmax, @cprec, @cscale;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @colList = @colList + N', ' + QUOTENAME(@cn);
+        SET @v =
+            CASE
+                WHEN LOWER(@tn) IN ('int','bigint','smallint','tinyint')                 THEN N'1'
+                WHEN LOWER(@tn) = 'bit'                                                   THEN N'1'
+                WHEN LOWER(@tn) IN ('decimal','numeric','money','smallmoney','float','real') THEN N'1.50'
+                WHEN LOWER(@tn) IN ('char','varchar','nchar','nvarchar')                  THEN N'''SampleText_1'''
+                WHEN LOWER(@tn) = 'date'                                                  THEN N'''2024-06-15'''
+                WHEN LOWER(@tn) IN ('datetime','datetime2','smalldatetime')               THEN N'''2024-06-15T12:34:56'''
+                WHEN LOWER(@tn) = 'datetimeoffset'                                        THEN N'''2024-06-15T12:34:56+00:00'''
+                WHEN LOWER(@tn) = 'time'                                                  THEN N'''12:34:56'''
+                WHEN LOWER(@tn) = 'uniqueidentifier'                                      THEN N'''00000000-0000-0000-0000-000000000001'''
+                ELSE TestGen.GetSampleValueLiteral(@tn, @cmax, @cprec, @cscale, 0)
+            END;
+        SET @valList = @valList + N', ' + ISNULL(@v, N'NULL');
+        FETCH NEXT FROM cc INTO @cn, @tn, @cmax, @cprec, @cscale;
+    END;
+    CLOSE cc; DEALLOCATE cc;
+
+    -- Always at least DECLARE the variable (an empty TVP is a valid argument);
+    -- add the seed row only when the type has insertable columns.
+    IF LEN(@colList) > 0
+    BEGIN
+        SET @colList = STUFF(@colList, 1, 2, N'');
+        SET @valList = STUFF(@valList, 1, 2, N'');
+        SET @SetupSql =
+            N'    DECLARE ' + @VarName + N' AS ' + @full + N';' + @CRLF +
+            N'    INSERT ' + @VarName + N' (' + @colList + N') VALUES (' + @valList + N');' + @CRLF;
+    END
+    ELSE
+        SET @SetupSql =
+            N'    DECLARE ' + @VarName + N' AS ' + @full + N';' + @CRLF;
+END;
+GO
+
+PRINT 'TestGen.BuildTvpSetup installed.';
+GO
+
 
 /* === 07_Seed_FakedTables.sql === */
 /******************************************************************************
@@ -1270,12 +1357,19 @@ BEGIN
                 FROM #sbdep x
                 JOIN sys.objects o ON o.object_id = x.id
                 JOIN sys.schemas s ON s.schema_id = o.schema_id
-                WHERE o.type IN ('V','FN','IF','TF','FS','FT')   -- schema-bound view / function
+                WHERE o.type IN ('V','FN','IF','TF','FS','FT','SP')  -- view / function / SECURITY POLICY
                 ORDER BY x.lvl DESC;                              -- deepest dependents first
             OPEN sbcur; FETCH NEXT FROM sbcur INTO @sbName, @sbType;
             WHILE @@FETCH_STATUS = 0
             BEGIN
-                SET @sbDrop = CASE WHEN @sbType = 'V' THEN N'DROP VIEW ' ELSE N'DROP FUNCTION ' END + @sbName;
+                -- v0.x: a SECURITY POLICY (row-level security) schema-binds its
+                -- predicate function, which schema-binds the base table - so the
+                -- table cannot be renamed/faked until the policy is dropped.  It
+                -- needs DROP SECURITY POLICY (not DROP FUNCTION/VIEW) and must go
+                -- BEFORE its predicate function - the lvl-DESC order guarantees that.
+                SET @sbDrop = CASE WHEN @sbType = 'V'  THEN N'DROP VIEW '
+                                   WHEN @sbType = 'SP' THEN N'DROP SECURITY POLICY '
+                                   ELSE N'DROP FUNCTION ' END + @sbName;
                 BEGIN TRY EXEC (@sbDrop); END TRY BEGIN CATCH END CATCH;
                 FETCH NEXT FROM sbcur INTO @sbName, @sbType;
             END;
@@ -1955,6 +2049,22 @@ BEGIN
         SourceFragment   NVARCHAR(2000)
     );
 
+    -- Blank out BEGIN CATCH ... END CATCH spans (length-preserving so later
+    -- offsets stay valid).  A re-throw inside a CATCH - RAISERROR(ERROR_MESSAGE()
+    -- ...) or a bare THROW; - is NOT an input-validation error path; only the
+    -- main-flow guards should drive "rejects/raises" tests.
+    DECLARE @lcScan NVARCHAR(MAX) = LOWER(@clean);
+    DECLARE @bcP INT = CHARINDEX('begin catch', @lcScan);
+    WHILE @bcP > 0
+    BEGIN
+        DECLARE @ecP INT = CHARINDEX('end catch', @lcScan, @bcP);
+        IF @ecP = 0 BREAK;
+        DECLARE @spanLen INT = (@ecP + 9) - @bcP;   -- 'end catch' = 9 chars
+        SET @clean   = STUFF(@clean, @bcP, @spanLen, REPLICATE(N' ', @spanLen));
+        SET @lcScan  = LOWER(@clean);
+        SET @bcP     = CHARINDEX('begin catch', @lcScan, @bcP + 1);
+    END;
+
     DECLARE @lower NVARCHAR(MAX) = LOWER(@clean);
     DECLARE @pos INT = 1, @hit INT;
     DECLARE @kw VARCHAR(10), @kwLen INT;
@@ -1988,56 +2098,72 @@ BEGIN
             END;
         END;
 
-        -- Locate the opening '(' after the keyword.
-        SET @parenStart = CHARINDEX('(', @clean, @hit + @kwLen);
-
-        -- THROW has a form without parens (THROW; for rethrow). Skip those.
-        IF @parenStart = 0 OR @parenStart > @hit + @kwLen + 80
+        -- THROW takes NO parentheses (THROW errno, 'message', state;).  A bare
+        -- "THROW;" rethrow carries no args, and CATCH blocks are already blanked,
+        -- so a THROW seen here is a main-flow validation guard.  RAISERROR(...)
+        -- uses parentheses (handled in the ELSE branch).
+        IF @kw = 'THROW'
         BEGIN
-            SET @pos = @hit + @kwLen;
-            CONTINUE;
-        END;
-
-        -- Locate the matching closing ')'. We scan character-by-character
-        -- handling string-quote nesting and depth.
-        DECLARE @i INT = @parenStart + 1, @depth INT = 1;
-        DECLARE @inStr BIT = 0;
-        SET @parenEnd = 0;
-        WHILE @i <= LEN(@clean)
-        BEGIN
-            DECLARE @c NCHAR(1) = SUBSTRING(@clean, @i, 1);
-            IF @inStr = 1
+            SET @parenEnd = CHARINDEX(N';', @clean, @hit + @kwLen);
+            IF @parenEnd = 0 SET @parenEnd = LEN(@clean) + 1;
+            SET @args = LTRIM(SUBSTRING(@clean, @hit + @kwLen, @parenEnd - (@hit + @kwLen)));
+            IF LEN(@args) = 0 OR LEFT(@args, 1) = N';'
             BEGIN
-                IF @c = N''''
-                BEGIN
-                    -- Escaped '' or end of string?
-                    IF SUBSTRING(@clean, @i + 1, 1) = N''''
-                        SET @i = @i + 1;     -- skip the escaped quote
-                    ELSE
-                        SET @inStr = 0;
-                END;
-            END
-            ELSE
-            BEGIN
-                IF @c = N'''' SET @inStr = 1;
-                ELSE IF @c = N'(' SET @depth = @depth + 1;
-                ELSE IF @c = N')'
-                BEGIN
-                    SET @depth = @depth - 1;
-                    IF @depth = 0 BEGIN SET @parenEnd = @i; BREAK; END;
-                END;
+                SET @pos = @hit + @kwLen;          -- bare THROW; -> not an input error path
+                CONTINUE;
             END;
-            SET @i = @i + 1;
-        END;
-
-        IF @parenEnd = 0
+        END
+        ELSE
         BEGIN
-            -- Couldn't find matching paren; skip this hit.
-            SET @pos = @hit + @kwLen;
-            CONTINUE;
-        END;
+            -- Locate the opening '(' after the keyword.
+            SET @parenStart = CHARINDEX('(', @clean, @hit + @kwLen);
+            IF @parenStart = 0 OR @parenStart > @hit + @kwLen + 80
+            BEGIN
+                SET @pos = @hit + @kwLen;
+                CONTINUE;
+            END;
 
-        SET @args = SUBSTRING(@clean, @parenStart + 1, @parenEnd - @parenStart - 1);
+            -- Locate the matching closing ')'. We scan character-by-character
+            -- handling string-quote nesting and depth.
+            DECLARE @i INT = @parenStart + 1, @depth INT = 1;
+            DECLARE @inStr BIT = 0;
+            SET @parenEnd = 0;
+            WHILE @i <= LEN(@clean)
+            BEGIN
+                DECLARE @c NCHAR(1) = SUBSTRING(@clean, @i, 1);
+                IF @inStr = 1
+                BEGIN
+                    IF @c = N''''
+                    BEGIN
+                        -- Escaped '' or end of string?
+                        IF SUBSTRING(@clean, @i + 1, 1) = N''''
+                            SET @i = @i + 1;     -- skip the escaped quote
+                        ELSE
+                            SET @inStr = 0;
+                    END;
+                END
+                ELSE
+                BEGIN
+                    IF @c = N'''' SET @inStr = 1;
+                    ELSE IF @c = N'(' SET @depth = @depth + 1;
+                    ELSE IF @c = N')'
+                    BEGIN
+                        SET @depth = @depth - 1;
+                        IF @depth = 0 BEGIN SET @parenEnd = @i; BREAK; END;
+                    END;
+                END;
+                SET @i = @i + 1;
+            END;
+
+            IF @parenEnd = 0
+            BEGIN
+                -- Couldn't find matching paren; skip this hit.
+                SET @pos = @hit + @kwLen;
+                CONTINUE;
+            END;
+
+            SET @args = SUBSTRING(@clean, @parenStart + 1, @parenEnd - @parenStart - 1);
+        END;
 
         -- Parse argument 1 (and 2 for severity / message-for-THROW).
         DECLARE @msg NVARCHAR(2000) = NULL, @sev INT = NULL;
@@ -2046,6 +2172,9 @@ BEGIN
         IF @kw = 'RAISERROR'
         BEGIN
             -- Arg 1 = message (string literal or variable)
+            -- tolerate an N'...' nvarchar literal prefix
+            IF LEFT(@trimmed, 1) IN (N'N', N'n') AND SUBSTRING(@trimmed, 2, 1) = N''''
+                SET @trimmed = SUBSTRING(@trimmed, 2, LEN(@trimmed));
             IF LEFT(@trimmed, 1) = N''''
             BEGIN
                 -- Pull literal until non-escaped closing quote.
@@ -2091,6 +2220,9 @@ BEGIN
             IF @c1 > 0
             BEGIN
                 DECLARE @rest NVARCHAR(MAX) = LTRIM(SUBSTRING(@trimmed, @c1 + 1, LEN(@trimmed)));
+                -- tolerate an N'...' nvarchar literal prefix
+                IF LEFT(@rest, 1) IN (N'N', N'n') AND SUBSTRING(@rest, 2, 1) = N''''
+                    SET @rest = SUBSTRING(@rest, 2, LEN(@rest));
                 IF LEFT(@rest, 1) = N''''
                 BEGIN
                     DECLARE @k INT = 2;
@@ -2558,22 +2690,24 @@ GO
  * TestGen.ExtractLeafDml  (v9.4)
  * ---------------------------------------------------------------------------
  * Given a branch BODY block, decide whether the body unconditionally performs
- * exactly ONE table-DML statement (an UPDATE, or an INSERT ... VALUES) and, if
- * so, hand that statement back so the test generator can "replay" it onto a
- * snapshot of the seeded table (see DESIGN_v9_4_Strong_Assertions.md).
+ * exactly ONE table-DML statement (an UPDATE, an INSERT ... VALUES, an
+ * INSERT ... SELECT, or a single-target DELETE) and, if so, hand that statement
+ * back so the test generator can "replay" it onto a snapshot of the seeded
+ * table (see DESIGN_v9_4_Strong_Assertions.md + DESIGN_DML_Effect_Assertions.md).
  *
- *   @DmlKind   OUTPUT  'UPDATE' | 'INSERT' | NULL  (NULL = not a leaf body)
+ *   @DmlKind   OUTPUT  'UPDATE' | 'INSERT' | 'DELETE' | NULL  (NULL = not a leaf body)
  *   @DmlTable  OUTPUT  bare target table name (no schema, no brackets)
  *   @DmlText   OUTPUT  the raw DML statement, with the target-table reference
  *                      rewritten to the literal token  {{TARGET}}  so the
  *                      generator can re-point the replay at a temp snapshot.
  *
  * A body counts as a "leaf" only when, after stripping -- comments:
- *   - it contains exactly one UPDATE or INSERT (and no other),
- *   - no DELETE and no MERGE,
+ *   - it contains exactly one UPDATE, INSERT or DELETE (and no other),
+ *   - no MERGE (deferred to phase 3),
  *   - no nested IF / WHILE (those make the DML path-dependent),
  *   - at most one BEGIN (the body's own outer BEGIN/END),
- *   - if it is an INSERT, it is not INSERT ... SELECT.
+ *   - if it is a DELETE, it has no JOIN (single-target only - a joined DELETE
+ *     carries two table references the single-target replay cannot handle).
  * Anything else returns @DmlKind = NULL and the generator falls back to the
  * weaker coverage/smoke assertion.
  *****************************************************************************/
@@ -2628,16 +2762,19 @@ BEGIN
     SET @bgCnt = (DATALENGTH(@u) - DATALENGTH(REPLACE(@u, N'BEGIN ',  N''))) / (6 * 2);
     SET @ifCnt = (DATALENGTH(@u) - DATALENGTH(REPLACE(@u, N'IF ',     N''))) / (3 * 2);
 
-    IF @uCnt + @iCnt <> 1 RETURN;
-    IF @dCnt > 0 OR @mCnt > 0 RETURN;
+    -- exactly one of UPDATE / INSERT / DELETE (MERGE deferred to phase 3)
+    IF @uCnt + @iCnt + @dCnt <> 1 RETURN;
+    IF @mCnt > 0 RETURN;
     IF @ifCnt > 0 OR @whCnt > 0 RETURN;
     IF @bgCnt > 1 RETURN;
 
     -- 3. locate the single DML statement
     IF @uCnt = 1
     BEGIN SET @DmlKind = 'UPDATE'; SET @kwPos = CHARINDEX(N'UPDATE ', @u); END
-    ELSE
+    ELSE IF @iCnt = 1
     BEGIN SET @DmlKind = 'INSERT'; SET @kwPos = CHARINDEX(N'INSERT ', @u); END
+    ELSE
+    BEGIN SET @DmlKind = 'DELETE'; SET @kwPos = CHARINDEX(N'DELETE ', @u); END
 
     IF @kwPos = 0 BEGIN SET @DmlKind = NULL; RETURN; END;
 
@@ -2653,17 +2790,23 @@ BEGIN
     END;
     SET @DmlText = LTRIM(RTRIM(SUBSTRING(@blk, @kwPos, @stmtEnd - @kwPos)));
 
-    -- 4. INSERT ... SELECT cannot be replayed as a literal VALUES insert
-    IF @DmlKind = 'INSERT' AND CHARINDEX(N'SELECT', UPPER(@DmlText)) > 0
+    -- 4. shape guards on the captured statement.
+    --    INSERT ... SELECT is now supported (the replay snapshots the target
+    --    and replays the INSERT...SELECT onto it).  A DELETE ... JOIN form,
+    --    however, carries two table references, which the {{TARGET}} rewrite +
+    --    single-target whole-table replay cannot handle - reject it.
+    IF @DmlKind = 'DELETE' AND CHARINDEX(N' JOIN ', UPPER(@DmlText)) > 0
     BEGIN
         SET @DmlKind = NULL; SET @DmlText = NULL; RETURN;
     END;
 
     -- 5. parse the target table token (after UPDATE, or INSERT [INTO])
-    SET @tblPos = @kwPos + 7;            -- past 'UPDATE ' / 'INSERT '
+    SET @tblPos = @kwPos + 7;            -- past 'UPDATE ' / 'INSERT ' / 'DELETE '
     WHILE @tblPos <= @blkLen AND SUBSTRING(@blk,@tblPos,1) IN (N' ',CHAR(9),CHAR(10),CHAR(13))
         SET @tblPos = @tblPos + 1;
+    -- skip the optional INTO (INSERT) / FROM (DELETE) keyword to reach the table
     IF UPPER(SUBSTRING(@blk,@tblPos,5)) = N'INTO '
+    OR UPPER(SUBSTRING(@blk,@tblPos,5)) = N'FROM '
     BEGIN
         SET @tblPos = @tblPos + 5;
         WHILE @tblPos <= @blkLen AND SUBSTRING(@blk,@tblPos,1) IN (N' ',CHAR(9),CHAR(10),CHAR(13))
@@ -2693,6 +2836,184 @@ END;
 GO
 
 PRINT 'TestGen.ExtractLeafDml created (v9.4 - leaf body-DML capture).';
+GO
+
+/*****************************************************************************
+ * TestGen.CaptureExpectedCounts  (DML effect assertions, phase 2)
+ * ---------------------------------------------------------------------------
+ * Runs a test's exact Arrange (SafeFakeTable + reverse-seed) + the procedure
+ * once, inside the GENERATOR's own transaction, and reports each faked table's
+ * row count BEFORE and AFTER the call.  The transaction is rolled back, so the
+ * fakes / seed / writes are all undone and the real tables are restored; the
+ * counts survive the rollback because they live in a TABLE VARIABLE.
+ *
+ * The generator uses the returned counts to bake EXACT per-table assertions
+ * into the "touches only mocked tables" test (the count-changing case), instead
+ * of the weaker "at least one table changed" heuristic, and to SkipTest +
+ * highlight when the seed drives no write at all.  See
+ * design/DESIGN_DML_Effect_Assertions.md.
+ *
+ *   @SetupBlock   the test's Arrange: SafeFakeTable calls + seed INSERTs (==@MockBlock)
+ *   @OutputDecls  DECLAREs for the proc's OUTPUT params (== @OutputDecls)
+ *   @FullProc     [schema].[proc]
+ *   @ArgListHappy the happy-path argument list (incl. ... OUTPUT)
+ *   @TablesCsv    comma-delimited full table names to count: [dbo].[A],[dbo].[B]
+ *   @ResultCsv    OUTPUT  'fullname@B=<n>|fullname@A=<n>|...'  (NULL on skip/err)
+ *   @CapErr       OUTPUT  NULL on clean capture; a reason string otherwise
+ *
+ * Safety:
+ *   - Only captures from a NON-transactional context, so its ROLLBACK fully and
+ *     safely discards everything (never unwinds a caller's transaction).
+ *   - Outer + inner TRY/CATCH: any error -> @CapErr set, @ResultCsv NULL, the
+ *     generator falls back to the heuristic.  Never throws, never corrupts.
+ *   - Non-transactional side effects (dbmail, sequences, xp_cmdshell, linked
+ *     server, global ##temp) are screened OUT by the generator BEFORE calling
+ *     this, because a ROLLBACK cannot undo them.
+ *****************************************************************************/
+IF OBJECT_ID('TestGen.CaptureExpectedCounts', 'P') IS NOT NULL
+    DROP PROCEDURE TestGen.CaptureExpectedCounts;
+GO
+
+CREATE PROCEDURE TestGen.CaptureExpectedCounts
+    @SetupBlock   NVARCHAR(MAX),
+    @OutputDecls  NVARCHAR(MAX),
+    @FullProc     NVARCHAR(300),
+    @ArgListHappy NVARCHAR(MAX),
+    @TablesCsv    NVARCHAR(MAX),
+    @ResultCsv    NVARCHAR(MAX) OUTPUT,
+    @CapErr       NVARCHAR(MAX) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET @ResultCsv = NULL;
+    SET @CapErr    = NULL;
+
+    -- Only safe to capture when not already inside a transaction: our ROLLBACK
+    -- must be free to discard the whole fake/seed/exec without touching a caller.
+    IF @@TRANCOUNT <> 0
+    BEGIN
+        SET @CapErr = N'skipped: capture requires a non-transactional context';
+        RETURN;
+    END;
+
+    IF @SetupBlock IS NULL OR LEN(LTRIM(RTRIM(ISNULL(@TablesCsv, N'')))) = 0
+    BEGIN
+        SET @CapErr = N'skipped: no setup block or table list';
+        RETURN;
+    END;
+
+    DECLARE @nl NVARCHAR(2) = NCHAR(13) + NCHAR(10);
+
+    -- Build the BEFORE / AFTER count-capture lines from the table list.
+    DECLARE @before NVARCHAR(MAX) = N'', @after NVARCHAR(MAX) = N'';
+    DECLARE @one NVARCHAR(300), @rest NVARCHAR(MAX) = @TablesCsv, @cpos INT;
+    WHILE LEN(@rest) > 0
+    BEGIN
+        SET @cpos = CHARINDEX(N',', @rest);
+        IF @cpos = 0 BEGIN SET @one = LTRIM(RTRIM(@rest)); SET @rest = N''; END
+        ELSE BEGIN SET @one = LTRIM(RTRIM(LEFT(@rest, @cpos - 1))); SET @rest = SUBSTRING(@rest, @cpos + 1, LEN(@rest)); END;
+        IF LEN(@one) > 0
+        BEGIN
+            SET @before = @before + N'    INSERT @cap SELECT ''B'', N''' + @one + N''', COUNT(*) FROM ' + @one + N';' + @nl;
+            SET @after  = @after  + N'    INSERT @cap SELECT ''A'', N''' + @one + N''', COUNT(*) FROM ' + @one + N';' + @nl;
+        END;
+    END;
+
+    -- Assemble the capture batch.  @cap (table variable) survives the ROLLBACK,
+    -- so the counts are read back through the OUTPUT param after everything else
+    -- is undone.  The procedure's own result set (if any) streams to the caller
+    -- harmlessly (the generator consumes PRINT/side-effects, not result sets).
+    DECLARE @batch NVARCHAR(MAX) =
+        N'SET NOCOUNT ON;' + @nl +
+        N'DECLARE @cap TABLE (Phase CHAR(1), FullName NVARCHAR(300), RowCnt INT);' + @nl +
+        N'DECLARE @tc0 INT = @@TRANCOUNT;' + @nl +
+        N'BEGIN TRY' + @nl +
+        N'  BEGIN TRAN;' + @nl +
+        @SetupBlock + @nl +
+        ISNULL(@OutputDecls, N'') + @nl +
+        @before +
+        N'  EXEC ' + @FullProc + N' ' + @ArgListHappy + N';' + @nl +
+        @after +
+        N'  IF @@TRANCOUNT > @tc0 ROLLBACK TRAN;' + @nl +
+        N'END TRY' + @nl +
+        N'BEGIN CATCH' + @nl +
+        N'  IF @@TRANCOUNT > @tc0 ROLLBACK TRAN;' + @nl +
+        N'  SET @CapErrOut = N''capture run error: '' + ERROR_MESSAGE();' + @nl +
+        N'END CATCH;' + @nl +
+        N'SELECT @ResultCsvOut = ISNULL(@ResultCsvOut, N'''') + FullName + N''@'' + Phase + N''='' + CAST(RowCnt AS NVARCHAR(12)) + N''|'' FROM @cap;';
+
+    BEGIN TRY
+        EXEC sys.sp_executesql @batch,
+             N'@ResultCsvOut NVARCHAR(MAX) OUTPUT, @CapErrOut NVARCHAR(MAX) OUTPUT',
+             @ResultCsvOut = @ResultCsv OUTPUT, @CapErrOut = @CapErr OUTPUT;
+    END TRY
+    BEGIN CATCH
+        -- A parse/compile error in the dynamic batch (seed shape, etc.) - never fatal.
+        SET @CapErr    = N'capture batch error: ' + ERROR_MESSAGE();
+        SET @ResultCsv = NULL;
+    END CATCH;
+
+    -- Defensive: if the batch left us in a transaction, unwind it.
+    IF @@TRANCOUNT <> 0 ROLLBACK;
+END;
+GO
+
+PRINT 'TestGen.CaptureExpectedCounts created (DML effect assertions - phase 2 capture).';
+GO
+
+/*****************************************************************************
+ * TestGen.ProbeHappyPath
+ * ---------------------------------------------------------------------------
+ * Runs a test's Arrange (SafeFakeTable + seed) + the procedure with the
+ * happy-path args ONCE inside the generator's own transaction, rolled back,
+ * and returns the error message the procedure raised (NULL if it ran clean).
+ * Used to detect when the generated happy-path inputs do not satisfy the
+ * procedure's own input validation, so the happy-path-success tests can be
+ * SkipTest-annotated (honest silence) rather than failing by construction.
+ * Same safety model as CaptureExpectedCounts (non-transactional context only).
+ *****************************************************************************/
+IF OBJECT_ID('TestGen.ProbeHappyPath', 'P') IS NOT NULL
+    DROP PROCEDURE TestGen.ProbeHappyPath;
+GO
+
+CREATE PROCEDURE TestGen.ProbeHappyPath
+    @SetupBlock   NVARCHAR(MAX),
+    @OutputDecls  NVARCHAR(MAX),
+    @FullProc     NVARCHAR(300),
+    @ArgListHappy NVARCHAR(MAX),
+    @ErrMsg       NVARCHAR(MAX) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET @ErrMsg = NULL;
+    IF @@TRANCOUNT <> 0 RETURN;          -- only from a clean context (rollback must be free)
+    IF @SetupBlock IS NULL RETURN;
+
+    DECLARE @nl NVARCHAR(2) = NCHAR(13) + NCHAR(10);
+    DECLARE @batch NVARCHAR(MAX) =
+        N'SET NOCOUNT ON;' + @nl +
+        N'DECLARE @tc0 INT = @@TRANCOUNT;' + @nl +
+        N'BEGIN TRY' + @nl +
+        N'  BEGIN TRAN;' + @nl +
+        @SetupBlock + @nl + ISNULL(@OutputDecls, N'') + @nl +
+        N'  EXEC ' + @FullProc + N' ' + @ArgListHappy + N';' + @nl +
+        N'  IF @@TRANCOUNT > @tc0 ROLLBACK TRAN;' + @nl +
+        N'END TRY' + @nl +
+        N'BEGIN CATCH' + @nl +
+        N'  IF @@TRANCOUNT > @tc0 ROLLBACK TRAN;' + @nl +
+        N'  SET @ErrOut = ERROR_MESSAGE();' + @nl +
+        N'END CATCH;';
+    BEGIN TRY
+        EXEC sys.sp_executesql @batch, N'@ErrOut NVARCHAR(MAX) OUTPUT', @ErrOut = @ErrMsg OUTPUT;
+    END TRY
+    BEGIN CATCH
+        SET @ErrMsg = N'probe batch error: ' + ERROR_MESSAGE();
+    END CATCH;
+    IF @@TRANCOUNT <> 0 ROLLBACK;
+END;
+GO
+
+PRINT 'TestGen.ProbeHappyPath created (happy-path validation probe for honest-skip).';
 GO
 
 IF OBJECT_ID('TestGen.AnalyzeBranchPaths', 'P') IS NOT NULL
@@ -4736,6 +5057,8 @@ BEGIN
 
         DECLARE @pname SYSNAME, @ptype SYSNAME, @pmax SMALLINT, @pprec TINYINT, @pscale TINYINT,
                 @pout BIT, @pnull BIT, @pid INT;
+        DECLARE @pIsTvp BIT, @pTypeSchema SYSNAME;   -- table-valued parameter support
+        DECLARE @tvpVar SYSNAME, @tvpSetup NVARCHAR(MAX);
 
         -- These must live outside the loop body. T-SQL evaluates a
         -- DECLARE @x = <expr> initializer ONCE, on first encounter,
@@ -4745,14 +5068,33 @@ BEGIN
         DECLARE @mCharLen INT, @mTarget INT, @mRaw NVARCHAR(220);   -- v11.x: matched-key arg row-1 seed value
 
         DECLARE pcur CURSOR LOCAL FAST_FORWARD FOR
-            SELECT ParamId, ParamName, SqlTypeName, MaxLength, [Precision], Scale, IsOutput, IsNullable
+            SELECT ParamId, ParamName, SqlTypeName, MaxLength, [Precision], Scale, IsOutput, IsNullable,
+                   IsTableType, TypeSchema
             FROM @Params
             ORDER BY ParamId;
         OPEN pcur;
-        FETCH NEXT FROM pcur INTO @pid, @pname, @ptype, @pmax, @pprec, @pscale, @pout, @pnull;
+        FETCH NEXT FROM pcur INTO @pid, @pname, @ptype, @pmax, @pprec, @pscale, @pout, @pnull, @pIsTvp, @pTypeSchema;
         WHILE @@FETCH_STATUS = 0
         BEGIN
-            IF @pout = 1
+            IF @pIsTvp = 1
+            BEGIN
+                -- Table-valued parameter: construct + seed a table variable of the
+                -- type and pass it (it cannot be NULL or a scalar).  The tables the
+                -- proc writes these rows into are faked (FKs dropped), so type-valid
+                -- rows suffice; if the proc validates the TVP contents and the seed
+                -- doesn't satisfy it, the happy-path probe honest-skips (no false red).
+                SET @tvpVar   = N'@tvp_' + REPLACE(REPLACE(@pname, N'@', N''), N' ', N'_');
+                SET @tvpSetup = NULL;
+                EXEC TestGen.BuildTvpSetup @pTypeSchema, @ptype, @tvpVar, @tvpSetup OUTPUT;
+                IF @tvpSetup IS NOT NULL
+                BEGIN
+                    SET @OutputDecls     = @OutputDecls + @tvpSetup;   -- flows to all tests + probe + capture
+                    SET @ArgListHappy    = @ArgListHappy    + N', ' + @pname + N' = ' + @tvpVar;
+                    SET @ArgListBoundary = @ArgListBoundary + N', ' + @pname + N' = ' + @tvpVar;
+                    SET @ArgListHighBnd  = @ArgListHighBnd  + N', ' + @pname + N' = ' + @tvpVar;
+                END;
+            END
+            ELSE IF @pout = 1
             BEGIN
                 SET @HasOutput = 1;
                 SET @OutputDecls = @OutputDecls + N'    DECLARE ' + @pname + N'_out '
@@ -4829,7 +5171,7 @@ BEGIN
                 SET @ArgListHighBnd  = @ArgListHighBnd  + N', ' + @pname + N' = '
                                        + TestGen.GetSampleValueLiteral(@ptype, @pmax, @pprec, @pscale, 2);
             END;
-            FETCH NEXT FROM pcur INTO @pid, @pname, @ptype, @pmax, @pprec, @pscale, @pout, @pnull;
+            FETCH NEXT FROM pcur INTO @pid, @pname, @ptype, @pmax, @pprec, @pscale, @pout, @pnull, @pIsTvp, @pTypeSchema;
         END;
         CLOSE pcur; DEALLOCATE pcur;
 
@@ -4846,22 +5188,15 @@ BEGIN
         DECLARE @MockBlock NVARCHAR(MAX) = N'';
 
         /* ------------------------------------------------------------------
-         * Emit ClearSchemaBoundReferences calls for the DISTINCT set of
-         * referenced tables that have schema-bound dependents. The helper
-         * skips referents already dropped by a sibling call, so noise is
-         * suppressed when two faked tables share a schema-bound view.
+         * Schema-bound dependents (WITH SCHEMABINDING views/functions, RLS
+         * SECURITY POLICY -> predicate function chains, persisted computed
+         * columns) are cleared by TestGen.SafeFakeTable itself, which walks the
+         * full dependency chain deepest-first (recursively, cycle-guarded, and
+         * SECURITY-POLICY-aware) just before it fakes each table.  The old
+         * upfront ClearSchemaBoundReferences emission was a single-level,
+         * non-SP-aware pre-pass - redundant with SafeFakeTable and a source of
+         * "Could not drop" noise on RLS chains - so it is intentionally retired.
          * -----------------------------------------------------------------*/
-        SELECT @MockBlock = @MockBlock
-            + N'    EXEC TestGen.ClearSchemaBoundReferences N''' + d.SchemaName + N'.' + d.ObjectName + N''';' + @CRLF
-        FROM @Deps d
-        WHERE d.DepKind IN ('TABLE','VIEW')
-          AND EXISTS
-          (
-              SELECT 1
-              FROM sys.sql_expression_dependencies sed
-              WHERE sed.referenced_id = OBJECT_ID(QUOTENAME(d.SchemaName) + N'.' + QUOTENAME(d.ObjectName))
-                AND sed.is_schema_bound_reference = 1
-          );
 
         /* ------------------------------------------------------------------
          * Inbound-FK cascade expansion.
@@ -5219,6 +5554,61 @@ BEGIN
         SET @S = @S + N'EXEC tSQLt.NewTestClass ''' + @TC + N''';' + @CRLF;
         SET @S = @S + N'GO' + @CRLF + @CRLF;
 
+        /* ------------------------------------------------------------------
+         * Honest-skip probe: if the procedure raises its OWN validation error
+         * on the generated happy-path inputs, the framework could not construct
+         * inputs that pass that validation - so the happy-path-success tests
+         * would FAIL by construction.  Detect it once (run the proc under the
+         * seed in a rolled-back transaction); if it raises a message matching a
+         * DETECTED main-flow guard, SkipTest-annotate those tests with a clear
+         * reason instead of failing them.  An UNEXPECTED error is left to fail,
+         * so genuine defects still surface.  @HappyCpList collects the per-test
+         * SkipTest insert points; they are stuffed just before the script runs.
+         * -----------------------------------------------------------------*/
+        DECLARE @HappySkipReason NVARCHAR(MAX) = NULL;
+        DECLARE @HappyCpList      NVARCHAR(MAX) = N'';
+        -- Probe-safe = a non-transactional context with no irreversible side effect,
+        -- so a gen-time happy/boundary/NULL probe can run + rollback cleanly.
+        DECLARE @ProbeSafe BIT =
+            CASE WHEN @@TRANCOUNT = 0
+                  AND @SrcU NOT LIKE N'%SP[_]SEND[_]DBMAIL%' AND @SrcU NOT LIKE N'%NEXT VALUE FOR%'
+                  AND @SrcU NOT LIKE N'%XP[_]CMDSHELL%'      AND @SrcU NOT LIKE N'%OPENROWSET%'
+                  AND @SrcU NOT LIKE N'%OPENQUERY%'          AND @SrcU NOT LIKE N'%##%'
+                 THEN 1 ELSE 0 END;
+        DECLARE @AcceptsCpList NVARCHAR(MAX) = N'';
+        DECLARE @AcceptsReason NVARCHAR(MAX) =
+            N'UnitAutogen generated a boundary or NULL value that is outside this '
+          + N'procedure''s accepted input domain (the procedure raised an error on it '
+          + N'at generation time).  This is not necessarily a defect - supply a custom '
+          + N'test with in-domain values, then remove this annotation.';
+        IF @HasErrorPaths = 1 AND @@TRANCOUNT = 0
+           AND @SrcU NOT LIKE N'%SP[_]SEND[_]DBMAIL%' AND @SrcU NOT LIKE N'%NEXT VALUE FOR%'
+           AND @SrcU NOT LIKE N'%XP[_]CMDSHELL%'      AND @SrcU NOT LIKE N'%OPENROWSET%'
+           AND @SrcU NOT LIKE N'%OPENQUERY%'          AND @SrcU NOT LIKE N'%##%'
+        BEGIN
+            DECLARE @HappyErr NVARCHAR(MAX) = NULL;
+            EXEC TestGen.ProbeHappyPath
+                 @SetupBlock   = @MockBlock,
+                 @OutputDecls  = @OutputDecls,
+                 @FullProc     = @FullProc,
+                 @ArgListHappy = @ArgListHappy,
+                 @ErrMsg       = @HappyErr OUTPUT;
+            IF @HappyErr IS NOT NULL
+               AND EXISTS (SELECT 1 FROM @Errors e
+                           WHERE e.MessagePattern IS NOT NULL
+                             AND @HappyErr LIKE e.MessagePattern)
+                SET @HappySkipReason =
+                    N'UnitAutogen could not generate happy-path inputs that satisfy this '
+                  + N'procedure''s own input validation - it raised: '
+                  + LEFT(@HappyErr, 220)
+                  + N'. The boundary/NULL "rejects" tests still verify the validation fires; '
+                  + N'supply a custom test with values that pass the guard to exercise the '
+                  + N'success path, then remove this annotation.';
+        END;
+        -- Test 1's SkipTest insert point (only when the happy path is blocked).
+        IF @HappySkipReason IS NOT NULL
+            SET @HappyCpList = @HappyCpList + CAST(DATALENGTH(@S) / 2 + 1 AS NVARCHAR(20)) + N',';
+
         /* -- Test 1: happy path ----------------------------------------- */
         SET @S = @S + N'CREATE PROCEDURE ' + QUOTENAME(@TC) + N'.[test ' + @ProcName + N' executes with valid inputs]' + @CRLF;
         SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF;
@@ -5252,6 +5642,13 @@ BEGIN
                 CASE WHEN @UseExpectExceptionForInvalid = 1 THEN N'rejects' ELSE N'accepts' END;
 
             -- Test 2a: low boundary
+            IF @UseExpectExceptionForInvalid = 0 AND @ProbeSafe = 1
+            BEGIN
+                DECLARE @probeErrLo NVARCHAR(MAX) = NULL;
+                EXEC TestGen.ProbeHappyPath @MockBlock, @OutputDecls, @FullProc, @ArgListBoundary, @probeErrLo OUTPUT;
+                IF @probeErrLo IS NOT NULL
+                    SET @AcceptsCpList = @AcceptsCpList + CAST(DATALENGTH(@S) / 2 + 1 AS NVARCHAR(20)) + N',';
+            END;
             SET @S = @S + N'CREATE PROCEDURE ' + QUOTENAME(@TC)
                        + N'.[test ' + @ProcName + N' ' + @boundaryVerb
                        + N' low boundary values]' + @CRLF;
@@ -5277,6 +5674,13 @@ BEGIN
             SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
 
             -- Test 2b: high boundary
+            IF @UseExpectExceptionForInvalid = 0 AND @ProbeSafe = 1
+            BEGIN
+                DECLARE @probeErrHi NVARCHAR(MAX) = NULL;
+                EXEC TestGen.ProbeHappyPath @MockBlock, @OutputDecls, @FullProc, @ArgListHighBnd, @probeErrHi OUTPUT;
+                IF @probeErrHi IS NOT NULL
+                    SET @AcceptsCpList = @AcceptsCpList + CAST(DATALENGTH(@S) / 2 + 1 AS NVARCHAR(20)) + N',';
+            END;
             SET @S = @S + N'CREATE PROCEDURE ' + QUOTENAME(@TC)
                        + N'.[test ' + @ProcName + N' ' + @boundaryVerb
                        + N' high boundary values]' + @CRLF;
@@ -5324,7 +5728,7 @@ BEGIN
         DECLARE @v100Char         NCHAR(1);
         DECLARE ncur CURSOR LOCAL FAST_FORWARD FOR
             SELECT ParamId, ParamName FROM @Params
-            WHERE IsNullable = 1 AND IsOutput = 0 AND @EmitNullChecks = 1;
+            WHERE IsNullable = 1 AND IsOutput = 0 AND IsTableType = 0 AND @EmitNullChecks = 1;
         OPEN ncur;
         FETCH NEXT FROM ncur INTO @nullParamId, @nullParamName;
         WHILE @@FETCH_STATUS = 0
@@ -5464,6 +5868,13 @@ BEGIN
             SET @NullVerb = CASE WHEN @UseExpectExceptionForInvalid = 1
                                  THEN N'rejects' ELSE N'accepts' END;
 
+            IF @UseExpectExceptionForInvalid = 0 AND @ProbeSafe = 1
+            BEGIN
+                DECLARE @probeErrNull NVARCHAR(MAX) = NULL;
+                EXEC TestGen.ProbeHappyPath @MockBlock, @OutputDecls, @FullProc, @ArgsNull, @probeErrNull OUTPUT;
+                IF @probeErrNull IS NOT NULL
+                    SET @AcceptsCpList = @AcceptsCpList + CAST(DATALENGTH(@S) / 2 + 1 AS NVARCHAR(20)) + N',';
+            END;
             SET @S = @S + N'CREATE PROCEDURE ' + QUOTENAME(@TC)
                        + N'.[test ' + @ProcName + N' ' + @NullVerb
                        + N' NULL for ' + @nullParamName + N']' + @CRLF;
@@ -5524,13 +5935,91 @@ BEGIN
             -- changes its (faked) tables' counts, so for it this is an isolation
             -- smoke test - it must run cleanly against faked + seeded copies of
             -- every dependency (the EXEC below is TRY/CATCH-guarded).
+
+            -- ============================================================
+            -- DML effect assertions (phase 2): for a count-CHANGING proc,
+            -- capture each faked table's EXACT before/after row count NOW by
+            -- running this test's own Arrange + the proc once inside the
+            -- generator's transaction (rolled back).  Used below to emit exact
+            -- per-table assertions instead of the "something changed" heuristic,
+            -- and to SkipTest + highlight when the seed drives no write at all.
+            -- The Arrange IS the test's reverse-predicate seed, so the capture
+            -- exercises exactly what the test will.  See
+            -- design/DESIGN_DML_Effect_Assertions.md.
+            -- ============================================================
+            DECLARE @ieCpPos    INT = DATALENGTH(@S) / 2 + 1;  -- SkipTest insert point (pre-CREATE)
+            DECLARE @ieCsv      NVARCHAR(MAX) = NULL, @ieErr NVARCHAR(MAX) = NULL;
+            DECLARE @ieSkip     NVARCHAR(MAX) = NULL;
+            DECLARE @ieCaptured BIT = 0;
+            DECLARE @ieCap TABLE (FullName NVARCHAR(300), Phase CHAR(1), Cnt INT);
+            IF @v94CountStable = 0
+            BEGIN
+                DECLARE @ieTbls NVARCHAR(MAX) = N'';
+                SELECT @ieTbls = @ieTbls
+                     + CASE WHEN LEN(@ieTbls) > 0 THEN N',' ELSE N'' END
+                     + QUOTENAME(SchemaName) + N'.' + QUOTENAME(ObjectName)
+                FROM @Deps WHERE DepKind IN ('TABLE','VIEW');
+
+                -- side-effect guard: never RUN a proc with non-transactional
+                -- effects at generation time (a ROLLBACK cannot undo these).
+                DECLARE @ieUnsafe BIT = 0;
+                IF @SrcU LIKE N'%SP[_]SEND[_]DBMAIL%' OR @SrcU LIKE N'%NEXT VALUE FOR%'
+                OR @SrcU LIKE N'%XP[_]CMDSHELL%'      OR @SrcU LIKE N'%OPENROWSET%'
+                OR @SrcU LIKE N'%OPENQUERY%'          OR @SrcU LIKE N'%##%'
+                    SET @ieUnsafe = 1;
+
+                IF @ieUnsafe = 0 AND LEN(@ieTbls) > 0
+                    EXEC TestGen.CaptureExpectedCounts
+                         @SetupBlock   = @MockBlock,
+                         @OutputDecls  = @OutputDecls,
+                         @FullProc     = @FullProc,
+                         @ArgListHappy = @ArgListHappy,
+                         @TablesCsv    = @ieTbls,
+                         @ResultCsv    = @ieCsv OUTPUT,
+                         @CapErr       = @ieErr OUTPUT;
+
+                IF @ieCsv IS NOT NULL AND @ieErr IS NULL
+                BEGIN
+                    -- parse 'full@B=n|full@A=n|...' into @ieCap
+                    DECLARE @ieTok NVARCHAR(400), @ieR NVARCHAR(MAX) = @ieCsv,
+                            @ieBar INT, @ieAt INT, @ieEq INT;
+                    WHILE LEN(@ieR) > 0
+                    BEGIN
+                        SET @ieBar = CHARINDEX(N'|', @ieR);
+                        IF @ieBar = 0 BEGIN SET @ieTok = @ieR; SET @ieR = N''; END
+                        ELSE BEGIN SET @ieTok = LEFT(@ieR, @ieBar - 1); SET @ieR = SUBSTRING(@ieR, @ieBar + 1, LEN(@ieR)); END;
+                        IF LEN(@ieTok) > 0
+                        BEGIN
+                            SET @ieAt = CHARINDEX(N'@', @ieTok);   -- full names are bracket-quoted, no '@'
+                            SET @ieEq = CHARINDEX(N'=', @ieTok);
+                            INSERT @ieCap (FullName, Phase, Cnt)
+                            VALUES (LEFT(@ieTok, @ieAt - 1),
+                                    SUBSTRING(@ieTok, @ieAt + 1, 1),
+                                    CAST(SUBSTRING(@ieTok, @ieEq + 1, 12) AS INT));
+                        END;
+                    END;
+                    SET @ieCaptured = 1;
+                    -- did ANY table change?  none -> the seed drove no write ->
+                    -- skip + highlight (honest "couldn't determine seed").
+                    IF NOT EXISTS (SELECT 1 FROM @ieCap b
+                                   JOIN @ieCap a ON a.FullName = b.FullName
+                                                AND a.Phase = 'A' AND b.Phase = 'B'
+                                   WHERE a.Cnt <> b.Cnt)
+                        SET @ieSkip = N'UnitAutogen could not determine a seed that drives this procedure''s INSERT/DELETE/MERGE - no faked table changed its row count during generation. Adjust the seed so it exercises the write, or correct the procedure; then remove this annotation. The expected per-table effects are written below for reference.';
+                END;
+            END;
+
             SET @S = @S + N'CREATE PROCEDURE ' + QUOTENAME(@TC)
                        + N'.[test ' + @ProcName + N' touches only mocked tables]' + @CRLF;
             SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF + @MockBlock + ISNULL(@OutputDecls, N'');
             SET @S = @S + N'    -- Capture row counts before execution' + @CRLF;
             SET @S = @S + N'    CREATE TABLE #v94_RcBefore (TableName SYSNAME, [RowCount] INT);' + @CRLF;
             SET @S = @S + N'    CREATE TABLE #v94_RcAfter  (TableName SYSNAME, [RowCount] INT);' + @CRLF;
-            IF @v94HasUpdate = 1
+            -- v0.9.13: capture content hashes for UPDATE procs (content-must-change)
+            -- AND for count-changing procs, so a net-zero count change - e.g. a
+            -- delete+insert (or balanced MERGE) that holds a table''s row count - is
+            -- still detected as a real modification via its content hash.
+            IF @v94HasUpdate = 1 OR @v94CountStable = 0
             BEGIN
                 SET @S = @S + N'    CREATE TABLE #v94_HashBefore (TableName SYSNAME, ContentHash INT);' + @CRLF;
                 SET @S = @S + N'    CREATE TABLE #v94_HashAfter  (TableName SYSNAME, ContentHash INT);' + @CRLF;
@@ -5549,7 +6038,7 @@ BEGIN
             BEGIN
                 SET @FullTable = QUOTENAME(@TableSchema) + N'.' + QUOTENAME(@TableName);
                 SET @S = @S + N'    INSERT #v94_RcBefore SELECT ''' + @TableName + N''', COUNT(*) FROM ' + @FullTable + N';' + @CRLF;
-                IF @v94HasUpdate = 1
+                IF @v94HasUpdate = 1 OR @v94CountStable = 0
                 BEGIN
                     SET @v94CcCols = N'';
                     SELECT @v94CcCols = @v94CcCols + N', ' + QUOTENAME(c.name)
@@ -5589,7 +6078,7 @@ BEGIN
             BEGIN
                 SET @FullTable = QUOTENAME(@TableSchema) + N'.' + QUOTENAME(@TableName);
                 SET @S = @S + N'    INSERT #v94_RcAfter SELECT ''' + @TableName + N''', COUNT(*) FROM ' + @FullTable + N';' + @CRLF;
-                IF @v94HasUpdate = 1
+                IF @v94HasUpdate = 1 OR @v94CountStable = 0
                 BEGIN
                     SET @v94CcCols = N'';
                     SELECT @v94CcCols = @v94CcCols + N', ' + QUOTENAME(c.name)
@@ -5643,19 +6132,84 @@ BEGIN
                     SET @S = @S + N'    END;' + @CRLF;
                 END;
             END
+            ELSE IF @ieCaptured = 1
+            BEGIN
+                -- DML effect assertions (phase 2): EXACT per-table row counts,
+                -- measured at generation time by running this test's own Arrange
+                -- + the proc once (rolled back).  Each faked table's count after
+                -- the seeded happy-path run must equal the measured value - this
+                -- pins the procedure's exact write footprint (a broken/removed
+                -- write under-counts; a stray write over-counts).  If no table
+                -- changed during capture the whole test carries a SkipTest
+                -- annotation (above) naming the gap.
+                SET @S = @S + N'    -- DML effect assertions: each faked table''s row count after the' + @CRLF;
+                SET @S = @S + N'    -- seeded happy-path run must equal the value measured when this' + @CRLF;
+                SET @S = @S + N'    -- test was generated (the procedure''s exact write footprint).' + @CRLF;
+                DECLARE @ieAn SYSNAME, @ieExp INT, @ieIdx INT = 0;
+                DECLARE iecur CURSOR LOCAL FAST_FORWARD FOR
+                    SELECT d.ObjectName, a.Cnt
+                    FROM @Deps d
+                    JOIN @ieCap a ON a.FullName = QUOTENAME(d.SchemaName) + N'.' + QUOTENAME(d.ObjectName)
+                                 AND a.Phase = 'A'
+                    WHERE d.DepKind IN ('TABLE','VIEW')
+                    ORDER BY d.ObjectName;
+                OPEN iecur;
+                FETCH NEXT FROM iecur INTO @ieAn, @ieExp;
+                WHILE @@FETCH_STATUS = 0
+                BEGIN
+                    SET @ieIdx = @ieIdx + 1;
+                    SET @S = @S + N'    DECLARE @v94eff' + CAST(@ieIdx AS NVARCHAR(6))
+                               + N' INT = (SELECT [RowCount] FROM #v94_RcAfter WHERE TableName = N'''
+                               + @ieAn + N''');' + @CRLF;
+                    SET @S = @S + N'    EXEC tSQLt.AssertEquals @Expected = ' + CAST(@ieExp AS NVARCHAR(12))
+                               + N', @Actual = @v94eff' + CAST(@ieIdx AS NVARCHAR(6))
+                               + N', @Message = N''Procedure''''s measured effect on '
+                               + REPLACE(@ieAn, NCHAR(39), NCHAR(39) + NCHAR(39))
+                               + N': expected exactly ' + CAST(@ieExp AS NVARCHAR(12))
+                               + N' row(s) after the seeded happy-path run.'';' + @CRLF;
+                    FETCH NEXT FROM iecur INTO @ieAn, @ieExp;
+                END;
+                CLOSE iecur; DEALLOCATE iecur;
+            END
             ELSE
             BEGIN
-                SET @S = @S + N'    -- INSERT/DELETE/MERGE procedure: row counts change by design, so a' + @CRLF;
-                SET @S = @S + N'    -- counts-held assertion would false-fail.  The isolation assertion is' + @CRLF;
-                SET @S = @S + N'    -- the TRY/CATCH around the EXEC above; the per-table delta below is' + @CRLF;
-                SET @S = @S + N'    -- printed for reference (exact content effect: see characterization scaffold).' + @CRLF;
+                SET @S = @S + N'    -- v0.9.13: INSERT/DELETE/MERGE procedure - a counts-HELD assertion would' + @CRLF;
+                SET @S = @S + N'    -- false-fail (counts change by design), but doing NOTHING is also wrong.' + @CRLF;
+                SET @S = @S + N'    -- It must change at least one faked table''s row count on the seeded happy' + @CRLF;
+                SET @S = @S + N'    -- path.  If none did, the seed did not drive the proc''s INSERT/DELETE/MERGE,' + @CRLF;
+                SET @S = @S + N'    -- or the DML was removed - both are real failures (this is the count-changing' + @CRLF;
+                SET @S = @S + N'    -- analog of the UPDATE content assertion).  Exact per-table +N delta is a' + @CRLF;
+                SET @S = @S + N'    -- later phase; this guarantees the modification is actually exercised.' + @CRLF;
+                SET @S = @S + N'    DECLARE @v94RcChanged INT =' + @CRLF;
+                SET @S = @S + N'        (SELECT COUNT(*) FROM #v94_RcBefore b' + @CRLF;
+                SET @S = @S + N'         JOIN #v94_RcAfter a ON a.TableName = b.TableName' + @CRLF;
+                SET @S = @S + N'         WHERE a.[RowCount] <> b.[RowCount])' + @CRLF;
+                SET @S = @S + N'      + (SELECT COUNT(*) FROM #v94_HashBefore hb' + @CRLF;
+                SET @S = @S + N'         JOIN #v94_HashAfter ha ON ha.TableName = hb.TableName' + @CRLF;
+                SET @S = @S + N'         WHERE ISNULL(ha.ContentHash,-2147483648) <> ISNULL(hb.ContentHash,-2147483648));' + @CRLF;
+                SET @S = @S + N'    DECLARE @v94RcChangedBit INT = CASE WHEN @v94RcChanged > 0 THEN 1 ELSE 0 END;' + @CRLF;
                 SET @S = @S + N'    DECLARE @v94IsoMsg NVARCHAR(MAX) = N'''';' + @CRLF;
                 SET @S = @S + N'    SELECT @v94IsoMsg = @v94IsoMsg + b.TableName + N'': '' + CAST(b.[RowCount] AS NVARCHAR(12))' + @CRLF;
                 SET @S = @S + N'                       + N'' -> '' + CAST(a.[RowCount] AS NVARCHAR(12)) + N''    ''' + @CRLF;
                 SET @S = @S + N'    FROM #v94_RcBefore b JOIN #v94_RcAfter a ON a.TableName = b.TableName;' + @CRLF;
                 SET @S = @S + N'    PRINT ''Faked-table row counts (before -> after): '' + ISNULL(@v94IsoMsg, N''(none)'');' + @CRLF;
+                SET @S = @S + N'    EXEC tSQLt.AssertEquals' + @CRLF;
+                SET @S = @S + N'         @Expected = 1,' + @CRLF;
+                SET @S = @S + N'         @Actual   = @v94RcChangedBit,' + @CRLF;
+                SET @S = @S + N'         @Message  = N''Procedure modifies data, but no faked table changed (row count or content) on the seeded happy path - the seed did not drive its INSERT/DELETE/MERGE, or the DML was removed.'';' + @CRLF;
             END;
             SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
+
+            -- skip-and-highlight: the proc modifies data but the seed drove no
+            -- write during capture.  Emit the complete test (assertions above,
+            -- for reference) but mark it Skipped, naming the gap so the developer
+            -- fixes the seed or the procedure.  Inserted just before this test's
+            -- CREATE PROCEDURE (quotes doubled so the annotation parser is happy).
+            -- skip the touches-only test when the seed drove no write (phase 2)
+            -- OR when the happy path could not satisfy the proc's validation.
+            IF @ieSkip IS NOT NULL OR @HappySkipReason IS NOT NULL
+                SET @S = STUFF(@S, @ieCpPos, 0,
+                    N'--[@tSQLt:SkipTest](''' + REPLACE(COALESCE(@ieSkip, @HappySkipReason), NCHAR(39), NCHAR(39) + NCHAR(39)) + N''')' + @CRLF);
         END;
 
         /* -- Test 5: dependent procedure calls (via SpyProcedure) -------
@@ -5768,6 +6322,8 @@ BEGIN
         /* -- Test 6: OUTPUT parameter shape ----------------------------- */
         IF @HasOutput = 1
         BEGIN
+            IF @HappySkipReason IS NOT NULL
+                SET @HappyCpList = @HappyCpList + CAST(DATALENGTH(@S) / 2 + 1 AS NVARCHAR(20)) + N',';
             SET @S = @S + N'CREATE PROCEDURE ' + QUOTENAME(@TC)
                        + N'.[test ' + @ProcName + N' assigns its OUTPUT parameters]' + @CRLF;
             SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF + @MockBlock + ISNULL(@OutputDecls, N'');
@@ -5926,7 +6482,14 @@ BEGIN
                        OR UPPER(@ProcSource) LIKE N'%NEWSEQUENTIALID%'
                        OR UPPER(@ProcSource) LIKE N'%RAND(%'
                      THEN 0 ELSE 1 END;
-            IF @CaptureRows = 1 AND @v94Deterministic = 1
+            -- A FOR JSON / FOR XML result set cannot be captured via INSERT ... EXEC
+            -- ("The FOR JSON clause is not allowed in an INSERT statement"), so the
+            -- row-baseline test would error.  Skip just that test for such procs.
+            DECLARE @v94JsonXml BIT =
+                CASE WHEN UPPER(@ProcSource) LIKE N'%FOR JSON%'
+                       OR UPPER(@ProcSource) LIKE N'%FOR XML%'
+                     THEN 1 ELSE 0 END;
+            IF @CaptureRows = 1 AND @v94Deterministic = 1 AND @v94JsonXml = 0
             BEGIN
                 -- Test 8: golden rows.
                 -- Build the #ActualResult column list from the captured shape.
@@ -5937,6 +6500,8 @@ BEGIN
                 FROM @ResultCols ORDER BY ColumnOrdinal;
                 SET @actualCols = STUFF(@actualCols, 1, 1, N'');
 
+                IF @HappySkipReason IS NOT NULL
+                    SET @HappyCpList = @HappyCpList + CAST(DATALENGTH(@S) / 2 + 1 AS NVARCHAR(20)) + N',';
                 SET @S = @S + N'CREATE PROCEDURE ' + QUOTENAME(@TC)
                            + N'.[test ' + @ProcName + N' returns rows matching baseline]' + @CRLF;
                 SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF + @MockBlock + ISNULL(@OutputDecls, N'');
@@ -6360,6 +6925,7 @@ BEGIN
                 DECLARE @v94InsNorm     NVARCHAR(MAX);
                 DECLARE @v94InsOp       INT;
                 DECLARE @v94InsCp       INT;
+                DECLARE @v94InsBound    INT;            -- col-list boundary (VALUES or SELECT, for INSERT...SELECT)
 
                 DECLARE pathidcur CURSOR LOCAL FAST_FORWARD FOR
                     -- v9.2: only iterate the OUTERMOST EXISTS_FALSE PathID
@@ -6829,7 +7395,8 @@ BEGIN
                         BEGIN
                             -- v9.4.2: a resolved body-DML target means this
                             -- path can carry the before/after delta assertion.
-                            IF @BodyDmlKind IN ('INSERT','UPDATE')
+                            -- (phase 2: DELETE joins INSERT/UPDATE here.)
+                            IF @BodyDmlKind IN ('INSERT','UPDATE','DELETE')
                                 SET @v94HasBodyDml = 1;
                             -- substitute proc parameters with the literal values
                             -- this test passes (longest names first so e.g.
@@ -6888,7 +7455,7 @@ BEGIN
                             IF @v94RU LIKE N'%RAND(%'  SET @v94HasRand  = 1;
 
                             SET @v94WherePos = 0;
-                            IF @BodyDmlKind = 'UPDATE'
+                            IF @BodyDmlKind IN ('UPDATE','DELETE')
                                 SET @v94WherePos = CHARINDEX(N' WHERE ', @v94RU);
                             SET @v94NdInWhere = 0;
                             IF @v94WherePos > 0
@@ -6928,8 +7495,16 @@ BEGIN
                                 BEGIN
                                     SET @v94InsOp = CHARINDEX(N'(', @BodyDmlText);
                                     SET @v94InsCp = CHARINDEX(N')', @BodyDmlText, @v94InsOp + 1);
+                                    -- the column list (if present) is the paren BEFORE the
+                                    -- VALUES or SELECT keyword.  INSERT...SELECT has no
+                                    -- VALUES, so bound by whichever keyword comes first.
+                                    SET @v94InsBound = CHARINDEX(N'VALUES', UPPER(@BodyDmlText));
+                                    IF @v94InsBound = 0 SET @v94InsBound = 2147483647;
+                                    IF CHARINDEX(N'SELECT', UPPER(@BodyDmlText)) > 0
+                                       AND CHARINDEX(N'SELECT', UPPER(@BodyDmlText)) < @v94InsBound
+                                        SET @v94InsBound = CHARINDEX(N'SELECT', UPPER(@BodyDmlText));
                                     IF @v94InsOp > 0 AND @v94InsCp > @v94InsOp + 1
-                                       AND @v94InsOp < CHARINDEX(N'VALUES', UPPER(@BodyDmlText))
+                                       AND @v94InsOp < @v94InsBound
                                     BEGIN
                                         SET @v94InsNorm = SUBSTRING(@BodyDmlText, @v94InsOp + 1, @v94InsCp - @v94InsOp - 1);
                                         SET @v94InsNorm = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
@@ -7047,6 +7622,18 @@ BEGIN
                             SET @S = @S + N'         @Expected = 1,' + @CRLF;
                             SET @S = @S + N'         @Actual   = @v94d_Grew,' + @CRLF;
                             SET @S = @S + N'         @Message  = ''INSERT branch: ' + @v94TargetFull + N' must gain a row from the procedure'';' + @CRLF;
+                        END
+                        ELSE IF @BodyDmlKind = 'DELETE'
+                        BEGIN
+                            -- phase 2: a DELETE branch must REMOVE at least one row from
+                            -- the target (the seed is arranged so the WHERE matches rows).
+                            SET @S = @S + N'    -- phase 2: the procedure (not the test) must DELETE from ' + @v94TargetFull + @CRLF;
+                            SET @S = @S + N'    DECLARE @v94d_CntAfter INT = (SELECT COUNT(*) FROM ' + @v94TargetFull + N');' + @CRLF;
+                            SET @S = @S + N'    DECLARE @v94d_Shrank INT = CASE WHEN @v94d_CntAfter < @v94d_CntBefore THEN 1 ELSE 0 END;' + @CRLF;
+                            SET @S = @S + N'    EXEC tSQLt.AssertEquals' + @CRLF;
+                            SET @S = @S + N'         @Expected = 1,' + @CRLF;
+                            SET @S = @S + N'         @Actual   = @v94d_Shrank,' + @CRLF;
+                            SET @S = @S + N'         @Message  = ''DELETE branch: ' + @v94TargetFull + N' must lose a row to the procedure'';' + @CRLF;
                         END
                         ELSE
                         BEGIN
@@ -7334,6 +7921,44 @@ BEGIN
             END;
             SET @TestsPreservedCount = (SELECT COUNT(*) FROM @Preserved);
 
+            -- Honest-skip: stamp the SkipTest annotation onto every recorded
+            -- happy-path test (proc raised its own validation error) AND every
+            -- boundary/NULL "accepts" test whose generated value the proc rejected.
+            -- All insertions are done in DESCENDING position order so earlier offsets
+            -- stay valid as text is inserted.
+            IF (@HappySkipReason IS NOT NULL AND LEN(@HappyCpList) > 0) OR LEN(@AcceptsCpList) > 0
+            BEGIN
+                DECLARE @AllSkips TABLE (Pos INT, Reason NVARCHAR(MAX));
+                DECLARE @skRest NVARCHAR(MAX), @skComma INT;
+                IF @HappySkipReason IS NOT NULL
+                BEGIN
+                    SET @skRest = @HappyCpList;
+                    WHILE LEN(@skRest) > 0
+                    BEGIN
+                        SET @skComma = CHARINDEX(N',', @skRest); IF @skComma = 0 BREAK;
+                        INSERT @AllSkips (Pos, Reason) VALUES (CAST(LEFT(@skRest, @skComma - 1) AS INT), @HappySkipReason);
+                        SET @skRest = SUBSTRING(@skRest, @skComma + 1, LEN(@skRest));
+                    END;
+                END;
+                SET @skRest = @AcceptsCpList;
+                WHILE LEN(@skRest) > 0
+                BEGIN
+                    SET @skComma = CHARINDEX(N',', @skRest); IF @skComma = 0 BREAK;
+                    INSERT @AllSkips (Pos, Reason) VALUES (CAST(LEFT(@skRest, @skComma - 1) AS INT), @AcceptsReason);
+                    SET @skRest = SUBSTRING(@skRest, @skComma + 1, LEN(@skRest));
+                END;
+                DECLARE @skPos INT, @skReason NVARCHAR(MAX);
+                DECLARE skCur CURSOR LOCAL FAST_FORWARD FOR SELECT Pos, Reason FROM @AllSkips ORDER BY Pos DESC;
+                OPEN skCur; FETCH NEXT FROM skCur INTO @skPos, @skReason;
+                WHILE @@FETCH_STATUS = 0
+                BEGIN
+                    SET @S = STUFF(@S, @skPos, 0,
+                        N'--[@tSQLt:SkipTest](''' + REPLACE(@skReason, NCHAR(39), NCHAR(39) + NCHAR(39)) + N''')' + @CRLF);
+                    FETCH NEXT FROM skCur INTO @skPos, @skReason;
+                END;
+                CLOSE skCur; DEALLOCATE skCur;
+            END;
+
             -- The generated script contains GO batch separators; use sp_executesql
             -- per-batch by splitting on GO.
             EXEC TestGen.ExecuteBatchedScript @Script = @S;
@@ -7506,6 +8131,12 @@ BEGIN
                      + N' was not found.';
         RETURN;
     END;
+
+    /* (TVP) Table-valued parameters are now CONSTRUCTED + seeded by the
+       generator (TestGen.BuildTvpSetup) and passed as a table variable, so they
+       no longer force NOT_TESTABLE.  If the proc validates the TVP contents and
+       the generated seed doesn't satisfy that, the happy-path probe honest-skips
+       the affected tests rather than failing. */
 
     /* v9.4.3 (parser limitation): the coverage instrumenter locates the
        executable body by finding the AS / BEGIN boundary line.  If no such
@@ -9458,31 +10089,43 @@ BEGIN
     DECLARE @phasdef     BIT;
     DECLARE @pout        BIT;
     DECLARE @pSuffix     NVARCHAR(50);
+    DECLARE @pIsTabType  BIT;
+    DECLARE @pTypeSchema SYSNAME;
 
     DECLARE pcov CURSOR LOCAL FAST_FORWARD FOR
-        SELECT p.name, t.name, p.max_length, p.precision, p.scale, p.has_default_value, p.is_output
+        SELECT p.name, t.name, p.max_length, p.precision, p.scale, p.has_default_value, p.is_output,
+               t.is_table_type, SCHEMA_NAME(t.schema_id)
         FROM   sys.parameters p
         JOIN   sys.types t ON p.user_type_id = t.user_type_id
         WHERE  p.object_id = OBJECT_ID(@FullName) AND p.parameter_id > 0
         ORDER BY p.parameter_id;
     OPEN pcov;
-    FETCH NEXT FROM pcov INTO @pname, @ptype, @pmax, @pprec, @pscale, @phasdef, @pout;
+    FETCH NEXT FROM pcov INTO @pname, @ptype, @pmax, @pprec, @pscale, @phasdef, @pout, @pIsTabType, @pTypeSchema;
     WHILE @@FETCH_STATUS = 0
     BEGIN
-        SET @pSuffix = N'';
-        IF @ptype IN ('varchar','nvarchar','char','nchar')
-            SET @pSuffix = N'(' + CASE WHEN @pmax=-1 THEN N'MAX'
-                WHEN @ptype IN ('nvarchar','nchar') THEN CAST(@pmax/2 AS NVARCHAR(10))
-                ELSE CAST(@pmax AS NVARCHAR(10)) END + N')';
-        ELSE IF @ptype IN ('decimal','numeric')
-            SET @pSuffix = N'('+CAST(@pprec AS NVARCHAR(5))+N','+CAST(@pscale AS NVARCHAR(5))+N')';
-
         IF LEN(@ParamList) > 0 SET @ParamList = @ParamList + N',' + CHAR(10);
-        SET @ParamList = @ParamList + N'    ' + @pname + N' ' + @ptype + @pSuffix;
-        IF @phasdef = 1 SET @ParamList = @ParamList + N' = NULL';
-        IF @pout    = 1 SET @ParamList = @ParamList + N' OUTPUT';
+        IF @pIsTabType = 1
+        BEGIN
+            -- A table-valued parameter must be schema-qualified and READONLY, or
+            -- the instrumented _cov copy won't compile (and coverage would fail).
+            SET @ParamList = @ParamList + N'    ' + @pname + N' '
+                           + QUOTENAME(@pTypeSchema) + N'.' + QUOTENAME(@ptype) + N' READONLY';
+        END
+        ELSE
+        BEGIN
+            SET @pSuffix = N'';
+            IF @ptype IN ('varchar','nvarchar','char','nchar')
+                SET @pSuffix = N'(' + CASE WHEN @pmax=-1 THEN N'MAX'
+                    WHEN @ptype IN ('nvarchar','nchar') THEN CAST(@pmax/2 AS NVARCHAR(10))
+                    ELSE CAST(@pmax AS NVARCHAR(10)) END + N')';
+            ELSE IF @ptype IN ('decimal','numeric')
+                SET @pSuffix = N'('+CAST(@pprec AS NVARCHAR(5))+N','+CAST(@pscale AS NVARCHAR(5))+N')';
+            SET @ParamList = @ParamList + N'    ' + @pname + N' ' + @ptype + @pSuffix;
+            IF @phasdef = 1 SET @ParamList = @ParamList + N' = NULL';
+            IF @pout    = 1 SET @ParamList = @ParamList + N' OUTPUT';
+        END;
 
-        FETCH NEXT FROM pcov INTO @pname, @ptype, @pmax, @pprec, @pscale, @phasdef, @pout;
+        FETCH NEXT FROM pcov INTO @pname, @ptype, @pmax, @pprec, @pscale, @phasdef, @pout, @pIsTabType, @pTypeSchema;
     END;
     CLOSE pcov; DEALLOCATE pcov;
 
@@ -15235,3 +15878,4 @@ BEGIN
     PRINT '****************************************************************';
 END
 GO
+                                                                                                                                                                                       
