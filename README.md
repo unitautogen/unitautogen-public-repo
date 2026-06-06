@@ -181,7 +181,7 @@ This is the **first public release** of UnitAutogen, labelled Beta because real-
 
 **What's coming next (your input shapes the order):**
 
-- Broader stored procedure pattern support (dynamic SQL, OUTPUT parameters, CLR)
+- Broader stored procedure pattern support (dynamic SQL, CLR)
 - SonarQube quality gate integration guide
 - NuGet package for easier pipeline consumption
 

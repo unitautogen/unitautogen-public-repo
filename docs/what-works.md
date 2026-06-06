@@ -66,14 +66,6 @@ assertion. Characterising result sets needs a separate feature (planned).
 single leaf DML statement fall back to smoke assertions for the same reason —
 the leaf-DML extractor is conservative.
 
-## Not yet supported
-
-**Dynamic SQL.** `EXEC sp_executesql` and `EXEC (@sql)` bodies are opaque to
-the parser; the framework will not generate per-branch tests for them. The
-procedure will likely be flagged NOT TESTABLE.
-
-**Triggers.** Out of scope for this release line.
-
 **Functions.** Scalar (`FN`), inline (`IF`) and multi-statement (`TF`)
 table-valued functions have generation and coverage support — see
 [functions.md](functions.md) — validated on AdventureWorks2025 (real line and
@@ -82,6 +74,20 @@ derived "shadow procedure" because a function body cannot host the coverage
 probe directly. As with procedures, branches the generated inputs don't reach
 are reported as honest gaps. Row/value characterization of a table-reading
 function still needs a manual blessed baseline (emitted as a `SkipTest`).
+
+**OUTPUT parameters.** Procedures with `OUTPUT` parameters are handled — they're
+passed correctly in the generated `EXEC` calls and a test confirms the procedure
+*assigns* its OUTPUT parameters. Asserting the exact returned *value* of each
+OUTPUT parameter is still being refined; today the generated test verifies the
+parameters are populated (shape), not yet their specific values.
+
+## Not yet supported
+
+**Dynamic SQL.** `EXEC sp_executesql` and `EXEC (@sql)` bodies are opaque to
+the parser; the framework will not generate per-branch tests for them. The
+procedure will likely be flagged NOT TESTABLE.
+
+**Triggers.** Out of scope for this release line.
 
 **Multi-database / cross-server procedures.** Procedures that reference objects
 in other databases or linked servers may parse but won't seed correctly.
