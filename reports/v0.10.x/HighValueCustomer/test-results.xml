@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="UnitAutogen" tests="20" failures="0" errors="0" skipped="1" timestamp="2026-06-05T12:19:10.539" hostname="HighValueCustomer">
+  <testsuite name="dbo" tests="20" failures="0" errors="0" skipped="1" time="0">
+    <testcase name="dbo.AssessCustomer" classname="dbo" time="0"></testcase>
+    <testcase name="dbo.GetVIPCustomerAnalyticsReport" classname="dbo" time="0"></testcase>
+  </testsuite>
+</testsuites>

@@ -7574,3 +7574,280 @@ across all three.
 RELEASE MECHANICS: ModuleVersion 0.10.0 (psd1); VERSION v0.10.0-beta; ReleaseNotes 2492
 chars (< 10600 PSGallery limit); installer root + powershell bundle copy identical + lint
 clean. Tag v0.10.0 to publish.
+
+## 2026-06-05 - FIX (post-0.10.0, queued for 0.10.1): single-proc/DB predicate-branch disconnect
+
+DANGEROUS DISCONNECT: only TestGen.GenerateAndCoverDatabase generated the seeded
+predicate-branch (data-shape) tests; the single-proc TestGen.GenerateAndRunCoverage never
+did. So running coverage on ONE procedure produced fewer tests + lower coverage than the
+database-wide run on the SAME procedure - a user would reasonably read that as a bug.
+
+FIX: GenerateAndRunCoverage now mirrors the database path exactly - (1) parse THIS proc's
+predicates (TestGen.ParseProcedurePredicates, single-proc CLR entry), (2) GenerateTestsFor
+Procedure, (3) GeneratePredicateBranchTests gated on PredicateInbox rows, (4) RunCoverage.
+Both the parse and the predicate-branch step are OBJECT_ID-guarded + TRY/CATCH, so the
+entry point degrades cleanly (string-gen branches) when the CLR parser isn't installed.
+
+VERIFIED: GenerateAndRunCoverage 'dbo','AssessCustomer' (HighValueCustomer) -> Step 1 parse,
+Step 2 generate, "emitted 6 predicate-branch test(s)", Step 3 coverage -> 12 tests / 12 pass
+- identical to the database-wide path (was 6 standard tests only before this fix).
+
+Not yet versioned/published (0.10.0 is live). Roll into a 0.10.1 patch.
+FILES: Install_UnitAutogen.sql (TestGen.GenerateAndRunCoverage), powershell/UnitAutogen/sql/
+Install_UnitAutogen.sql (synced), CHANGES.md.
+
+---
+
+## 2026-06-05 ÔÇö v0.11 Phase A step 1: numeric-oracle value-probe (search-based seeding)
+
+**Goal:** cover loop-local / coupled branch gates that the static reverse-seeder marks
+UNRECOGNISED (measured baseline on HighValueCustomer.dbo.usp_ReconcileTradedPositions: only
+1 of 13 branch gates resolves). Design: design/DESIGN_Search_Based_Seeding.md (hardest-first,
+driven by gate G5a: `@AdjustedValue>100000 AND @WavePatternPhase='C'` ÔÇö reachable only when an
+earlier AVG gate set Phase='C' AND a per-row product exceeds the threshold).
+
+**Mechanism proven:** error_reported XEvent + severity-0 `RAISERROR(... ,0,1) WITH NOWAIT`
+captures the substituted value, per loop iteration, AND survives ROLLBACK (spike: 3/3 values
+captured through a rolled-back tran). This is the numeric oracle the search needs.
+
+**Built (TestGen.InstrumentProcedure):** new optional `@ProbeMapJson NVARCHAR(MAX)=NULL`
+(JSON `[{"line":<stmtLine>,"locals":"@a,@b"}]`). For each mapped statement line the instrumented
+_cov emits `SET @__uap_val=CONCAT('__PROBE|<line>|@a=',CONVERT(NVARCHAR(40),@a),...); RAISERROR(...)`
+right after the statement, captured by error_reported. NULL (default) => byte-identical behaviour
+to before. One hoisted `DECLARE @__uap_val` (SET each fire ÔÇö no DECLARE-initializer-in-loop pitfall).
+
+**Bug the hard case exposed:** the G5a operand `@AdjustedValue` is a DECLARE-initialised local,
+and DECLARE lines are classified IsNoise (not statement-processed) when @CountDecl=0, so the
+probe never fired. Fix: a probed line is exempt from the DECLARE-noise rule so it goes through
+statement processing. (A SELECT-assigned operand like @MFI_Score never surfaced this ÔÇö exactly
+why we design for the hardest case first.)
+
+**Validated end-to-end on the real proc (HighValueCustomer):**
+- _cov compiles with @ProbeMapJson; probes injected for both line 42 (@MFI_Score, SELECT) and
+  line 99 (@AdjustedValue + @WavePatternPhase, DECLARE-initialised).
+- In-situ run under a seed engineered for the hardest arm captured:
+  `__PROBE|42|@MFI_Score=91` and `__PROBE|99|@AdjustedValue=300000.0000|@WavePatternPhase=C`.
+  => the numeric oracle reads the exact values that decide G2 and G5a, and G5a's coupled
+  cross-gate arm is provably reachable/seedable.
+
+Bundle powershell/UnitAutogen/sql/Install_UnitAutogen.sql re-synced from root (SHA256 identical).
+NEXT: TestGen.SearchSeedForGate (drive candidate seeds, read probe values, interpolate/descend),
+then path-prefix composition for G5a. Unreleased (0.11 WIP).
+
+---
+
+## 2026-06-05 ÔÇö v0.11 Phase A complete: search-based gate-seeding engine + driver
+
+Built on the validated numeric oracle (probe/error_reported). Two new procs folded into the
+installer (root + powershell bundle, SHA256 identical) and verified deploying from the installer:
+
+**TestGen.SearchSeedForGate** (the search core): given a gate operand + comparator/comparand +
+arrange-template ({KNOB}) + optional path-prefix, it probe-instruments _cov, runs candidate
+seeds in rolled-back trans under a private error_reported ring-buffer session, reads the operand
+value, and MEASURE-AND-INTERPOLATES (two extremes -> linear solve -> bisect, budget ~24) to a
+witness seed; honest NULL witness (NOT_TESTABLE) if exhausted. Validated on the real proc
+usp_ReconcileTradedPositions:
+  - G2 @MFI_Score > 80  -> witness; @MFI_Score < 20 -> witness (monotone)
+  - @MFI_Score BETWEEN 45 AND 55 -> interpolated to knob=50 (NON-MONOTONE interior; extremes miss)
+  - G5a @AdjustedValue > 100000 with Phase='C' prefix -> witness (COUPLED cross-gate arm reachable)
+
+**TestGen.SearchSeedForProc** + **TestGen.SearchSeedResult** (the gate-parser driver): for each
+UNRECOGNISED gate in PredicateInbox, auto-parses operand+comparator+comparand from the predicate
+text, finds the operand's aggregate assignment in the source (SELECT @x = AVG|SUM|MIN|MAX|COUNT
+(col) FROM tbl), auto-builds a permissive arrange row with the target column = {KNOB}, and drives
+SearchSeedForGate. Records WITNESS / NOT_TESTABLE / UNSUPPORTED per gate. Validated on
+usp_ReconcileTradedPositions: the 2 aggregate gates (L44,L49) auto-resolve to WITNESS with ZERO
+hand-feeding; the other 10 are honestly classed UNSUPPORTED (per-row product / scalar-from-table
+/ bare-param / env temp-guard ÔÇö other archetypes).
+
+Result: on a real production proc where the static seeder covered 1/13 branch gates, the search
+layer adds the aggregate-computed-local archetype automatically, and the engine (with a supplied
+prefix) covers the coupled cross-gate arm that no prior version could.
+
+HONEST BOUNDARY / NEXT: the driver auto-derives the AGGREGATE archetype; per-row-product (G5a-
+style) + loop-trip-count + scalar-from-table + bare-param archetypes are handled by the ENGINE
+but not yet auto-derived by the driver, and auto path-prefix construction for ancestor-guarded
+gates is the next layer (currently supplied). Wiring witnesses into GeneratePredicateBranchTests
+(emit the seed as a branch test; NOT_TESTABLE annotation otherwise) is the remaining integration.
+Unreleased (0.11 WIP).
+
+---
+
+## 2026-06-05 ÔÇö v0.11 driver extended: auto-reachability + scalar/nullcheck archetypes
+
+Extends the gate-parser driver so it runs with NO hand-fed inputs and covers more archetypes.
+Folded into the installer (root + bundle, SHA256 identical; section 20a_Reach + 20c driver),
+verified deploying from the installer.
+
+New: TestGen.BuildReachArgs (synth a permissive proc ARG LIST + var decls from sys.parameters)
+and TestGen.BuildReachPrefix (seed one permissive row into every referenced user table except the
+gate's target table). SearchSeedForProc now uses these automatically when @PrefixSql/@ArgList are
+not supplied, so the driver reaches gates on its own.
+
+New archetypes auto-derived: SCALAR (@x = col FROM tbl) and NULLCHK (@x IS [NOT] NULL over a
+scalar select), in addition to AGG. The assignment finder now reconstructs MULTI-LINE statements
+(the scalar SELECT @x = col / FROM tbl / WHERE... spans 3 lines) before parsing.
+
+Validated on usp_ReconcileTradedPositions, FULLY AUTOMATIC (no prefix/args supplied):
+  L27 @IsActiveAccount IS NULL -> NULLCHK/WITNESS
+  L32 @IsActiveAccount = 0     -> SCALAR/WITNESS (knob=0)
+  L44 @MFI_Score > 80          -> AGG/WITNESS
+  L49 @MFI_Score < 20          -> AGG/WITNESS
+  => 4 WITNESS / 8 UNSUPPORTED (per-row product / categorical / bare-param / env temp-guard).
+
+Bug found+fixed (the hard SCALAR case exposed it; the AGG case masked it): the driver parses the
+target table unquoted (dbo.Tbl) but BuildReachPrefix emits it quoted ([dbo].[Tbl]), so the
+"exclude target table" check never matched -> the prefix ALSO seeded the target table, and on a
+NON-identity PK (TradingAccounts.AccountID) the arrange row collided -> arrange INSERT failed ->
+proc never ran -> false NOT_TESTABLE. MarketIndicators' identity PK hid it. Fixed: quoting-
+insensitive exclude compare.
+
+NEXT (still): per-row-product (G5a) / categorical / bare-param / loop-trip archetype auto-
+derivation; wiring witnesses into GeneratePredicateBranchTests. Unreleased (0.11 WIP).
+
+---
+
+## 2026-06-05 ÔÇö v0.11 gate-parser COMPLETE: per-row, coupled, recursive-prefix archetypes
+
+Finishes the search-based gate parser. Folded into the installer (root + bundle, SHA256
+identical, deploys clean). New TestGen.BuildQualifyingRow (seed ONE row satisfying the loop's
+source WHERE, with driving-column overrides). SearchSeedForProc extended with:
+  - loop-source detection (INTO #tmp FROM realtbl WHERE preds) + per-row column lineage
+    (operand -> #temp col -> real col, through products of locals),
+  - PARAM archetype (bare @param gate; covered by the arg + loop reach),
+  - PER-ROW numeric (drive a real column -> probe the operand -> interpolate),
+  - PER-ROW categorical (@x = 'lit' -> seed the column to the literal),
+  - ENCLOSING per-row branch conditions via BEGIN/END depth tracking (the gate sits inside
+    IF @CurrentDirection='S' -> the seed must set TradeDirection='S' or the arm never runs),
+  - RECURSIVE PREFIX for coupled flags (@AdjustedValue>100000 AND @WavePatternPhase='C' ->
+    find SET @WavePatternPhase='C' -> its enclosing IF @MFI_Score>80 -> reuse THAT gate's
+    witness seed as the prefix that establishes Phase='C'),
+  - ENVIRONMENTAL gates (OBJECT_ID / @@var / GETDATE) -> honest NOT_TESTABLE.
+
+RESULT on usp_ReconcileTradedPositions, FULLY AUTOMATIC: all 12 previously-UNRECOGNISED gates
+accounted for -> 11 WITNESS + 1 honest NOT_TESTABLE (the #temp OBJECT_ID guard). With the 1
+gate the static seeder already covered, the proc goes from 1/13 to 13/13 gates handled.
+
+NO-GHOST verification (the headline): the coupled G5a witness was RUN against the real proc and
+confirmed to fire the actual arm -- mfiAvg=580 (Phase='C'), DryRunAuditLog status =
+HOLD_RISK_LIMIT. Two ghost-witness bugs found+fixed during verification: (1) the per-row numeric
+WitnessArrange omitted the recursive prefix, so the recorded seed didn't establish Phase='C';
+(2) the flag-SET finder matched MAX(SET @flag=...) = the last assignment ('B'), not the one
+assigning the demanded literal ('C') -> now matches the specific literal. Also fixed: the column-
+lineage finder matched the gate line itself (the '=' inside '<=') -> restricted to assignment
+lines strictly before the gate.
+
+Unreleased (0.11 WIP). REMAINING: wire witnesses into GeneratePredicateBranchTests (emit each
+seed as an actual branch test / NOT_TESTABLE annotation); broaden no-ghost auto-verification to
+every witness; exercise on a 2nd/3rd proc + the pz fixtures.
+
+---
+
+## 2026-06-05 ÔÇö v0.11 search-seed tests EMITTED + passing (end-to-end pipeline)
+
+TestGen.EmitSearchSeedTests (installer section 20d) turns SearchSeedResult witnesses into real
+tSQLt tests: FakeTable every referenced table, apply the reach prefix + the verified witness
+seed, EXEC the proc.  A gate whose TRUE arm RAISES (e.g. validation IS NULL -> RAISERROR) gets
+tSQLt.ExpectException; a NOT_TESTABLE gate gets a SkipTest annotation naming the honest reason.
+
+END-TO-END on usp_ReconcileTradedPositions, fully automatic:
+  ParseProcedurePredicates -> SearchSeedForProc (11 WITNESS + 1 NOT_TESTABLE) ->
+  EmitSearchSeedTests -> tSQLt.Run = 11 Success + 1 Skipped, 0 fail/err.
+The 11 include the coupled cross-gate G5a (HOLD_RISK_LIMIT) and L27 (IS NULL) which correctly
+ExpectException for its RAISERROR arm. So a proc the framework previously seeded 1/13 gates on
+now has 12 generated, passing branch tests + 1 honest skip.
+
+Folded into installer (root + bundle SHA256 identical, 20d deploys clean). Bug fixed: EXEC()
+forbids QUOTENAME() in its string -> pre-build the DROP into a variable + sp_executesql.
+
+REMAINING: broaden to a 2nd/3rd proc + the pz fixtures; optional per-test branch-coverage
+assertion (today the emitted test exercises the branch + asserts no unexpected error / expects
+the raise; the no-ghost guarantee is established at search time and re-confirmed by the suite
+passing). 0.11 still WIP/unreleased.
+
+---
+
+## 2026-06-05 ÔÇö v0.11 search-seeding WIRED INTO THE SWEEP (coverage 36.7% -> 83.3%)
+
+The search-seeding now runs as part of the standard sweep. GenerateAndRunCoverage (single-proc)
+and GenerateAndCoverDatabase + ...V10 (db sweep) call, right after GeneratePredicateBranchTests
+and before RunCoverage:
+    EXEC TestGen.SearchSeedForProc ...;
+    EXEC TestGen.EmitSearchSeedTests ... @TestClass='test_'+proc, @DedupSkips=1;
+Fully TRY/CATCH-isolated - a search failure can never break the sweep.
+
+EmitSearchSeedTests sweep mode (@DedupSkips=1): emits witness tests into the SAME class as the
+predicate-branch tests, DROPS the predicate-branch NOT_TESTABLE skip for each witnessed line, and
+does NOT re-emit residue skips (the environmental ones stay). Switched FakeTable -> SafeFakeTable
+(handles schema-bound / RLS deps).
+
+VALIDATED end-to-end on usp_ReconcileTradedPositions via GenerateAndRunCoverage (real coverage
+path): line coverage 36.7% (11/30) -> 83.3% (25/30); tests 6 pass/14 skip -> 17 pass/3 skip/0
+fail-err. The 14 UNRECOGNISED-gate skips became 11 passing witness tests + 1 retained honest skip;
+base + seeded tests preserved. Clean teardown (CleanupInterruptedRuns ok).
+
+THREE bugs the integration surfaced + fixed: (1) `@TestClass = N'test_'+@p` is illegal as an EXEC
+param value (expression) -> pre-build into a variable; (2) EmitSearchSeedTests class-create guard
+`IF SCHEMA_ID IS NULL OR NOT EXISTS(... WHERE 1=0)` was ALWAYS true -> it called
+tSQLt.NewTestClass every time, which DROPS+recreates the class and wiped the base/predicate-branch
+tests when emitting into the shared sweep class -> create only when SCHEMA_ID IS NULL; (3) use
+SafeFakeTable not FakeTable. All 4 changed procs recompile clean; bundle SHA256 identical.
+
+TO APPLY: re-run Install_UnitAutogen.sql on the target DB, then the normal sweep
+(Invoke-UnitAutogen / GenerateAndCoverDatabase) picks it up automatically. 0.11 still WIP.
+
+---
+
+## 2026-06-06 ÔÇö v0.11 LOOPCOUNT archetype: pure loop-accumulator gates (pz.LoopLocalGate 0%->100%)
+
+The search engine now covers the LOOPCOUNT archetype - a gate on a loop ACCUMULATOR
+(SET @x = @x +/- k inside a WHILE) whose value = the loop trip count = COUNT over a seedable
+table.  The knob is the ROW COUNT of that table: detect the SET @x=@x+- accumulator + the
+enclosing WHILE..COUNT..FROM <tbl>, build an arrange that inserts {KNOB} permissive rows into
+<tbl>, probe @x at the accumulator line, search the count.  Both arms seeded (the comparator AND
+its negation) so the IF's TRUE and FALSE branches are both covered.
+
+VALIDATED end-to-end on AdventureWorks2025 pz.LoopLocalGate (IF @x>3 where @x=COUNT(pz.Orders)):
+0% -> 100% line (4/4), 3 pass / 2 skip / 0 fail-err.  The witness seeds 12 rows (@x=12>3, arm A)
+and 1 row (@x=1<=3, arm B).  This was the ORIGINAL motivating case for the whole search effort.
+
+COLLATION HARDENING (surfaced on AdventureWorks2025, whose DB collation Latin1_General_CI_AS <>
+the server default SQL_Latin1_General_CP1_CI_AS): a tempdb temp-table column (server collation)
+compared to a catalog column (db collation) - both implicit - conflicts. Fixed in the search
+helpers: #src.Txt and #w.Col -> COLLATE DATABASE_DEFAULT; OBJECTPROPERTYEX(...,'BaseType')='U' ->
+CAST(... AS NVARCHAR(20)) COLLATE DATABASE_DEFAULT = N'U' (OBJECTPROPERTYEX returns sql_variant,
+so CAST before COLLATE). EmitSearchSeedTests now includes the comparator in the test name so a
+both-directions gate yields two distinct tests. These make the whole search layer collation-safe.
+
+Bundle SHA256 identical. 0.11 still WIP.
+
+===============================================================================
+RELEASE v0.11.0-beta ÔÇö 2026-06-06
+===============================================================================
+Search-based gate seeding: the generator now covers branch gates the static
+reverse-seeder cannot invert (loop accumulators, per-row products, coupled
+cross-gate conditions, aggregate bands) via a numeric XEvent-probe oracle +
+measure-and-interpolate, emitting verified witness tests or honest NOT_TESTABLE.
+Wired into the standard sweep. Archetypes: AGG / SCALAR / NULLCHK / PARAM /
+PERROW(value+categorical) / COUPLED(recursive prefix) / LOOPCOUNT(row-count knob).
+Validated: HighValueCustomer usp_ReconcileTradedPositions 1/13->13/13 gates
+(36.7%->83.3% line, 18.8%->87.5% branch); AdventureWorks pz.LoopLocalGate 0->100%
+(DB 93.1%->96.6% line, 93.2%->97.3% branch); no regressions. Collation-safe.
+New procs: TestGen.SearchSeedForGate / SearchSeedForProc / EmitSearchSeedTests /
+BuildReachArgs / BuildReachPrefix / BuildQualifyingRow. See dated entries above.
+===============================================================================
+
+---
+
+## 2026-06-06 ÔÇö v0.11 honest-labelling fix: function deferral surfaces the real reason
+
+RunCoverageForFunction previously reported EVERY scalar/multi-statement-TVF coverage deferral as
+"instrumenter limitation - please report this function body", even when the true cause was an
+infrastructure limit on the shadow (system-versioned temporal table, full-text, memory-optimized,
+missing dependency). Now, when the shadow is NOT_TESTABLE, the deferral classification calls
+TestGen.AssessTestability on the shadow and surfaces THAT reason (with the actionable remediation,
+e.g. "turn SYSTEM_VERSIONING OFF"), both in the console and in CoverageResult.NotTestableReason
+(the HTML report tooltip). Validated on WideWorldImporters Website.CalculateCustomerPrice: was
+"instrumenter limitation - please report", now "depends on a system-versioned temporal table...".
+No false-report asking the user to report a non-bug. Folded into the v0.11.0 installer (not yet
+published), bundle SHA256 identical.

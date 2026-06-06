@@ -1,5 +1,5 @@
 ﻿@{
-    ModuleVersion     = '0.10.0'
+    ModuleVersion     = '0.11.0'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -39,6 +39,26 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
+## v0.11.0 (beta) — 2026-06-06
+
+SEARCH-BASED GATE SEEDING — the headline feature. Branch gates whose controlling value the
+static reverse-seeder cannot invert (loop accumulators, per-row products, coupled cross-gate
+conditions, aggregate bands) are now covered by a numeric oracle: the generator instruments the
+procedure, drives candidate seeds, reads the operand''s live value through an XEvent probe
+(rollback-immune, fires per loop iteration), and measure-and-interpolates the seed that lands
+each arm. A verified witness becomes a real tSQLt test; an unreachable / environmental gate is
+an honest NOT_TESTABLE. It runs automatically as part of the normal sweep.
+
+Archetypes auto-derived: aggregate-over-table, scalar-from-table, IS [NOT] NULL, bare parameter,
+per-row value, per-row categorical, COUPLED cross-gate (with a recursive prefix that reuses an
+ancestor gate''s witness to establish the flag), and LOOP-COUNT (a loop accumulator driven by
+the trip count over a seedable table — both arms seeded).
+
+Measured impact on real procedures: a coupled/per-row reconciliation procedure went from 1 of 13
+to 13 of 13 branch gates handled (36.7% -> 83.3% line); a loop-accumulator gate went 0% -> 100%.
+No regressions on already-covered procedures. The whole search layer is collation-safe (works on
+databases whose collation differs from the server default).
+
 ## v0.10.0 (beta) — 2026-06-05
 
 Major capability + honesty release. New capabilities:

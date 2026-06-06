@@ -321,5 +321,51 @@ BEGIN
 END;
 GO
 
+------------------------------------------------- HARD LOOP (search-based, v0.11)
+-- The minimal deterministic repro of the usp_ReconcileTradedPositions G5a mechanism:
+-- conditional accumulation into a NON-MONOTONE band. Only Status='SHIP' rows add to
+-- @sum (inner equality literal -> candidate value); the gate is a BETWEEN band, so
+-- extremes BOTH miss (0 rows undershoots, many/large overshoots). Covering IN_BAND
+-- needs the numeric oracle (measure @sum) + interpolate, not probe-the-extremes.
+GO
+CREATE OR ALTER PROCEDURE pz.HardLoopGate @Lo DECIMAL(10,2), @Hi DECIMAL(10,2)
+AS
+BEGIN
+    DECLARE @sum DECIMAL(10,2) = 0, @amt DECIMAL(10,2), @status NVARCHAR(20);
+    DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT Amount, Status FROM pz.Orders;
+    OPEN c; FETCH NEXT FROM c INTO @amt, @status;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        IF @status = N'SHIP' SET @sum = @sum + @amt;   -- only SHIP rows accumulate
+        FETCH NEXT FROM c INTO @amt, @status;
+    END
+    CLOSE c; DEALLOCATE c;
+    IF @sum BETWEEN @Lo AND @Hi                         -- non-monotone band
+        SELECT 'IN_BAND' AS Arm;
+    ELSE
+        SELECT 'OUT_OF_BAND' AS Arm;
+END;
+GO
+
+-- Honest-boundary twin: accumulation driven by UNSEEDABLE state (GETDATE). The
+-- oracle can measure @sum but no seedable axis moves it -> after budget B the engine
+-- must emit NOT_TESTABLE naming the gate (proves the no-ghost guarantee at the hard end).
+GO
+CREATE OR ALTER PROCEDURE pz.UnseedableLoopGate
+AS
+BEGIN
+    DECLARE @sum INT = 0, @i INT = 0;
+    WHILE @i < (SELECT COUNT(*) FROM pz.Orders)
+    BEGIN
+        SET @sum = @sum + DATEPART(MILLISECOND, SYSDATETIME());  -- unseedable
+        SET @i = @i + 1;
+    END
+    IF @sum > 100000
+        SELECT 'A' AS Arm;
+    ELSE
+        SELECT 'B' AS Arm;
+END;
+GO
+
 PRINT 'PredicateZoo procedures installed.';
 GO
