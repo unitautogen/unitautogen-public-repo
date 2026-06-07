@@ -1,5 +1,5 @@
 ﻿@{
-    ModuleVersion     = '0.11.1'
+    ModuleVersion     = '0.12.0'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -39,6 +39,19 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
+## v0.12.0 (beta) — 2026-06-07
+
+WHERE-AWARE BOUNDARY SEEDING. The in-database SQLCLR parser now lifts a guarded UPDATE/DELETE''s
+WHERE equalities (col = literal, col IN (...), AND-chained) into seed overrides, so the boundary
+test pre-seeds rows that actually satisfy the filter. A selective UPDATE/DELETE behind a loosened
+comparison operator (e.g. count > N silently changed to count >= N) is now caught even when the
+filter uses specific literal values -- not just unfiltered or sample-matching DML. Strictly
+additive and conservative: anything the parser cannot lift cleanly (OR, ranges, functions,
+subqueries, INSERT, multi-gate) seeds exactly as v0.11.1 -- never an error, never a false failure.
+Validated on AdventureWorks2025 including a 3-conjunct WHERE (Region = ''US'' AND Status IN (3,4)
+AND Priority = 9). NOTE: this release rebuilds the SQLCLR assembly (new trust hash) and adds a
+PredicateInbox column -- install BOTH Install_UnitAutogen.sql AND Install-UnitAutogenClr.SSMS.sql.
+
 ## v0.11.1 (beta) — 2026-06-07
 
 BOUNDARY-VALUE MUTATION DETECTION. Predicate-branch tests now catch comparison-operator

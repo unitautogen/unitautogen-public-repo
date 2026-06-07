@@ -47,6 +47,9 @@ BEGIN
         PredicateTreeJson NVARCHAR(MAX)   NULL,
         SeedPlanTrueJson  NVARCHAR(MAX)   NULL,
         SeedPlanFalseJson NVARCHAR(MAX)   NULL,
+        -- v0.12: seed overrides lifted from a guarded UPDATE/DELETE's WHERE so the
+        -- boundary test seeds rows the DML will hit. {"schema","table","overrides":[{"col","val"}]}.
+        BodyDmlSeedJson  NVARCHAR(MAX)    NULL,
         PredicateText    NVARCHAR(MAX)    NOT NULL,
         UnsupportedReason NVARCHAR(400)   NULL,
         ParserVersion    VARCHAR(32)      NULL,
@@ -99,6 +102,15 @@ BEGIN
             SeedPlanTrueJson  NVARCHAR(MAX) NULL,
             SeedPlanFalseJson NVARCHAR(MAX) NULL;
     PRINT 'TestGen.PredicateInbox: added v0.12 tree + seed-plan columns (upgrade).';
+END
+GO
+
+-- Upgrade-safe: add the v0.12 body-DML seed-overrides column to a pre-existing table.
+IF OBJECT_ID('TestGen.PredicateInbox','U') IS NOT NULL
+   AND COL_LENGTH('TestGen.PredicateInbox','BodyDmlSeedJson') IS NULL
+BEGIN
+    ALTER TABLE TestGen.PredicateInbox ADD BodyDmlSeedJson NVARCHAR(MAX) NULL;
+    PRINT 'TestGen.PredicateInbox: added BodyDmlSeedJson column (upgrade).';
 END
 GO
 
@@ -166,6 +178,7 @@ CREATE PROCEDURE TestGen.AddParsedPredicate
     @PredicateTreeJson NVARCHAR(MAX)= NULL,
     @SeedPlanTrueJson  NVARCHAR(MAX)= NULL,
     @SeedPlanFalseJson NVARCHAR(MAX)= NULL,
+    @BodyDmlSeedJson  NVARCHAR(MAX) = NULL,
     @UnsupportedReason NVARCHAR(400)= NULL,
     @ParserVersion    VARCHAR(32)   = NULL,
     @InboxId          INT           = NULL OUTPUT
@@ -181,13 +194,13 @@ BEGIN
         (SchemaName, ProcName, BranchId, StartLine, Context, Shape,
          AggregateColumn, Comparator, Comparand,
          TargetTablesJson, JoinsJson, WhereAstJson,
-         PredicateTreeJson, SeedPlanTrueJson, SeedPlanFalseJson,
+         PredicateTreeJson, SeedPlanTrueJson, SeedPlanFalseJson, BodyDmlSeedJson,
          PredicateText, UnsupportedReason, ParserVersion, RunId)
     VALUES
         (@SchemaName, @ProcName, @BranchId, @StartLine, @Context, @Shape,
          @AggregateColumn, @Comparator, @Comparand,
          @TargetTablesJson, @JoinsJson, @WhereAstJson,
-         @PredicateTreeJson, @SeedPlanTrueJson, @SeedPlanFalseJson,
+         @PredicateTreeJson, @SeedPlanTrueJson, @SeedPlanFalseJson, @BodyDmlSeedJson,
          @PredicateText, @UnsupportedReason, @ParserVersion, @RunId);
     SET @InboxId = SCOPE_IDENTITY();
 END;

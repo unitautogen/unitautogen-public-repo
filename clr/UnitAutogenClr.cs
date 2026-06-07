@@ -189,6 +189,97 @@ public static class UnitAutogenClr
         return null;
     }
 
+    // ---------------------------------------------------------------------
+    // v0.12: body-DML WHERE -> seed overrides. For a gate whose guarded branch
+    // is an UPDATE/DELETE with a WHERE of AND-chained "col = <literal>" and
+    // "col IN (<literals>)" conjuncts, lift those into seed overrides so the
+    // boundary test pre-seeds rows the DML will actually hit (otherwise generic
+    // sample rows don't match the filter and a loosened-operator mutation is
+    // missed). Conservative: anything not a literal-equality/IN is ignored, and
+    // an empty set yields null (-> generic seed; never an error, never a false
+    // failure). Returns {"schema","table","overrides":[{"col","val"}]} or null.
+    // ---------------------------------------------------------------------
+    private static SD.TSqlStatement FirstDmlStatement(SD.TSqlStatement s)
+    {
+        if (s == null) return null;
+        if (s is SD.UpdateStatement || s is SD.DeleteStatement) return s;
+        var blk = s as SD.BeginEndBlockStatement;
+        if (blk != null && blk.StatementList != null)
+            foreach (SD.TSqlStatement c in blk.StatementList.Statements)
+            { var d = FirstDmlStatement(c); if (d != null) return d; }
+        return null;
+    }
+
+    private static string ColName(SD.ColumnReferenceExpression c)
+    {
+        if (c == null || c.MultiPartIdentifier == null) return null;
+        var ids = c.MultiPartIdentifier.Identifiers;
+        return ids.Count > 0 ? ids[ids.Count - 1].Value : null;
+    }
+
+    private static void CollectEqOverrides(SD.BooleanExpression be, List<object> ov)
+    {
+        if (be == null) return;
+        var bp = be as SD.BooleanParenthesisExpression;
+        if (bp != null) { CollectEqOverrides(bp.Expression, ov); return; }
+        var bb = be as SD.BooleanBinaryExpression;
+        if (bb != null)
+        {
+            if (bb.BinaryExpressionType == SD.BooleanBinaryExpressionType.And)
+            { CollectEqOverrides(bb.FirstExpression, ov); CollectEqOverrides(bb.SecondExpression, ov); }
+            return; // OR -> cannot guarantee a single seeded row hits both arms; skip
+        }
+        var bc = be as SD.BooleanComparisonExpression;
+        if (bc != null && bc.ComparisonType == SD.BooleanComparisonType.Equals)
+        {
+            var col = bc.FirstExpression as SD.ColumnReferenceExpression;
+            string lit = (col != null) ? LiteralText(bc.SecondExpression) : null;
+            if (col == null) { col = bc.SecondExpression as SD.ColumnReferenceExpression; lit = (col != null) ? LiteralText(bc.FirstExpression) : null; }
+            string cn = ColName(col);
+            if (cn != null && lit != null) ov.Add(M("col", cn, "val", lit));
+            return;
+        }
+        var ip = be as SD.InPredicate;
+        if (ip != null && !ip.NotDefined && ip.Subquery == null && ip.Values != null && ip.Values.Count > 0)
+        {
+            var col = ip.Expression as SD.ColumnReferenceExpression;
+            string cn = ColName(col);
+            string lit = LiteralText(ip.Values[0]);
+            if (cn != null && lit != null) ov.Add(M("col", cn, "val", lit));
+            return;
+        }
+        // anything else (ranges, functions, subqueries, col=col) -> no override
+    }
+
+    private static string BodyDmlSeedJsonFor(SD.TSqlStatement thenStmt)
+    {
+        var stmt = FirstDmlStatement(thenStmt);
+        if (stmt == null) return null;
+        SD.SchemaObjectName tgt = null; SD.WhereClause where = null;
+        var upd = stmt as SD.UpdateStatement;
+        if (upd != null && upd.UpdateSpecification != null)
+        {
+            var t = upd.UpdateSpecification.Target as SD.NamedTableReference;
+            if (t != null) tgt = t.SchemaObject;
+            where = upd.UpdateSpecification.WhereClause;
+        }
+        var del = stmt as SD.DeleteStatement;
+        if (del != null && del.DeleteSpecification != null)
+        {
+            var t = del.DeleteSpecification.Target as SD.NamedTableReference;
+            if (t != null) tgt = t.SchemaObject;
+            where = del.DeleteSpecification.WhereClause;
+        }
+        if (tgt == null || where == null || where.SearchCondition == null) return null;
+        var ov = new List<object>();
+        CollectEqOverrides(where.SearchCondition, ov);
+        if (ov.Count == 0) return null;
+        var parts = tgt.Identifiers.Select(id => id.Value).ToList();
+        string tbl = parts[parts.Count - 1];
+        string sch = parts.Count >= 2 ? parts[parts.Count - 2] : "dbo";
+        return Json(M("schema", sch, "table", tbl, "overrides", ov));
+    }
+
     private static string QuoteIdent(string x)
     {
         if (x == null) return null;
@@ -859,7 +950,9 @@ public static class UnitAutogenClr
             if (ifs != null)
             {
                 branchId++;
-                rows.Add(Classify(ifs.Predicate, branchId, "IF", schema, proc, ifs.StartLine));
+                var ifRow = Classify(ifs.Predicate, branchId, "IF", schema, proc, ifs.StartLine);
+                ifRow["BodyDmlSeedJson"] = BodyDmlSeedJsonFor(ifs.ThenStatement);
+                rows.Add(ifRow);
                 VisitFragment(ifs.ThenStatement, "IF", schema, proc);
                 VisitFragment(ifs.ElseStatement, "IF", schema, proc);
                 return;
@@ -905,7 +998,7 @@ public static class UnitAutogenClr
                 "Shape", "UNRECOGNISED", "AggregateColumn", null, "Comparator", null, "Comparand", null,
                 "TargetTablesJson", "[]", "JoinsJson", null, "WhereAstJson", null,
                 "PredicateTreeJson", null, "SeedPlanTrueJson", null, "SeedPlanFalseJson", null, "PredicateTreeText", null,
-                "PredicateText", FragText(predicate), "UnsupportedReason", null);
+                "PredicateText", FragText(predicate), "UnsupportedReason", null, "BodyDmlSeedJson", null);
 
             // Inline single-assignment locals / expand conditional locals.
             SD.BooleanExpression workPred = predicate;
@@ -1444,6 +1537,7 @@ public static class UnitAutogenClr
             AddParam(cmd, "@SeedPlanTrueJson", r["SeedPlanTrueJson"]);
             AddParam(cmd, "@SeedPlanFalseJson", r["SeedPlanFalseJson"]);
             AddParam(cmd, "@UnsupportedReason", r["UnsupportedReason"]);
+            AddParam(cmd, "@BodyDmlSeedJson", r.ContainsKey("BodyDmlSeedJson") ? r["BodyDmlSeedJson"] : null);
             cmd.Parameters.AddWithValue("@ParserVersion", ParserSignature);
             var outp = cmd.Parameters.Add("@InboxId", SqlDbType.Int);
             outp.Direction = ParameterDirection.Output;

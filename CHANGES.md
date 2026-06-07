@@ -7948,3 +7948,41 @@ needs the pre-seeded generic rows to be affected by the DML -- a selective WHERE
 sample values don't match means no detection (NOT a false positive, just a miss); multi-gate
 procs still degrade to no boundary assertion. Note: the released installer ships these
 changes UNINSTALLED until re-pushed; regression-test by installing on a fresh DB + sweep.
+
+---
+
+## 2026-06-07 -- v0.12 WHERE-aware boundary seeding: the SQLCLR parser lifts guarded-DML WHERE equalities
+
+Closes the v0.11.1 selective-WHERE miss the RIGHT way -- in the C# ScriptDom parser, not
+fragile T-SQL text parsing. When a gate's guarded branch is an UPDATE/DELETE, the parser now
+walks that DML's WHERE and lifts AND-chained "col = <literal>" and "col IN (<literals>)"
+conjuncts into a new PredicateInbox field BodyDmlSeedJson
+({"schema","table","overrides":[{"col","val"}]}). Module 34 passes those overrides to
+TestGen.BuildSeedInsert, so the boundary test pre-seeds rows that SATISFY the DML's filter --
+and a selective UPDATE/DELETE now actually hits them, so a loosened-operator mutation is caught.
+
+Layers changed: clr/UnitAutogenClr.cs (new BodyDmlSeedJsonFor / FirstDmlStatement /
+CollectEqOverrides helpers via existing LiteralText; emitted in the IfStatement visit + the
+inbox write); modules/31 (PredicateInbox BodyDmlSeedJson column + upgrade migration +
+AddParsedPredicate @BodyDmlSeedJson param/INSERT); modules/34 (cursor fetch + override CASE
+into BuildSeedInsert); Install_UnitAutogen.sql (synced, all 8 edits) and
+clr/Install-UnitAutogenClr.SSMS.sql (rebuilt assembly + new SHA-512 trust hashes via
+Build-Clr.ps1/Emit-InstallerSql.ps1). Assembly recompiled clean (csc exit 0, 60928 bytes).
+
+VALIDATED live on AdventureWorks2025 with the HARDEST in-scope case --
+  IF (SELECT COUNT(*) FROM Sales.SalesOrderHeader) > 5
+      UPDATE dbo.OrderAudit SET Flag = 1 WHERE Region = 'US' AND Status IN (3,4) AND Priority = 9;
+Parser emitted BodyDmlSeedJson = overrides [Region=N'US', Status=3, Priority=9]; the generated
+FALSE test pre-seeds 3 rows "N'US', 3, 9, 42" (satisfying all three conjuncts); both tests PASS
+on `>5`; mutate to `>=5` and the FALSE test FAILS via AssertEqualsTable (Flag 42 -> 1). Mutation
+caught. Regression: pz.CountGtGate (result-set, no DML target) regenerated UNCHANGED -- the
+conservative single-gate/single-target guard still degrades cleanly. Strictly additive: when
+the parser emits no overrides (OR, ranges, functions, subqueries, col=col, INSERT, multi-gate)
+BodyDmlSeedJson is NULL and seeding is byte-for-byte v0.11.1 -- never an error, never a false
+failure (override values are the DML's own literals, type-consistent by construction).
+
+DEPLOYMENT NOTE: this release changes BOTH installers AND the SQLCLR assembly (new trust hash),
+so installing it requires re-running Install-UnitAutogenClr.SSMS.sql (re-registers the parser)
+in addition to Install_UnitAutogen.sql. tsql_lint.py BEGIN/END false-positive still applies to
+the generators; live compile+run is authoritative. Run the full 3-DB regression sweep after a
+fresh install to confirm.
