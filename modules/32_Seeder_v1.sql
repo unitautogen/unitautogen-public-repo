@@ -210,7 +210,7 @@ BEGIN
             DECLARE @Ni INT = CAST(@N AS INT);
             IF      @op = '='  SET @K = CASE WHEN @want = 1 THEN @Ni     ELSE @Ni + 1 END;
             ELSE IF @op = '<>' SET @K = CASE WHEN @want = 1 THEN @Ni + 1 ELSE @Ni     END;
-            ELSE IF @op = '>'  SET @K = CASE WHEN @want = 1 THEN @Ni + 1 ELSE 0       END;
+            ELSE IF @op = '>'  SET @K = CASE WHEN @want = 1 THEN @Ni + 1 ELSE @Ni     END;
             ELSE IF @op = '>=' SET @K = CASE WHEN @want = 1 THEN @Ni     ELSE @Ni - 1 END;
             ELSE IF @op = '<'  SET @K = CASE WHEN @want = 1 THEN @Ni - 1 ELSE @Ni     END;
             ELSE IF @op = '<=' SET @K = CASE WHEN @want = 1 THEN @Ni     ELSE @Ni + 1 END;

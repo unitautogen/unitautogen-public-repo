@@ -78,6 +78,39 @@ BEGIN
         WHERE SchemaName = @SchemaName AND ProcName = @ProcName
         ORDER BY CreatedAt DESC, InboxId DESC;
 
+    -- v0.11 boundary-effect target. When the proc has EXACTLY ONE gate AND EXACTLY
+    -- ONE fakeable updated (base) table, the FALSE/boundary test can additionally
+    -- assert the guarded write did NOT happen - which catches operator-loosening
+    -- (e.g. > changed to >=). Strictly conservative: if anything is ambiguous,
+    -- @TargetTable stays NULL and the generated tests are byte-for-byte unchanged
+    -- (no new assertion, no new failure risk). See CHANGES 2026-06-07.
+    DECLARE @TargetTable NVARCHAR(300) = NULL, @TargetPlain NVARCHAR(300) = NULL,
+            @TargetSchema SYSNAME = NULL, @TargetName SYSNAME = NULL;
+    DECLARE @tgtFake NVARCHAR(MAX) = N'', @tgtBefore NVARCHAR(MAX) = N'', @tgtAssert NVARCHAR(MAX) = N'', @preSeed NVARCHAR(MAX) = NULL;
+    DECLARE @GateCount INT = (SELECT COUNT(*) FROM TestGen.PredicateInbox
+                              WHERE SchemaName = @SchemaName AND ProcName = @ProcName
+                                AND (@RunId IS NULL OR RunId = @RunId));
+    IF @GateCount = 1
+    BEGIN
+        BEGIN TRY
+            SELECT @TargetSchema = MAX(referenced_schema_name),
+                   @TargetName   = MAX(referenced_entity_name)
+            FROM   sys.dm_sql_referenced_entities(@full, N'OBJECT')
+            WHERE  is_updated = 1 AND referenced_entity_name IS NOT NULL
+              AND  ISNULL(referenced_schema_name, N'') NOT IN (N'sys', N'INFORMATION_SCHEMA')
+            HAVING COUNT(DISTINCT ISNULL(referenced_schema_name, N'dbo') + N'.' + referenced_entity_name) = 1;
+        END TRY BEGIN CATCH SET @TargetName = NULL; END CATCH;
+
+        IF @TargetName IS NOT NULL
+        BEGIN
+            IF OBJECT_ID(QUOTENAME(ISNULL(@TargetSchema, N'dbo')) + N'.' + QUOTENAME(@TargetName), 'U') IS NOT NULL
+            BEGIN
+                SET @TargetPlain = ISNULL(@TargetSchema, N'dbo') + N'.' + @TargetName;
+                SET @TargetTable = QUOTENAME(ISNULL(@TargetSchema, N'dbo')) + N'.' + QUOTENAME(@TargetName);
+            END;
+        END;
+    END;
+
     DECLARE @InboxId INT, @BranchId INT, @StartLine INT, @Shape VARCHAR(32),
             @TablesJson NVARCHAR(MAX), @PredText NVARCHAR(MAX), @UnsReason NVARCHAR(400);
     DECLARE @fakes NVARCHAR(MAX), @dir VARCHAR(8), @i INT,
@@ -129,8 +162,34 @@ BEGIN
 
                 IF @sup = 1 AND @ps IS NOT NULL
                 BEGIN
+                    -- v0.11: the FALSE/boundary direction can also assert the guarded
+                    -- write did NOT fire (catches > -> >= style operator loosening).
+                    -- Reset per iteration (vars hoisted to proc top; never DECLARE in loop).
+                    SET @tgtFake = N''; SET @tgtBefore = N''; SET @tgtAssert = N''; SET @preSeed = NULL;
+                    -- v0.11.1: assert the guarded write (INSERT / UPDATE / DELETE) did NOT fire
+                    -- on the boundary seed. Only when T is a separate write target (not a gate
+                    -- source). Pre-seed T with sample rows so UPDATE/DELETE have something to act
+                    -- on, then compare full content before/after: a row-count change catches
+                    -- INSERT/DELETE; AssertEqualsTable catches UPDATE. Mutating > to >= makes the
+                    -- gate true at the boundary, the write fires, the content differs, test fails.
+                    IF @dir = 'FALSE' AND @TargetTable IS NOT NULL
+                       AND CHARINDEX(N'N''' + @TargetPlain + N'''', ISNULL(@fakes, N'')) = 0
+                    BEGIN
+                        SET @preSeed = TestGen.BuildSeedInsert(@TargetSchema, @TargetName, NULL, 3);
+                        SET @tgtFake = N'    EXEC TestGen.SafeFakeTable N''' + REPLACE(@TargetPlain, @q, @q + @q) + N''';' + @crlf
+                                     + ISNULL(N'    ' + @preSeed + @crlf, N'');
+                        SET @tgtBefore = N'    SELECT * INTO #uag_tgt_before FROM ' + @TargetTable + N';' + @crlf;
+                        SET @tgtAssert = N'    SELECT * INTO #uag_tgt_after FROM ' + @TargetTable + N';' + @crlf
+                            + N'    DECLARE @uag_cb INT = (SELECT COUNT(*) FROM #uag_tgt_before);' + @crlf
+                            + N'    DECLARE @uag_ca INT = (SELECT COUNT(*) FROM #uag_tgt_after);' + @crlf
+                            + N'    EXEC tSQLt.AssertEquals @Expected = @uag_cb, @Actual = @uag_ca,' + @crlf
+                            + N'         @Message = N''v0.11 boundary: gate is FALSE with this seed but the guarded write to '
+                            + REPLACE(@TargetPlain, @q, @q + @q) + N' changed its row count - the comparison operator may have been loosened (e.g. > to >=).'';' + @crlf
+                            + N'    EXEC tSQLt.AssertEqualsTable ''#uag_tgt_before'', ''#uag_tgt_after'';' + @crlf;
+                    END;
+
                     SET @body = N'CREATE PROCEDURE ' + QUOTENAME(@TestClassName) + N'.' + QUOTENAME(@tname) + @crlf
-                        + N'AS' + @crlf + N'BEGIN' + @crlf + ISNULL(@fakes, N'');
+                        + N'AS' + @crlf + N'BEGIN' + @crlf + ISNULL(@fakes, N'') + @tgtFake;
                     IF @seed IS NOT NULL SET @body = @body + @seed + @crlf;
                     -- STRONG assertion: the seed must drive the gate predicate to
                     -- the intended direction (no ghost pass - a wrong seed fails here).
@@ -138,13 +197,14 @@ BEGIN
                         + N'    DECLARE @uag_actual BIT = CASE WHEN ' + @ps + N' THEN 1 ELSE 0 END;' + @crlf
                         + N'    EXEC tSQLt.AssertEquals @Expected = ' + CAST(@eb AS NVARCHAR(1)) + N', @Actual = @uag_actual,' + @crlf
                         + N'         @Message = N''v0.10 ' + @dir + N': seed did not drive the gate predicate ' + @dir + N' (branch not exercised)'';' + @crlf
+                        + @tgtBefore
                         + N'    BEGIN TRY' + @crlf
                         + N'        EXEC ' + @full + N' ' + @args + N';' + @crlf
                         + N'    END TRY BEGIN CATCH' + @crlf
                         + N'        DECLARE @e NVARCHAR(MAX) = N''v0.10 branch ' + @dir
                         + N' seed EXEC failed: '' + ERROR_MESSAGE();' + @crlf
                         + N'        EXEC tSQLt.Fail @e;' + @crlf
-                        + N'    END CATCH;' + @crlf + N'END;';
+                        + N'    END CATCH;' + @crlf + @tgtAssert + N'END;';
                 END
                 ELSE
                 BEGIN
