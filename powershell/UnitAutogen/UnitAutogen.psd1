@@ -1,5 +1,5 @@
 ﻿@{
-    ModuleVersion     = '0.11.0'
+    ModuleVersion     = '0.11.1'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -39,6 +39,19 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
+## v0.11.1 (beta) — 2026-06-07
+
+BOUNDARY-VALUE MUTATION DETECTION. Predicate-branch tests now catch comparison-operator
+loosening (e.g. count > N silently changed to count >= N). Two parts: (1) a COUNT_CMP ''>'' gate''s
+non-satisfy case now seeds the boundary (N rows) instead of 0, so the discriminating value is
+actually exercised; (2) the FALSE/boundary test pre-seeds the guarded write target and compares its
+full content before/after the procedure runs — a row-count check catches INSERT/DELETE and
+AssertEqualsTable catches UPDATE. On correct code the gate is false and the target is unchanged
+(pass); loosen the operator and at the boundary the write fires, the content differs, and the test
+fails with a clear message. Strictly conservative: emitted only for single-gate / single-fakeable-
+target procedures, so every other shape generates exactly as before. Regression-clean on
+AdventureWorks2025, HighValueCustomer and WideWorldImporters (0 fail / 0 err).
+
 ## v0.11.0 (beta) — 2026-06-06
 
 SEARCH-BASED GATE SEEDING — the headline feature. Branch gates whose controlling value the
@@ -88,19 +101,9 @@ NOT_TESTABLE):
 - A FOR JSON / FOR XML result set no longer errors the row-baseline test (it cannot be
   captured via INSERT...EXEC); that single test is skipped for such procedures.
 
-## v0.9.14 (beta) — 2026-06-04
-
-- CATCH-with-ROLLBACK error paths skip with an exact reason; inline TVFs report a clean
-  NOT_TESTABLE; SkipTest reasons containing apostrophes are quote-escaped.
-
-## v0.9.12 (beta) — 2026-06-04
-
-- Result-row baseline quotes JSON keys (result columns with spaces now work); functions
-  declared WITH EXECUTE AS OWNER build their coverage shadow correctly.
-
 ## Earlier releases
 
-Full release history (v0.9.11 back to v0.9.0) is in CHANGES.md and on the GitHub
+Full release history (v0.9.14 back to v0.9.0) is in CHANGES.md and on the GitHub
 Releases page: https://github.com/unitautogen/unitautogen-public-repo/releases
 
 '@
