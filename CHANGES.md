@@ -7986,3 +7986,70 @@ so installing it requires re-running Install-UnitAutogenClr.SSMS.sql (re-registe
 in addition to Install_UnitAutogen.sql. tsql_lint.py BEGIN/END false-positive still applies to
 the generators; live compile+run is authoritative. Run the full 3-DB regression sweep after a
 fresh install to confirm.
+
+--------------------------------------------------------------------------------
+2026-06-11  @EmitNullChecks now defaults OFF (no forced per-parameter NULL tests)
+--------------------------------------------------------------------------------
+@EmitNullChecks default flipped 1 -> 0 in GenerateTestsForProcedure,
+GenerateAndRunCoverage and GenerateAndCoverDatabase (and the modules/04 source).
+The parameter and the runtime gate are unchanged, so @EmitNullChecks = 1 fully
+restores the previous behaviour (one NULL test per nullable parameter).
+
+WHY: the per-parameter "accepts NULL for @x" tests were emitted for every
+nullable parameter whether or not the procedure does anything with NULL - test
+count without coverage. A procedure's genuine NULL handling is a real branch/
+line and is covered by the predicate-branch path (the in-database CLR parser),
+not by speculative injection. We no longer FORCE null checks; we cover what the
+code actually does.
+
+CAVEAT: with NO CLR predicate parser installed, a NULL-driven branch previously
+covered only incidentally by the forced injection is no longer covered unless
+@EmitNullChecks = 1. Install the parser (step 2 of the bundle) for branch-derived
+NULL coverage.
+
+VERIFIED (AdventureWorks2025, HumanResources.uspUpdateEmployeeHireInfo):
+  default (=0) -> 5 tests (4 pass, 1 skip); line 66.7% / branch 0.0%
+  =1           -> 12 tests (the 7 "accepts NULL for @x" return); same coverage.
+The 7 NULL smokes added zero coverage on this proc - exactly the noise removed.
+
+FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       modules/04_Test_Generator_v3.sql, docs/ADVANCED_USAGE.md,
+       docs/REFERENCE_GUIDE.md, docs/EASY_USAGE.md, docs/advanced-snippets.sql,
+       CHANGES.md
+
+--------------------------------------------------------------------------------
+2026-06-11  v0.13.0 - independent core-engine review fixes
+--------------------------------------------------------------------------------
+Independent 4-reviewer pass over the core engine. Five correctness/robustness bugs
+fixed + verified live on AdventureWorks2025 / HighValueCustomer / WideWorldImporters
+(0 fail / 0 err). Three latent edge-cases triaged + deferred.
+
+FIXED:
+1. Alias/UDT scalar types now resolve to base type in GetSampleValueLiteral, so
+   alias-typed params/cols (dbo.Flag, dbo.Name...) get real values, not NULL.
+2. SatisfyingValue skips when the comparand is NULL (bare keyword or "NULL /* unknown
+   type */" fallback) instead of emitting col = NULL (UNKNOWN -> self-failed). Quoted
+   'NULL' strings unaffected.
+3. GenerateAndRunCoverage Step-1 parser guard OBJECT_ID(...,'P') -> type-agnostic
+   OBJECT_ID(...): the shipped parser is a CLR proc (type 'PC'), so the old guard
+   never fired and the single-proc path silently skipped predicate parsing.
+4. NOT_TESTABLE SkipTest reason text now escapes single quotes (no "unmatched quote").
+5. CleanupInterruptedRuns also detects the crash state where the base proc is missing
+   (renamed to _orig, synonym not yet created) + sibling _cov, not only synonym-at-base.
+Plus: @EmitNullChecks now defaults to 0 (see prior entry).
+
+DEFERRED (latent; do NOT reproduce on real procs, only synthetic formatting; dedicated
+test-harnessed pass scheduled): branch-coverage mis-attribution (adjacent/nested IF +
+one-line IF/ELSE; inference duplicated across ~5 procs); boundary "rejects" probe;
+predicate-branch matched-key arg pinning (did not reproduce).
+
+FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       powershell/UnitAutogen/UnitAutogen.psd1, VERSION, dist/UnitAutogen-0.13.0-install.zip,
+       docs/*, CHANGES.md
+
+2026-06-11  v0.13.0 addendum - drop "(v0.10)" tag from predicate-branch test names
+GeneratePredicateBranchTests no longer appends " (v0.10)" to the predicate TRUE/FALSE and
+NOT_TESTABLE branch-test names (e.g. "...branch 1 line 10 predicate TRUE"). The per-run cleanup
+now matches prior branch tests by their generated structure ("branch N line M predicate ..." /
+"... NOT_TESTABLE") instead of the version tag, so regeneration still drops older "(v0.10)"-named
+tests already in a database. Verified on HighValueCustomer.AssessCustomer (11 tests, 0 tagged).

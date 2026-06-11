@@ -62,7 +62,7 @@ CREATE PROCEDURE TestGen.GenerateTestsForProcedure
     @CaptureRows                   BIT           = 1,    -- golden-row baseline ON: matched key args now align with the seed (procs return rows), so the captured baseline is meaningful (validated: CustOrderHist -> 1 row on Northwind).
     @EmitNegativeTests             BIT           = 1,    -- when 1, scan source for RAISERROR/THROW and emit ExpectException tests
     @AssertExceptionOnInvalidInputs BIT          = 1,    -- when 1, boundary + NULL-for-matched-param tests expect an exception (only if the proc has detected error paths)
-    @EmitNullChecks                BIT           = 1,    -- when 0, do not emit the NULL-rejection tests
+    @EmitNullChecks                BIT           = 0,    -- when 0, do not emit the NULL-rejection tests
     @EmitScaffold                  BIT           = 1,    -- when 0, do not emit the set-based characterization scaffold
     @GeneratedScript               NVARCHAR(MAX) = NULL OUTPUT,
     @RunId                         INT           = NULL OUTPUT,
@@ -3937,7 +3937,7 @@ CREATE PROCEDURE TestGen.GenerateAndRunCoverage
     @CaptureRows                   BIT           = 1,
     @EmitNegativeTests             BIT           = 1,
     @AssertExceptionOnInvalidInputs BIT          = 1,
-    @EmitNullChecks                BIT           = 1,
+    @EmitNullChecks                BIT           = 0,
     @EmitScaffold                  BIT           = 1,
     @OutputMode                    VARCHAR(10)   = 'TEXT',   -- coverage report mode
     @RunId                         INT           = NULL OUTPUT

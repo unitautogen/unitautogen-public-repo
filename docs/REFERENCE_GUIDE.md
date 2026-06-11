@@ -608,13 +608,16 @@ copy from `test_<proc>`, so the two never duplicate.
 
 `GenerateTestsForProcedure` and `GenerateTestsForSchema` take two switches:
 
-- `@EmitNullChecks` (default `1`) - when `0`, the NULL-rejection tests are not
-  generated.
+- `@EmitNullChecks` (default `0`) - when `1`, forces one NULL test per nullable
+  parameter. Off by default: a procedure's genuine NULL handling is a real
+  branch/line and is covered as such, so the framework no longer injects a
+  speculative NULL test into every parameter.
 - `@EmitScaffold` (default `1`) - when `0`, the set-based characterization
   scaffold is not generated.
 
-Both default on - honest by default - so pass `0` only to suppress a family
-you do not want for a given procedure or schema.
+`@EmitScaffold` defaults on; `@EmitNullChecks` defaults off. Pass
+`@EmitScaffold = 0` to drop the scaffold, or `@EmitNullChecks = 1` to add the
+per-parameter NULL tests for a given procedure or schema.
 
 ### Database-wide coverage report (CI/CD)
 

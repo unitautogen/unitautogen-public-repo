@@ -48,7 +48,7 @@ opt out.
 
 | Parameter                          | Default | Meaning                                                                                                          |
 |------------------------------------|---------|------------------------------------------------------------------------------------------------------------------|
-| `@EmitNullChecks`                  | `1`     | Generate one NULL-rejection test per parameter. Turn off when the procedure deliberately accepts NULL inputs.    |
+| `@EmitNullChecks`                  | `0`     | When `1`, force one NULL test per nullable parameter. Off by default — a procedure's genuine NULL handling is a real branch/line and is covered as such; this switch only adds speculative per-parameter NULL injection. |
 | `@EmitScaffold`                    | `1`     | Generate the set-based / CTE characterisation scaffold test. Turn off for simple branching procedures.           |
 | `@CaptureRows`                     | `0`     | Also generate a "golden row" baseline test that captures the current output of the procedure as the expected.    |
 | `@EmitNegativeTests`               | `1`     | Scan the procedure source for `RAISERROR` / `THROW` paths and emit `ExpectException` tests for each.             |

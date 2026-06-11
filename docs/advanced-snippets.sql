@@ -15,7 +15,7 @@
      @ProcName         the procedure under test
      @ExecuteScript    1 = create the tests now; 0 = just return the script
      @CaptureRows      1 = also emit the golden-row baseline test
-     @EmitNullChecks   1 = emit NULL-rejection tests        (default 1)
+     @EmitNullChecks   1 = force one NULL test per param     (default 0)
      @EmitScaffold     1 = emit the set-based CTE scaffold   (default 1)
 ============================================================================*/
 
@@ -26,13 +26,13 @@ EXEC TestGen.GenerateTestsForProcedure
      @ExecuteScript = 1;
 GO
 
-/*--- 2. Generate WITHOUT the NULL-rejection tests ---------------------------
-  Use when the procedure deliberately does not validate NULL inputs and you
-  do not want the NULL-rejection tests in the class.                          */
+/*--- 2. Generate WITH the per-parameter NULL tests (opt-in) ------------------
+  NULL tests are OFF by default. Pass @EmitNullChecks = 1 to force one NULL
+  test per nullable parameter (the pre-0.13 default behaviour).               */
 EXEC TestGen.GenerateTestsForProcedure
      @SchemaName     = 'dbo',
      @ProcName       = 'uspV9ValidationTest',
-     @EmitNullChecks = 0,
+     @EmitNullChecks = 1,
      @ExecuteScript  = 1;
 GO
 

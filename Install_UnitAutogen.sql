@@ -369,6 +369,20 @@ AS
 BEGIN
     IF @Variant = 3 RETURN N'NULL';
 
+    -- v0.13: resolve an alias / user-defined scalar type (e.g. dbo.Flag, dbo.Name)
+    -- to its base system type, so callers that pass the alias name (TYPE_NAME(
+    -- user_type_id) / sys.types.name) get a real sample value instead of the
+    -- "unknown type" NULL fallback. Built-in types are is_user_defined = 0 and
+    -- pass through unchanged; CLR (assembly) and table types are left alone.
+    IF EXISTS (SELECT 1 FROM sys.types
+               WHERE name = @SqlTypeName
+                 AND is_user_defined = 1 AND is_table_type = 0 AND is_assembly_type = 0)
+        SELECT TOP (1) @SqlTypeName = TYPE_NAME(system_type_id)
+        FROM sys.types
+        WHERE name = @SqlTypeName
+          AND is_user_defined = 1 AND is_table_type = 0 AND is_assembly_type = 0
+        ORDER BY user_type_id;
+
     DECLARE @t SYSNAME = LOWER(@SqlTypeName);
 
     -- Integers
@@ -4258,7 +4272,7 @@ CREATE PROCEDURE TestGen.GenerateTestsForProcedure
     @CaptureRows                   BIT           = 1,    -- golden-row baseline ON: matched key args now align with the seed (procs return rows), so the captured baseline is meaningful (validated: CustOrderHist -> 1 row on Northwind).
     @EmitNegativeTests             BIT           = 1,    -- when 1, scan source for RAISERROR/THROW and emit ExpectException tests
     @AssertExceptionOnInvalidInputs BIT          = 1,    -- when 1, boundary + NULL-for-matched-param tests expect an exception (only if the proc has detected error paths)
-    @EmitNullChecks                BIT           = 1,    -- when 0, do not emit the NULL-rejection tests
+    @EmitNullChecks                BIT           = 0,    -- when 0, do not emit the NULL-rejection tests
     @EmitScaffold                  BIT           = 1,    -- when 0, do not emit the set-based characterization scaffold
     @GeneratedScript               NVARCHAR(MAX) = NULL OUTPUT,
     @RunId                         INT           = NULL OUTPUT,
@@ -4366,7 +4380,7 @@ BEGIN
                 N'GO' + @CRLF + @CRLF +
                 N'EXEC tSQLt.NewTestClass ''' + @TestClassName + N''';' + @CRLF +
                 N'GO' + @CRLF + @CRLF +
-                N'--[@tSQLt:SkipTest](''NOT TESTABLE: ' + @TestabilityReason + N''')' + @CRLF +
+                N'--[@tSQLt:SkipTest](''NOT TESTABLE: ' + REPLACE(@TestabilityReason, NCHAR(39), NCHAR(39)+NCHAR(39)) + N''')' + @CRLF +
                 N'CREATE PROCEDURE ' + QUOTENAME(@TestClassName) + N'.[test ' + @ProcName + N' is not auto-testable]' + @CRLF +
                 N'AS' + @CRLF +
                 N'BEGIN' + @CRLF +
@@ -8460,7 +8474,7 @@ CREATE PROCEDURE TestGen.GenerateAndRunCoverage
     @CaptureRows                   BIT           = 1,
     @EmitNegativeTests             BIT           = 1,
     @AssertExceptionOnInvalidInputs BIT          = 1,
-    @EmitNullChecks                BIT           = 1,
+    @EmitNullChecks                BIT           = 0,
     @EmitScaffold                  BIT           = 1,
     @OutputMode                    VARCHAR(10)   = 'TEXT',   -- coverage report mode
     @RunId                         INT           = NULL OUTPUT
@@ -8477,7 +8491,7 @@ BEGIN
     -- on which entry point you used).  Gated on the CLR parser being present;
     -- degrades cleanly (string-gen branches) if it is not.
     PRINT '--- Step 1 of 3: parse predicates for this procedure ---';
-    IF OBJECT_ID('TestGen.ParseProcedurePredicates','P') IS NOT NULL
+    IF OBJECT_ID('TestGen.ParseProcedurePredicates') IS NOT NULL  -- v0.13: type-agnostic; the shipped parser is a CLR proc (type 'PC'), which OBJECT_ID(...,'P') never matches
     BEGIN TRY
         EXEC TestGen.ParseProcedurePredicates @Schema = @SchemaName, @ProcName = @ProcName;
     END TRY
@@ -9133,7 +9147,7 @@ CREATE PROCEDURE TestGen.GenerateTestsForSchema
     @SchemaName     SYSNAME,
     @ExcludePattern NVARCHAR(200) = NULL,
     @ExecuteScript  BIT = 1,
-    @EmitNullChecks BIT = 1,        -- passed through to GenerateTestsForProcedure
+    @EmitNullChecks BIT = 0,        -- passed through to GenerateTestsForProcedure
     @EmitScaffold   BIT = 1         -- passed through to GenerateTestsForProcedure
 AS
 BEGIN
@@ -14685,8 +14699,10 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    -- Find every procedure ending in _orig whose base name is held by a
-    -- synonym - that combination indicates a broken half-instrumented state.
+    -- Find every procedure ending in _orig that indicates a broken half-
+    -- instrumented state: EITHER the base name is held by a synonym (crashed
+    -- mid-run), OR the base procedure is missing entirely (crashed between the
+    -- rename and the synonym create) with a sibling _cov still present.
     DECLARE @Orphans TABLE (
         SchemaName SYSNAME,
         ProcName   SYSNAME
@@ -14701,10 +14717,25 @@ BEGIN
     WHERE o.type = 'P'
       AND o.name LIKE '%[_]orig'
       AND (@SchemaFilter IS NULL OR s.name = @SchemaFilter)
-      AND EXISTS (
-          SELECT 1 FROM sys.synonyms syn
-          WHERE syn.schema_id = o.schema_id
-            AND syn.name      = LEFT(o.name, LEN(o.name) - 5)
+      AND (
+          -- (a) base name held by a synonym -> instrumented, mid-run state
+          EXISTS (
+              SELECT 1 FROM sys.synonyms syn
+              WHERE syn.schema_id = o.schema_id
+                AND syn.name      = LEFT(o.name, LEN(o.name) - 5)
+          )
+          -- (b) v0.13: base procedure missing (rename done, synonym not yet
+          --     created or lost in a crash), corroborated by a sibling _cov so
+          --     we never touch a user's unrelated *_orig procedure.
+          OR (
+              OBJECT_ID(QUOTENAME(s.name) + N'.' + QUOTENAME(LEFT(o.name, LEN(o.name) - 5)), 'P') IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM sys.objects cov
+                  WHERE cov.schema_id = o.schema_id
+                    AND cov.type = 'P'
+                    AND cov.name = LEFT(o.name, LEN(o.name) - 5) + N'_cov'
+              )
+          )
       );
 
     DECLARE @count INT = (SELECT COUNT(*) FROM @Orphans);
@@ -15508,6 +15539,16 @@ BEGIN
     DECLARE @op2 VARCHAR(16) = REPLACE(UPPER(LTRIM(RTRIM(@Op))), '!=', '<>');
     DECLARE @num FLOAT       = TRY_CAST(@Literal AS FLOAT);
     DECLARE @isStr BIT       = CASE WHEN LEFT(LTRIM(@Literal),1) IN ('''','N') THEN 1 ELSE 0 END;
+
+    -- v0.13: a NULL comparand makes `col = NULL` / `col <> NULL` (and every
+    -- comparison) UNKNOWN, never TRUE - it cannot be satisfied by seeding, so
+    -- return NULL and let the caller skip this branch instead of emitting
+    -- `col = NULL`, which self-fails the strong assertion. Matches both the bare
+    -- keyword and the `NULL /* unknown type ... */` sample-fallback form, but NOT
+    -- a quoted string literal that merely contains NULL (e.g. N'NULL').
+    DECLARE @litU NVARCHAR(400) = UPPER(LTRIM(@Literal));
+    IF @Literal IS NULL OR @litU = N'NULL' OR @litU LIKE N'NULL[ /]%'
+        RETURN NULL;
 
     -- A literal guaranteed not to equal a "normal" seeded value.
     DECLARE @diffStr NVARCHAR(64) = N'N''__UAG_NOMATCH__''';
@@ -16768,14 +16809,19 @@ BEGIN
     DECLARE @q NCHAR(1) = NCHAR(39);
     DECLARE @crlf NCHAR(2) = NCHAR(13) + NCHAR(10);
 
-    -- Clean slate: drop any prior v0.10 tests in this class (handles re-runs and
-    -- predicate shape changes so no stale TRUE/FALSE/NOT_TESTABLE tests linger).
+    -- Clean slate: drop any prior predicate-branch tests in this class (handles
+    -- re-runs and predicate shape changes so no stale TRUE/FALSE/NOT_TESTABLE tests
+    -- linger). Matched by their generated structure ("branch N line M predicate ..."
+    -- / "... NOT_TESTABLE") rather than a version tag, so it also catches the older
+    -- "(v0.10)"-suffixed names already present in a database.
     IF @Execute = 1
     BEGIN
         DECLARE @cleanup NVARCHAR(MAX) = N'';
         SELECT @cleanup = @cleanup + N'DROP PROCEDURE ' + QUOTENAME(@TestClassName) + N'.' + QUOTENAME(o.name) + N';' + @crlf
         FROM   sys.procedures o
-        WHERE  o.schema_id = SCHEMA_ID(@TestClassName) AND o.name LIKE '%(v0.10)';
+        WHERE  o.schema_id = SCHEMA_ID(@TestClassName)
+          AND  (o.name LIKE '% branch % line % predicate %'
+                OR o.name LIKE '% branch % line % NOT[_]TESTABLE%');
         IF LEN(ISNULL(@cleanup, N'')) > 0 EXEC sp_executesql @cleanup;
     END;
 
@@ -16860,7 +16906,7 @@ BEGIN
             SET @esc = REPLACE(LEFT(ISNULL(@PredText, N''), 240) + N' - '
                      + ISNULL(@UnsReason, N'outside the v0.10 predicate grammar'), @q, @q + @q);
             SET @tname = N'test ' + @ProcName + N' branch ' + CAST(@BranchId AS NVARCHAR(10))
-                       + N' line ' + CAST(ISNULL(@StartLine, 0) AS NVARCHAR(10)) + N' NOT_TESTABLE (v0.10)';
+                       + N' line ' + CAST(ISNULL(@StartLine, 0) AS NVARCHAR(10)) + N' NOT_TESTABLE';
             SET @body = N'--[@tSQLt:SkipTest](' + @q + N'NOT_TESTABLE: ' + @esc + @q + N')' + @crlf
                 + N'CREATE PROCEDURE ' + QUOTENAME(@TestClassName) + N'.' + QUOTENAME(@tname) + @crlf
                 + N'AS' + @crlf + N'BEGIN SET NOCOUNT ON; /* predicate outside v0.10 grammar - see annotation */ END;';
@@ -16879,7 +16925,7 @@ BEGIN
 
                 SET @tname = N'test ' + @ProcName + N' branch ' + CAST(@BranchId AS NVARCHAR(10))
                            + N' line ' + CAST(ISNULL(@StartLine, 0) AS NVARCHAR(10))
-                           + N' predicate ' + @dir + N' (v0.10)';
+                           + N' predicate ' + @dir;
 
                 IF @sup = 1 AND @ps IS NOT NULL
                 BEGIN

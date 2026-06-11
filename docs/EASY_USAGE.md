@@ -169,7 +169,7 @@ or `RunCoverage` first.
 You now know the four commands that cover most of the day-to-day
 workflow. If you need more — schema-wide generation, custom
 hand-written test classes, the per-feature switches like
-`@EmitNullChecks = 0`, the testability assessment proc — see
+`@EmitNullChecks = 1`, the testability assessment proc — see
 [ADVANCED_USAGE.md](ADVANCED_USAGE.md).
 
 If anything in this page didn't work as described, please open a

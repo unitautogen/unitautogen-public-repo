@@ -1,5 +1,5 @@
 ﻿@{
-    ModuleVersion     = '0.12.0'
+    ModuleVersion     = '0.13.0'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -39,6 +39,27 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
+## v0.13.0 (beta) — 2026-06-11
+
+CORRECTNESS FIXES (independent core-engine review) + NULL tests now OFF by default.
+
+- @EmitNullChecks now DEFAULTS TO 0. The per-parameter "accepts NULL" smoke tests are no longer
+  forced; genuine NULL handling in a procedure is covered as a normal branch/line. Pass
+  @EmitNullChecks = 1 to restore the previous per-parameter NULL tests.
+- Alias / user-defined scalar types (e.g. dbo.Flag, dbo.Name) now resolve to their base type when
+  sampling values, so alias-typed parameters and columns get real seeds and arguments instead of
+  NULL -- fixes weakened WHERE lookups and seed inserts on alias-heavy schemas.
+- Equality seeding now skips (rather than emitting `col = NULL`) when a comparand is NULL, so a
+  branch over an unknown-typed value no longer self-fails its own assertion.
+- The in-database SQLCLR predicate parser is now detected correctly by GenerateAndRunCoverage (the
+  guard tested for a T-SQL proc type and silently skipped the CLR parser), so single-proc runs
+  parse predicates and emit data-shape branch tests when the parser is installed.
+- NOT_TESTABLE skip annotations now escape apostrophes in the reason ("unmatched quote" fixed).
+- The interrupted-run self-heal now also recovers a procedure left missing after a crash between
+  the rename and the synonym create (previously only the synonym-present state was detected).
+
+Regression-clean on AdventureWorks2025, HighValueCustomer and WideWorldImporters (0 fail / 0 err).
+
 ## v0.12.0 (beta) — 2026-06-07
 
 WHERE-AWARE BOUNDARY SEEDING. The in-database SQLCLR parser now lifts a guarded UPDATE/DELETE''s
