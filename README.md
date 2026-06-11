@@ -164,13 +164,13 @@ Honest scope is in [docs/what-works.md](docs/what-works.md). Short version: Unit
 
 ## How it works
 
-In one paragraph: UnitAutogen parses your procedure body, builds a path table of every IF / CASE / EXISTS branch, generates a test per path with appropriate seed data, instruments a copy of the procedure with Extended Events line probes, runs the test class, captures hit lines from the XEvent file, and produces a line/branch coverage report. v9.4 added snapshot-and-replay assertions so each branch's table effect is verified, not just executed. v10 added universal generation, NOT-TESTABLE detection, and in-place test preservation across regenerations.
+In one paragraph: UnitAutogen parses your procedure body, builds a path table of every IF / CASE / EXISTS branch, generates a test per path with appropriate seed data, instruments a copy of the procedure with Extended Events line probes, runs the test class, captures hit lines from the XEvent file, and produces a line/branch coverage report. v9.4 added snapshot-and-replay assertions so each branch's table effect is verified, not just executed. v10 added universal generation, NOT-TESTABLE detection, and in-place test preservation across regenerations. By default, generation now covers the NULL handling a procedure actually contains rather than injecting a speculative NULL test into every parameter — set `@EmitNullChecks = 1` to opt back into per-parameter NULL tests.
 
 Full architecture: [docs/architecture.md](docs/architecture.md).
 
 ## Status and roadmap
 
-This is the **first public release** of UnitAutogen, labelled Beta because real-world testing only happens at scale once strangers run it on their own schemas. The engineering has been validated on three reference databases at high coverage, but you will surface things on production schemas that nobody has tried. Bug reports are the most valuable thing you can give us right now.
+UnitAutogen is in active Beta, labelled Beta because real-world testing only happens at scale once strangers run it on their own schemas. The engineering has been validated on three reference databases at high coverage, but you will surface things on production schemas that nobody has tried. Bug reports are the most valuable thing you can give us right now.
 
 **Shipped in this release:**
 
