@@ -8053,3 +8053,83 @@ NOT_TESTABLE branch-test names (e.g. "...branch 1 line 10 predicate TRUE"). The 
 now matches prior branch tests by their generated structure ("branch N line M predicate ..." /
 "... NOT_TESTABLE") instead of the version tag, so regeneration still drops older "(v0.10)"-named
 tests already in a database. Verified on HighValueCustomer.AssessCustomer (11 tests, 0 tagged).
+
+--------------------------------------------------------------------------------
+2026-06-12  NEW: TestGen.ExportTestClasses - portable test export (UNRELEASED)
+--------------------------------------------------------------------------------
+Scripts the generated tSQLt test classes OUT of a database into one idempotent,
+deployable .sql. Run it against any OTHER database that already has tSQLt +
+UnitAutogen (TestGen) to recreate the tests there.
+  * Pre-flight guard (RAISERROR + SET NOEXEC) aborts cleanly, deploying nothing,
+    if tSQLt or the TestGen runtime helpers (SafeFakeTable, AssertResultRowsMatch
+    Baseline, AssertResultShape) are missing on the target.
+  * Recreates each class via tSQLt.NewTestClass; reproduces each test proc
+    verbatim, preserving the leading --[@tSQLt:SkipTest] annotation so skips hold.
+  * Params: @TestClass (one class), @Like (filter), @OutputMode RESULT|PRINT.
+PowerShell: new Export-UnitAutogenTests cmdlet writes the script to a file.
+Validated on AdventureWorks2025: round-trip (export -> DropClass -> redeploy from
+script -> tSQLt.Run identical 5 pass/2 skip) and guard aborts on a bare DB (0 classes).
+FILES: Install_UnitAutogen.sql, powershell/UnitAutogen/sql/Install_UnitAutogen.sql,
+       powershell/UnitAutogen/UnitAutogen.psm1, powershell/UnitAutogen/UnitAutogen.psd1, CHANGES.md
+NOTE: UNRELEASED - version still 0.13.0; bump to 0.14.0 when releasing.
+
+
+================================================================================
+2026-06-12  v0.14.0  -  BUG-001 FIX: branch tests restored to Arrange-Act-Assert
+================================================================================
+DEFECT (BUG-001, see BUGS.md; introduced v0.10.2): every seeded predicate-branch
+test asserted the gate predicate on the SEED *before* executing the procedure - an
+Arrange-Assert-Act ordering. That pre-Act assertion tested the test's own setup,
+not the procedure; for a literal EXISTS seed it was tautological (a failed seed
+already errors the test on its own line); and nothing asserted what the branch
+actually did, so a wrong-value / wrong-WHERE write passed the whole class green.
+
+FIX (full + conservative, measurement-based): GeneratePredicateBranchTests now
+emits Arrange -> Act -> Assert and the pre-Act predicate assertion is removed. The
+arm's effect is OBSERVED, not parsed (PredicateInbox records only the gate, never
+the arm's write DML): new TestGen.MeasureBranchEffect runs the direction's Arrange
++ the proc under a rolled-back transaction (mirrors CaptureExpectedCounts' safety
+model) and reports the write target's row-count and content-hash delta. A
+SELF-CONTAINED post-Act assertion is emitted to match - grew => INSERT (count
+delta), shrank => DELETE, held + content changed => UPDATE (count held + content
+changed), held + same => no observable write. The test captures its own
+before/after, so non-determinism (e.g. ModifiedDate = GETDATE()) cannot false-fail.
+Conservative: no single write target resolved, a capture error, or @@TRANCOUNT<>0
+-> smoke + coverage (exactly as before). New helper TestGen.ChecksumColList
+(checksum-able column list). CaptureExpectedCounts is left untouched (zero blast
+radius on the base generator); the search-based seeding engine is untouched.
+
+VALIDATED on AdventureWorks2025: the upsert (IF EXISTS UPDATE ELSE INSERT)
+generates AAA tests - FALSE asserts "add 1 row", TRUE asserts "change content with
+the row count held" - 5 pass / 1 skip / 0 fail, 100% line + branch. MUTATION PROOF:
+a broken UPDATE (WHERE never matches the seeded row) now FAILS the TRUE test (the
+old smoke test passed it); restored -> green. Three more EXISTS shapes
+(gate<>target UPDATE, single-condition EXISTS, @Mode parameter gate) generate
+clean, 0 fail. SET PARSEONLY accepts all 270 installer batches.
+
+FOOTPRINT-SKIP PRUNE: the base generator's "touches only mocked tables" footprint
+test SkipTest-annotates itself when the happy-path seed drove no measurable
+row-count change (commonly a count-stable UPDATE the count probe cannot see). When
+the proc's writes are already covered by an effect-asserting predicate-branch test,
+that skip asserts nothing -> it is dropped (at the end of GeneratePredicateBranchTests,
+gated on a '@uag_ca' effect-assert marker existing in a branch test). So a
+well-covered branched proc goes fully green - the showcase upsert went 6 tests/1 skip
+-> 5 tests/0 skip, still 100% line + branch. A footprint test that actually MEASURED
+(passes) is kept; a skip is kept whenever NO effect-asserting branch test exists - so
+a SURVIVING "touches only mocked tables" skip is now a meaningful "no test
+characterized this write; review the seed or confirm the proc is read-only/count-
+stable" signal, not routine yellow. Non-branched single-statement procs are
+unaffected (they are NOT_TESTABLE and never had a footprint test).
+
+REGRESSION GUARD: scripts/Check_Invariants.sql enforces INV-1 (Arrange-Act-Assert)
+- RAISERROR if any generated test asserts before it executes the proc under test.
+Run after a sweep / in CI. Test classes generated BEFORE this fix still carry the
+old pattern until regenerated; a full regen sweep clears them.
+
+FILES: Install_UnitAutogen.sql (TestGen.ChecksumColList + TestGen.MeasureBranch
+Effect added; GeneratePredicateBranchTests rewritten), powershell/UnitAutogen/sql/
+Install_UnitAutogen.sql (bundle, byte-identical), scripts/Check_Invariants.sql,
+BUGS.md (new defect ledger + INV-1), VERSION, powershell/UnitAutogen/UnitAutogen.psd1,
+docs/strong-assertions.md, tools/tsql_lint.py (BEGIN/END check downgraded to a
+non-fatal warning - it miscounts generated-SQL-heavy files; PARSEONLY is the
+authority). NOTE: v0.14.0 also carries the ExportTestClasses feature (entry above).

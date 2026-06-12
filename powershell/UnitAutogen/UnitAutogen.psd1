@@ -1,5 +1,5 @@
 ﻿@{
-    ModuleVersion     = '0.13.0'
+    ModuleVersion     = '0.14.0'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -13,7 +13,8 @@
         'Invoke-UnitAutogen',
         'Export-CoverageCoberturaXml',
         'Export-TestResultsJunitXml',
-        'Export-CoverageHtmlReport'
+        'Export-CoverageHtmlReport',
+        'Export-UnitAutogenTests'
     )
 
     CmdletsToExport   = @()
@@ -39,6 +40,24 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
+## v0.14.0 (beta) — 2026-06-12
+
+BUG-001 FIX — generated branch tests restored to Arrange-Act-Assert with real effect
+assertions; plus the new Export-UnitAutogenTests command.
+
+- Seeded predicate-branch tests previously asserted the gate predicate on the seed BEFORE
+  running the procedure (Arrange-Assert-Act) and never checked what the branch did — a
+  wrong-value / wrong-WHERE write passed the whole class green. They now run
+  Arrange -> Act -> Assert and assert the arm''s OBSERVED effect: INSERT adds rows, DELETE
+  removes rows, UPDATE changes content with the row count held. The test captures its own
+  before/after, so GETDATE()-style non-determinism cannot false-fail; anything the
+  generator cannot resolve falls back to the previous smoke test (no false failures).
+- New scripts/Check_Invariants.sql — a CI guard that fails if any generated test asserts
+  before it executes the procedure under test. Regenerate existing test classes to adopt
+  the new assertions.
+- New Export-UnitAutogenTests scripts in-database test classes into a portable, idempotent
+  .sql with a pre-flight guard requiring tSQLt + TestGen on the target.
+
 ## v0.13.0 (beta) — 2026-06-11
 
 CORRECTNESS FIXES (independent core-engine review) + NULL tests now OFF by default.

@@ -3030,6 +3030,117 @@ GO
 PRINT 'TestGen.ProbeHappyPath created (happy-path validation probe for honest-skip).';
 GO
 
+/*****************************************************************************
+ * TestGen.ChecksumColList  (BUG-001 / AAA branch-effect assertions)
+ * ---------------------------------------------------------------------------
+ * Returns the comma-separated, bracket-quoted list of a table's columns that
+ * BINARY_CHECKSUM can hash (excludes computed columns - tSQLt.FakeTable omits
+ * them - and the non-checksummable types text/ntext/image/xml + the CLR types
+ * geography/geometry/hierarchyid). NULL when no hashable column exists.
+ *****************************************************************************/
+IF OBJECT_ID('TestGen.ChecksumColList', 'FN') IS NOT NULL
+    DROP FUNCTION TestGen.ChecksumColList;
+GO
+CREATE FUNCTION TestGen.ChecksumColList(@full NVARCHAR(300))
+RETURNS NVARCHAR(MAX)
+AS
+BEGIN
+    DECLARE @objid INT = OBJECT_ID(@full);
+    IF @objid IS NULL RETURN NULL;
+    DECLARE @cols NVARCHAR(MAX);
+    SELECT @cols = STRING_AGG(CONVERT(NVARCHAR(MAX), QUOTENAME(c.name)), N', ')
+                     WITHIN GROUP (ORDER BY c.column_id)
+    FROM   sys.columns c
+    JOIN   sys.types   t ON t.user_type_id = c.user_type_id
+    WHERE  c.object_id = @objid
+      AND  c.is_computed = 0
+      AND  t.name NOT IN (N'text', N'ntext', N'image', N'xml',
+                          N'geography', N'geometry', N'hierarchyid');
+    RETURN @cols;
+END;
+GO
+PRINT 'TestGen.ChecksumColList created (BUG-001 branch-effect column list).';
+GO
+
+/*****************************************************************************
+ * TestGen.MeasureBranchEffect  (BUG-001 / AAA branch-effect assertions)
+ * ---------------------------------------------------------------------------
+ * Runs ONE branch direction's Arrange (SafeFakeTable + seed) + the procedure
+ * once, inside the generator's own transaction, and reports the resolved write
+ * target's row count BEFORE and AFTER, plus whether its content hash changed.
+ * The transaction is rolled back (table variable survives), so fakes/seed/
+ * writes are all undone. The generator uses the classification (grew / shrank /
+ * held+changed / held+same) to choose which SELF-CONTAINED post-Act assertion
+ * to emit into the branch test. Never throws; any error -> @MeasErr set and the
+ * generator falls back to a smoke test.
+ *
+ * Same safety model as TestGen.CaptureExpectedCounts: NON-transactional context
+ * only, so the ROLLBACK can fully discard everything without touching a caller.
+ *****************************************************************************/
+IF OBJECT_ID('TestGen.MeasureBranchEffect', 'P') IS NOT NULL
+    DROP PROCEDURE TestGen.MeasureBranchEffect;
+GO
+CREATE PROCEDURE TestGen.MeasureBranchEffect
+    @SetupBlock  NVARCHAR(MAX),     -- Arrange: SafeFakeTable calls + seed INSERTs
+    @FullProc    NVARCHAR(300),     -- [schema].[proc]
+    @ArgList     NVARCHAR(MAX),     -- the branch test's EXEC argument list
+    @TargetFull  NVARCHAR(300),     -- quoted [schema].[table] - the resolved write target
+    @CntBefore   INT            OUTPUT,
+    @CntAfter    INT            OUTPUT,
+    @HashChanged BIT            OUTPUT,
+    @MeasErr     NVARCHAR(MAX)  OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET @CntBefore = NULL; SET @CntAfter = NULL; SET @HashChanged = NULL; SET @MeasErr = NULL;
+
+    -- ROLLBACK must be free to discard the whole fake/seed/exec without a caller's tran.
+    IF @@TRANCOUNT <> 0 BEGIN SET @MeasErr = N'skipped: requires a non-transactional context'; RETURN; END;
+    IF @SetupBlock IS NULL OR @TargetFull IS NULL BEGIN SET @MeasErr = N'skipped: no setup block or target'; RETURN; END;
+
+    DECLARE @nl NVARCHAR(2) = NCHAR(13) + NCHAR(10);
+    DECLARE @cols NVARCHAR(MAX) = TestGen.ChecksumColList(@TargetFull);
+    DECLARE @hsh  NVARCHAR(MAX) = CASE WHEN @cols IS NULL THEN N'CAST(NULL AS INT)'
+                                       ELSE N'CHECKSUM_AGG(BINARY_CHECKSUM(' + @cols + N'))' END;
+
+    DECLARE @batch NVARCHAR(MAX) =
+        N'SET NOCOUNT ON;' + @nl +
+        N'DECLARE @cap TABLE (Phase CHAR(1), Cnt INT, Hsh INT);' + @nl +
+        N'DECLARE @tc0 INT = @@TRANCOUNT;' + @nl +
+        N'BEGIN TRY' + @nl +
+        N'  BEGIN TRAN;' + @nl +
+        @SetupBlock + @nl +
+        N'  INSERT @cap SELECT ''B'', COUNT(*), ' + @hsh + N' FROM ' + @TargetFull + N';' + @nl +
+        N'  EXEC ' + @FullProc + N' ' + @ArgList + N';' + @nl +
+        N'  INSERT @cap SELECT ''A'', COUNT(*), ' + @hsh + N' FROM ' + @TargetFull + N';' + @nl +
+        N'  IF @@TRANCOUNT > @tc0 ROLLBACK TRAN;' + @nl +
+        N'END TRY' + @nl +
+        N'BEGIN CATCH' + @nl +
+        N'  IF @@TRANCOUNT > @tc0 ROLLBACK TRAN;' + @nl +
+        N'  SET @ErrOut = N''measure run error: '' + ERROR_MESSAGE();' + @nl +
+        N'END CATCH;' + @nl +
+        N'SELECT @CbOut = (SELECT Cnt FROM @cap WHERE Phase = ''B''),' + @nl +
+        N'       @CaOut = (SELECT Cnt FROM @cap WHERE Phase = ''A''),' + @nl +
+        N'       @HchOut = CASE WHEN (SELECT Hsh FROM @cap WHERE Phase = ''B'') <> (SELECT Hsh FROM @cap WHERE Phase = ''A'')' + @nl +
+        N'                       OR (CASE WHEN (SELECT Hsh FROM @cap WHERE Phase = ''B'') IS NULL THEN 1 ELSE 0 END' + @nl +
+        N'                           <> CASE WHEN (SELECT Hsh FROM @cap WHERE Phase = ''A'') IS NULL THEN 1 ELSE 0 END)' + @nl +
+        N'                      THEN 1 ELSE 0 END;';
+
+    BEGIN TRY
+        EXEC sys.sp_executesql @batch,
+             N'@CbOut INT OUTPUT, @CaOut INT OUTPUT, @HchOut BIT OUTPUT, @ErrOut NVARCHAR(MAX) OUTPUT',
+             @CbOut = @CntBefore OUTPUT, @CaOut = @CntAfter OUTPUT, @HchOut = @HashChanged OUTPUT, @ErrOut = @MeasErr OUTPUT;
+    END TRY
+    BEGIN CATCH
+        SET @MeasErr = N'measure batch error: ' + ERROR_MESSAGE();
+    END CATCH;
+
+    IF @@TRANCOUNT <> 0 ROLLBACK;
+END;
+GO
+PRINT 'TestGen.MeasureBranchEffect created (BUG-001 branch-effect measurement).';
+GO
+
 IF OBJECT_ID('TestGen.AnalyzeBranchPaths', 'P') IS NOT NULL
     DROP PROCEDURE TestGen.AnalyzeBranchPaths;
 GO
@@ -9132,6 +9243,132 @@ END;
 GO
 PRINT 'TestGen.DropGeneratedTestClasses created.';
 GO
+
+IF OBJECT_ID('TestGen.ExportTestClasses','P') IS NOT NULL
+    DROP PROCEDURE TestGen.ExportTestClasses;
+GO
+/*=============================================================================
+  TestGen.ExportTestClasses
+  -----------------------------------------------------------------------------
+  Scripts the generated tSQLt test classes (the test_* schemas) OUT of this
+  database into a single, idempotent, deployable .sql script. Run that script
+  against any OTHER database that already has tSQLt + UnitAutogen (TestGen)
+  installed to recreate the tests there.
+
+    @TestClass  - one test-class schema name (e.g. N'test_AssessCustomer');
+                  NULL = export every generated test class.
+    @Like       - LIKE filter on the test-class name (e.g. N'test\_usp%');
+                  NULL = no filter.
+    @OutputMode - 'RESULT' (default) returns one NVARCHAR(MAX) row (the script);
+                  'PRINT' prints it in 4000-char chunks for SSMS.
+
+  The exported script:
+    * begins with a PRE-FLIGHT GUARD that aborts cleanly (RAISERROR + NOEXEC)
+      if tSQLt or the TestGen runtime helpers are absent on the target;
+    * recreates each class with tSQLt.NewTestClass (drop+create = idempotent);
+    * reproduces each test proc verbatim, preserving the leading
+      --[@tSQLt:SkipTest] annotation that tSQLt reads to honour skips.
+=============================================================================*/
+CREATE PROCEDURE TestGen.ExportTestClasses
+    @TestClass  SYSNAME       = NULL,
+    @Like       NVARCHAR(256) = NULL,
+    @OutputMode VARCHAR(10)   = 'RESULT'
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @nl  NCHAR(2)      = NCHAR(13) + NCHAR(10);
+    DECLARE @go  NVARCHAR(8)   = NCHAR(13) + NCHAR(10) + N'GO' + NCHAR(13) + NCHAR(10);
+    DECLARE @S   NVARCHAR(MAX) = N'';
+    DECLARE @cls SYSNAME;
+    DECLARE @def NVARCHAR(MAX);
+    DECLARE @n   INT           = 0;
+
+    -- header ------------------------------------------------------------------
+    SET @S =
+        N'/* ============================================================================' + @nl +
+        N'   UnitAutogen - exported tSQLt test classes' + @nl +
+        N'   Source database : ' + DB_NAME() + @nl +
+        N'   Exported (UTC)  : ' + CONVERT(NVARCHAR(30), SYSUTCDATETIME(), 120) + @nl +
+        N'   Deploy: run against any database that ALREADY has tSQLt + UnitAutogen (TestGen).' + @nl +
+        N'           The pre-flight block below aborts cleanly if either is missing.' + @nl +
+        N'   ============================================================================ */' + @nl;
+
+    -- pre-flight guard --------------------------------------------------------
+    SET @S = @S + @go +
+        N'SET NOEXEC OFF;' + @nl +
+        N'DECLARE @uagdb SYSNAME = DB_NAME();' + @nl +
+        N'IF SCHEMA_ID(N''tSQLt'') IS NULL OR OBJECT_ID(N''tSQLt.FakeTable'') IS NULL' + @nl +
+        N'BEGIN' + @nl +
+        N'    RAISERROR(N''ExportTestClasses: tSQLt is not installed in database [%s]. Install tSQLt, then re-run this script.'', 16, 1, @uagdb);' + @nl +
+        N'    SET NOEXEC ON;' + @nl +
+        N'END;' + @nl +
+        N'IF SCHEMA_ID(N''TestGen'') IS NULL' + @nl +
+        N'   OR OBJECT_ID(N''TestGen.SafeFakeTable'') IS NULL' + @nl +
+        N'   OR OBJECT_ID(N''TestGen.AssertResultRowsMatchBaseline'') IS NULL' + @nl +
+        N'   OR OBJECT_ID(N''TestGen.AssertResultShape'') IS NULL' + @nl +
+        N'BEGIN' + @nl +
+        N'    RAISERROR(N''ExportTestClasses: UnitAutogen (TestGen) runtime helpers are missing in database [%s]. Install UnitAutogen, then re-run this script.'', 16, 1, @uagdb);' + @nl +
+        N'    SET NOEXEC ON;' + @nl +
+        N'END;' + @go;
+
+    -- emit each test class ----------------------------------------------------
+    DECLARE c CURSOR LOCAL FAST_FORWARD FOR
+        SELECT s.name
+        FROM   sys.schemas s
+        JOIN   sys.extended_properties ep
+               ON ep.class = 3 AND ep.major_id = s.schema_id AND ep.name = N'tSQLt.TestClass'
+        WHERE  (@TestClass IS NULL OR s.name = @TestClass)
+          AND  (@Like      IS NULL OR s.name LIKE @Like)
+        ORDER  BY s.name;
+    OPEN c;
+    FETCH NEXT FROM c INTO @cls;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @n = @n + 1;
+        SET @S = @S +
+            N'-- ===== ' + @cls + N' =====' + @nl +
+            N'EXEC tSQLt.NewTestClass ''' + REPLACE(@cls, '''', '''''') + N''';' + @go;
+
+        DECLARE p CURSOR LOCAL FAST_FORWARD FOR
+            SELECT m.definition
+            FROM   sys.procedures o
+            JOIN   sys.sql_modules m ON o.object_id = m.object_id
+            WHERE  o.schema_id = SCHEMA_ID(@cls)
+            ORDER  BY CASE WHEN o.name = N'SetUp' THEN 0 ELSE 1 END, o.name;
+        OPEN p;
+        FETCH NEXT FROM p INTO @def;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SET @S = @S + @def + @go;   -- verbatim: keeps the SkipTest annotation
+            FETCH NEXT FROM p INTO @def;
+        END;
+        CLOSE p; DEALLOCATE p;
+
+        FETCH NEXT FROM c INTO @cls;
+    END;
+    CLOSE c; DEALLOCATE c;
+
+    -- footer ------------------------------------------------------------------
+    SET @S = @S +
+        N'SET NOEXEC OFF;' + @nl +
+        N'PRINT N''UnitAutogen: deployed ' + CAST(@n AS NVARCHAR(10)) + N' test class(es) from ' + DB_NAME() + N'.'';' + @nl;
+
+    IF @OutputMode = 'PRINT'
+    BEGIN
+        DECLARE @i INT = 1, @len INT = DATALENGTH(@S) / 2;
+        WHILE @i <= @len
+        BEGIN
+            PRINT SUBSTRING(@S, @i, 4000);
+            SET @i = @i + 4000;
+        END;
+    END
+    ELSE
+        SELECT @S AS ExportScript;
+END;
+GO
+PRINT 'TestGen.ExportTestClasses installed.';
+GO
+
 /* === 06_Schema_Generator.sql === */
 /*****************************************************************************
  * TestGen.GenerateTestsForSchema
@@ -16883,6 +17120,11 @@ BEGIN
     DECLARE @fakes NVARCHAR(MAX), @dir VARCHAR(8), @i INT,
             @seed NVARCHAR(MAX), @sup BIT, @rsn NVARCHAR(400),
             @tname NVARCHAR(300), @body NVARCHAR(MAX), @esc NVARCHAR(MAX), @ps NVARCHAR(MAX), @eb BIT;
+    -- BUG-001 (AAA branch-effect): loop-scoped vars hoisted to proc top (a DECLARE
+    -- with initializer inside a loop body evaluates the initializer only once).
+    DECLARE @arrange NVARCHAR(MAX), @hcols NVARCHAR(MAX), @hExpr NVARCHAR(MAX),
+            @aft NVARCHAR(MAX), @emsg NVARCHAR(MAX),
+            @mcb INT, @mca INT, @mhc BIT, @merr NVARCHAR(MAX);
 
     DECLARE c CURSOR LOCAL FAST_FORWARD FOR
         SELECT InboxId, BranchId, StartLine, Shape, TargetTablesJson, PredicateText, UnsupportedReason, BodyDmlSeedJson
@@ -16929,19 +17171,26 @@ BEGIN
 
                 IF @sup = 1 AND @ps IS NOT NULL
                 BEGIN
+                    -- BUG-001 (AAA): Arrange -> Act -> Assert. The arm's effect is
+                    -- OBSERVED (TestGen.MeasureBranchEffect runs this direction's Arrange +
+                    -- the proc under a rolled-back transaction and reports the write
+                    -- target's row count + content-hash delta); a SELF-CONTAINED post-Act
+                    -- assertion is emitted to match (grew=INSERT / shrank=DELETE /
+                    -- held+changed=UPDATE / held+same=no-write). Conservative: no single
+                    -- write target, a capture error, or a transactional context -> smoke
+                    -- fallback. There is NO pre-Act assertion: the old one asserted the
+                    -- test's own seed (not the proc), broke AAA, and was tautological for a
+                    -- literal seed (a failed seed already errors the test on its own line).
                     SET @tgtFake = N''; SET @tgtBefore = N''; SET @tgtAssert = N''; SET @preSeed = NULL;
-                    -- v0.11.1: assert the guarded write (INSERT / UPDATE / DELETE) did NOT fire
-                    -- on the boundary seed. Only when T is a separate write target (not a gate
-                    -- source). Pre-seed T with sample rows so UPDATE/DELETE have something to act
-                    -- on, then compare full content before/after: a row-count change catches
-                    -- INSERT/DELETE; AssertEqualsTable catches UPDATE. Mutating > to >= makes the
-                    -- gate true at the boundary, the write fires, the content differs, test fails.
-                    IF @dir = 'FALSE' AND @TargetTable IS NOT NULL
+
+                    -- ARRANGE. When the write target is a SEPARATE table from any gate
+                    -- source, fake + pre-seed it (parser-lifted WHERE overrides when
+                    -- available, else generic) so a selective UPDATE/DELETE in this arm has
+                    -- rows to act on. When target = gate source the gate seed already
+                    -- populates it - faking again would wipe that seed, so leave it.
+                    IF @TargetTable IS NOT NULL
                        AND CHARINDEX(N'N''' + @TargetPlain + N'''', ISNULL(@fakes, N'')) = 0
                     BEGIN
-                        -- v0.12: when the parser lifted seed overrides from the guarded
-                        -- DML's WHERE (col=literal / col IN(...)), seed rows that satisfy it
-                        -- so a selective UPDATE/DELETE actually hits them. Else generic seed.
                         SET @preSeed = TestGen.BuildSeedInsert(@TargetSchema, @TargetName,
                             CASE WHEN @BodyDmlSeedJson IS NOT NULL
                                       AND JSON_VALUE(@BodyDmlSeedJson, N'$.table') = @TargetName
@@ -16949,33 +17198,88 @@ BEGIN
                                  THEN JSON_QUERY(@BodyDmlSeedJson, N'$.overrides') ELSE NULL END, 3);
                         SET @tgtFake = N'    EXEC TestGen.SafeFakeTable N''' + REPLACE(@TargetPlain, @q, @q + @q) + N''';' + @crlf
                                      + ISNULL(N'    ' + @preSeed + @crlf, N'');
-                        SET @tgtBefore = N'    SELECT * INTO #uag_tgt_before FROM ' + @TargetTable + N';' + @crlf;
-                        SET @tgtAssert = N'    SELECT * INTO #uag_tgt_after FROM ' + @TargetTable + N';' + @crlf
-                            + N'    DECLARE @uag_cb INT = (SELECT COUNT(*) FROM #uag_tgt_before);' + @crlf
-                            + N'    DECLARE @uag_ca INT = (SELECT COUNT(*) FROM #uag_tgt_after);' + @crlf
-                            + N'    EXEC tSQLt.AssertEquals @Expected = @uag_cb, @Actual = @uag_ca,' + @crlf
-                            + N'         @Message = N''v0.11 boundary: gate is FALSE with this seed but the guarded write to '
-                            + REPLACE(@TargetPlain, @q, @q + @q) + N' changed its row count - the comparison operator may have been loosened (e.g. > to >=).'';' + @crlf
-                            + N'    EXEC tSQLt.AssertEqualsTable ''#uag_tgt_before'', ''#uag_tgt_after'';' + @crlf;
+                    END;
+                    SET @arrange = ISNULL(@fakes, N'') + @tgtFake + ISNULL(@seed + @crlf, N'');
+
+                    -- ASSERT, by observation: measure this direction's effect on the target.
+                    IF @TargetTable IS NOT NULL
+                    BEGIN
+                        SET @merr = NULL; SET @mcb = NULL; SET @mca = NULL; SET @mhc = NULL;
+                        EXEC TestGen.MeasureBranchEffect
+                             @SetupBlock = @arrange, @FullProc = @full, @ArgList = @args,
+                             @TargetFull = @TargetTable,
+                             @CntBefore = @mcb OUTPUT, @CntAfter = @mca OUTPUT,
+                             @HashChanged = @mhc OUTPUT, @MeasErr = @merr OUTPUT;
+
+                        IF @merr IS NULL AND @mcb IS NOT NULL AND @mca IS NOT NULL
+                        BEGIN
+                            SET @hcols = TestGen.ChecksumColList(@TargetTable);
+                            SET @hExpr = CASE WHEN @hcols IS NULL THEN N'CAST(NULL AS INT)'
+                                              ELSE N'CHECKSUM_AGG(BINARY_CHECKSUM(' + @hcols + N'))' END;
+                            -- before snapshot (Arrange tail)
+                            SET @tgtBefore = N'    DECLARE @uag_cb INT = (SELECT COUNT(*) FROM ' + @TargetTable + N');' + @crlf
+                                           + N'    DECLARE @uag_hb INT = (SELECT ' + @hExpr + N' FROM ' + @TargetTable + N');' + @crlf;
+                            -- after capture (post-Act, shared by every classification)
+                            SET @aft = N'    DECLARE @uag_ca INT = (SELECT COUNT(*) FROM ' + @TargetTable + N');' + @crlf
+                                     + N'    DECLARE @uag_ha INT = (SELECT ' + @hExpr + N' FROM ' + @TargetTable + N');' + @crlf
+                                     + N'    DECLARE @uag_chg INT = CASE WHEN @uag_hb <> @uag_ha' + @crlf
+                                     + N'         OR (CASE WHEN @uag_hb IS NULL THEN 1 ELSE 0 END <> CASE WHEN @uag_ha IS NULL THEN 1 ELSE 0 END)' + @crlf
+                                     + N'         THEN 1 ELSE 0 END;' + @crlf;
+                            IF @mca > @mcb
+                            BEGIN  -- INSERT arm: rows added
+                                SET @emsg = REPLACE(N'branch ' + @dir + N': expected the procedure to add '
+                                          + CAST(@mca - @mcb AS NVARCHAR(10)) + N' row(s) to ' + @TargetPlain + N'.', @q, @q + @q);
+                                SET @tgtAssert = @aft
+                                    + N'    DECLARE @uag_delta INT = @uag_ca - @uag_cb;' + @crlf
+                                    + N'    EXEC tSQLt.AssertEquals @Expected = ' + CAST(@mca - @mcb AS NVARCHAR(10)) + N', @Actual = @uag_delta,' + @crlf
+                                    + N'         @Message = N''' + @emsg + N''';' + @crlf;
+                            END
+                            ELSE IF @mca < @mcb
+                            BEGIN  -- DELETE arm: rows removed
+                                SET @emsg = REPLACE(N'branch ' + @dir + N': expected the procedure to remove '
+                                          + CAST(@mcb - @mca AS NVARCHAR(10)) + N' row(s) from ' + @TargetPlain + N'.', @q, @q + @q);
+                                SET @tgtAssert = @aft
+                                    + N'    DECLARE @uag_delta INT = @uag_cb - @uag_ca;' + @crlf
+                                    + N'    EXEC tSQLt.AssertEquals @Expected = ' + CAST(@mcb - @mca AS NVARCHAR(10)) + N', @Actual = @uag_delta,' + @crlf
+                                    + N'         @Message = N''' + @emsg + N''';' + @crlf;
+                            END
+                            ELSE IF @mhc = 1 AND @hcols IS NOT NULL
+                            BEGIN  -- UPDATE arm: row count held, content changed
+                                SET @emsg = REPLACE(N'branch ' + @dir + N': expected the procedure to change '
+                                          + @TargetPlain + N' content with the row count held.', @q, @q + @q);
+                                SET @tgtAssert = @aft
+                                    + N'    EXEC tSQLt.AssertEquals @Expected = @uag_cb, @Actual = @uag_ca,' + @crlf
+                                    + N'         @Message = N''' + @emsg + N''';' + @crlf
+                                    + N'    EXEC tSQLt.AssertEquals @Expected = 1, @Actual = @uag_chg,' + @crlf
+                                    + N'         @Message = N''' + @emsg + N''';' + @crlf;
+                            END
+                            ELSE
+                            BEGIN  -- row count held, content unchanged: this arm writes nothing observable
+                                SET @emsg = REPLACE(N'branch ' + @dir + N': expected no change to '
+                                          + @TargetPlain + N' (row count and content held).', @q, @q + @q);
+                                SET @tgtAssert = @aft
+                                    + N'    EXEC tSQLt.AssertEquals @Expected = @uag_cb, @Actual = @uag_ca,' + @crlf
+                                    + N'         @Message = N''' + @emsg + N''';' + @crlf
+                                    + CASE WHEN @hcols IS NULL THEN N''
+                                        ELSE N'    EXEC tSQLt.AssertEquals @Expected = 0, @Actual = @uag_chg,' + @crlf
+                                           + N'         @Message = N''' + @emsg + N''';' + @crlf END;
+                            END;
+                        END;
                     END;
 
+                    -- ASSEMBLE in Arrange -> (before snapshot) -> Act -> Assert order.
                     SET @body = N'CREATE PROCEDURE ' + QUOTENAME(@TestClassName) + N'.' + QUOTENAME(@tname) + @crlf
-                        + N'AS' + @crlf + N'BEGIN' + @crlf + ISNULL(@fakes, N'') + @tgtFake;
-                    IF @seed IS NOT NULL SET @body = @body + @seed + @crlf;
-                    -- STRONG assertion: the seed must drive the gate predicate to
-                    -- the intended direction (no ghost pass - a wrong seed fails here).
-                    SET @body = @body
-                        + N'    DECLARE @uag_actual BIT = CASE WHEN ' + @ps + N' THEN 1 ELSE 0 END;' + @crlf
-                        + N'    EXEC tSQLt.AssertEquals @Expected = ' + CAST(@eb AS NVARCHAR(1)) + N', @Actual = @uag_actual,' + @crlf
-                        + N'         @Message = N''v0.10 ' + @dir + N': seed did not drive the gate predicate ' + @dir + N' (branch not exercised)'';' + @crlf
+                        + N'AS' + @crlf + N'BEGIN' + @crlf
+                        + @arrange
                         + @tgtBefore
                         + N'    BEGIN TRY' + @crlf
                         + N'        EXEC ' + @full + N' ' + @args + N';' + @crlf
                         + N'    END TRY BEGIN CATCH' + @crlf
-                        + N'        DECLARE @e NVARCHAR(MAX) = N''v0.10 branch ' + @dir
-                        + N' seed EXEC failed: '' + ERROR_MESSAGE();' + @crlf
-                        + N'        EXEC tSQLt.Fail @e;' + @crlf
-                        + N'    END CATCH;' + @crlf + @tgtAssert + N'END;';
+                        + N'        DECLARE @uag_e NVARCHAR(MAX) = N''branch ' + @dir + N' EXEC failed: '' + ERROR_MESSAGE();' + @crlf
+                        + N'        EXEC tSQLt.Fail @uag_e;' + @crlf
+                        + N'    END CATCH;' + @crlf
+                        + @tgtAssert
+                        + N'END;';
                 END
                 ELSE
                 BEGIN
@@ -16994,6 +17298,37 @@ BEGIN
         FETCH NEXT FROM c INTO @InboxId, @BranchId, @StartLine, @Shape, @TablesJson, @PredText, @UnsReason, @BodyDmlSeedJson;
     END;
     CLOSE c; DEALLOCATE c;
+
+    -- v0.14.0: prune the redundant footprint SKIP. The base generator's
+    -- "touches only mocked tables" test SkipTest-annotates itself when the
+    -- happy-path seed drove no measurable row-count change (often a count-stable
+    -- UPDATE the count probe can't see). When this proc's writes are already
+    -- covered by an effect-asserting predicate-branch test, that skip asserts
+    -- nothing and is pure noise - drop it. A footprint test that actually measured
+    -- (i.e. passes) is kept; and a skip is kept whenever NO effect-asserting branch
+    -- test exists, so a surviving skip is a meaningful "no test characterized this
+    -- write - review it" signal rather than routine yellow.
+    IF @Execute = 1
+       AND EXISTS (SELECT 1 FROM sys.procedures p
+                   JOIN   sys.sql_modules m ON m.object_id = p.object_id
+                   WHERE  p.schema_id = SCHEMA_ID(@TestClassName)
+                     AND  p.name LIKE '% branch % line % predicate %'
+                     AND  m.definition LIKE '%@uag_ca%')   -- a v0.14.0 effect-asserting branch test
+    BEGIN
+        DECLARE @dropFp NVARCHAR(MAX) = N'';
+        SELECT @dropFp = @dropFp + N'DROP PROCEDURE ' + QUOTENAME(@TestClassName) + N'.' + QUOTENAME(p.name) + N';' + @crlf
+        FROM   sys.procedures p
+        JOIN   sys.sql_modules m ON m.object_id = p.object_id
+        WHERE  p.schema_id = SCHEMA_ID(@TestClassName)
+          AND  p.name LIKE '%touches only mocked tables%'
+          AND  m.definition LIKE '%@tSQLt:SkipTest%';
+        IF LEN(@dropFp) > 0
+        BEGIN
+            EXEC sys.sp_executesql @dropFp;
+            PRINT 'GeneratePredicateBranchTests: dropped a redundant footprint SkipTest ('
+                + 'writes are covered by effect-asserting branch tests).';
+        END;
+    END;
 
     PRINT 'GeneratePredicateBranchTests: emitted ' + CAST(@TestsEmitted AS NVARCHAR(10))
         + ' predicate-branch test(s) into ' + QUOTENAME(@TestClassName) + '.';

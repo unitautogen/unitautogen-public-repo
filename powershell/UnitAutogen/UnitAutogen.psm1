@@ -590,9 +590,88 @@ function Export-CoverageHtmlReport {
 }
 
 
+function Export-UnitAutogenTests {
+    <#
+    .SYNOPSIS
+        Exports the generated tSQLt test classes from a database into a single,
+        deployable .sql script.
+
+    .DESCRIPTION
+        Calls TestGen.ExportTestClasses and writes the returned script to a file.
+        Run that script against any OTHER database that already has tSQLt and
+        UnitAutogen (TestGen) installed to recreate the tests there. The script is
+        idempotent (drops + recreates each class) and starts with a pre-flight
+        guard that aborts cleanly if tSQLt or TestGen is missing on the target.
+
+    .PARAMETER ServerInstance
+        SQL Server instance name.
+
+    .PARAMETER Database
+        Source database (where the tests were generated).
+
+    .PARAMETER OutputFile
+        Path to write the .sql script. Default: unitautogen-tests.sql
+
+    .PARAMETER TestClass
+        Export a single test class (e.g. 'test_MyProc'). Default: all classes.
+
+    .PARAMETER Like
+        LIKE filter on the test-class name (e.g. 'test\_usp%'). Default: all.
+
+    .PARAMETER Credential
+        PSCredential for SQL auth. Omit for Windows auth.
+
+    .EXAMPLE
+        Export-UnitAutogenTests `
+            -ServerInstance 'sql01' `
+            -Database       'DevDB' `
+            -OutputFile     './tests/unitautogen-tests.sql'
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]       $ServerInstance,
+        [Parameter(Mandatory)] [string]       $Database,
+        [string]               $OutputFile = 'unitautogen-tests.sql',
+        [string]               $TestClass  = $null,
+        [string]               $Like       = $null,
+        [PSCredential]         $Credential = $null
+    )
+
+    $connParams = Build-ConnParams -ServerInstance $ServerInstance -Database $Database `
+                      -Credential $Credential
+
+    $argList = @()
+    if ($TestClass) { $argList += "@TestClass = N'$($TestClass -replace "'","''")'" }
+    if ($Like)      { $argList += "@Like = N'$($Like -replace "'","''")'" }
+    $argList += "@OutputMode = 'RESULT'"
+    $query = "EXEC TestGen.ExportTestClasses " + ($argList -join ', ') + ";"
+
+    Write-Host "[UnitAutogen] Exporting test classes from [$Database]..."
+
+    # -MaxCharLength: Invoke-Sqlcmd truncates column values at 4000 chars by
+    # default; override so the full export script reaches PowerShell.
+    $result = Invoke-Sqlcmd @connParams -Query $query -MaxCharLength ([int]::MaxValue)
+    $script = $result.ExportScript
+
+    if (-not $script) {
+        throw "[UnitAutogen] ExportTestClasses returned no script - no matching " +
+              "generated test classes were found in [$Database]."
+    }
+
+    $dir = Split-Path -Parent $OutputFile
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    [System.IO.File]::WriteAllText($OutputFile, $script, (New-Object System.Text.UTF8Encoding($false)))
+    $bytes = (Get-Item -LiteralPath $OutputFile).Length
+    Write-Host "[UnitAutogen] Test classes exported -> $((Resolve-Path $OutputFile).Path) ($bytes bytes)"
+}
+
+
 # =============================================================================
 Export-ModuleMember -Function Install-UnitAutogenDatabase,
                                Invoke-UnitAutogen,
                                Export-CoverageCoberturaXml,
                                Export-TestResultsJunitXml,
-                               Export-CoverageHtmlReport
+                               Export-CoverageHtmlReport,
+                               Export-UnitAutogenTests
