@@ -3141,6 +3141,157 @@ GO
 PRINT 'TestGen.MeasureBranchEffect created (BUG-001 branch-effect measurement).';
 GO
 
+/*****************************************************************************
+ * TestGen.FormatTypeDecl  -  a T-SQL type declaration string for a scalar type
+ * (used to DECLARE a local of a procedure parameter's exact type so an OUTPUT
+ * value can be captured). e.g. ('nvarchar',120,..,..) -> 'NVARCHAR(60)'.
+ *****************************************************************************/
+IF OBJECT_ID('TestGen.FormatTypeDecl', 'FN') IS NOT NULL
+    DROP FUNCTION TestGen.FormatTypeDecl;
+GO
+CREATE FUNCTION TestGen.FormatTypeDecl(@typeName SYSNAME, @maxLen INT, @prec INT, @scale INT)
+RETURNS NVARCHAR(100)
+AS
+BEGIN
+    DECLARE @t NVARCHAR(100) = LOWER(@typeName);
+    RETURN CASE
+        WHEN @t IN (N'nvarchar', N'nchar')
+            THEN UPPER(@t) + N'(' + CASE WHEN @maxLen = -1 THEN N'MAX' ELSE CAST(@maxLen / 2 AS NVARCHAR(10)) END + N')'
+        WHEN @t IN (N'varchar', N'char', N'varbinary', N'binary')
+            THEN UPPER(@t) + N'(' + CASE WHEN @maxLen = -1 THEN N'MAX' ELSE CAST(@maxLen AS NVARCHAR(10)) END + N')'
+        WHEN @t IN (N'decimal', N'numeric')
+            THEN UPPER(@t) + N'(' + CAST(@prec AS NVARCHAR(10)) + N',' + CAST(@scale AS NVARCHAR(10)) + N')'
+        WHEN @t IN (N'datetime2', N'datetimeoffset', N'time')
+            THEN UPPER(@t) + N'(' + CAST(@scale AS NVARCHAR(10)) + N')'
+        ELSE UPPER(@t)
+    END;
+END;
+GO
+PRINT 'TestGen.FormatTypeDecl created.';
+GO
+
+/*****************************************************************************
+ * TestGen.CaptureBranchOutputs  -  per-branch OUTPUT-value measurement
+ * ---------------------------------------------------------------------------
+ * Runs ONE branch direction's Arrange (SafeFakeTable + seed) + the procedure
+ * once, inside the generator's own (rolled-back) transaction, CAPTURING the
+ * procedure's scalar OUTPUT parameter values. The generated branch test then
+ * asserts those exact values - so each branch verifies the result it produces,
+ * not just that it ran. Scalar variables survive the ROLLBACK, so the captured
+ * delimited string is read back through @OutCsv after everything is undone.
+ *
+ *   @OutDecls   DECLARE @uag_o_<p> <type>; ... (the capture locals)
+ *   @ExecArgs   arg list that binds each OUTPUT param as @p = @uag_o_<p> OUTPUT
+ *   @OutCsvExpr expression that builds the NCHAR(2)-delimited value string
+ *               (NCHAR(0) = a NULL value), in parameter order
+ *
+ * Same safety model as TestGen.MeasureBranchEffect: NON-transactional context
+ * only; never throws (any error -> @Err set, @OutCsv NULL -> caller skips the
+ * value assertion and the branch test is unchanged).
+ *****************************************************************************/
+IF OBJECT_ID('TestGen.CaptureBranchOutputs', 'P') IS NOT NULL
+    DROP PROCEDURE TestGen.CaptureBranchOutputs;
+GO
+CREATE PROCEDURE TestGen.CaptureBranchOutputs
+    @SetupBlock NVARCHAR(MAX),
+    @FullProc   NVARCHAR(300),
+    @ExecArgs   NVARCHAR(MAX),
+    @OutDecls   NVARCHAR(MAX),
+    @OutCsvExpr NVARCHAR(MAX),
+    @OutCsv     NVARCHAR(MAX) OUTPUT,
+    @Err        NVARCHAR(MAX) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET @OutCsv = NULL; SET @Err = NULL;
+    IF @@TRANCOUNT <> 0 BEGIN SET @Err = N'skipped: requires a non-transactional context'; RETURN; END;
+    IF @SetupBlock IS NULL OR @OutDecls IS NULL OR @OutCsvExpr IS NULL
+        BEGIN SET @Err = N'skipped: missing setup/decls/expr'; RETURN; END;
+
+    DECLARE @nl NVARCHAR(2) = NCHAR(13) + NCHAR(10);
+    DECLARE @batch NVARCHAR(MAX) =
+        N'SET NOCOUNT ON;' + @nl +
+        N'DECLARE @tc0 INT = @@TRANCOUNT;' + @nl +
+        @OutDecls + @nl +
+        N'BEGIN TRY' + @nl +
+        N'  BEGIN TRAN;' + @nl +
+        @SetupBlock + @nl +
+        N'  EXEC ' + @FullProc + N' ' + @ExecArgs + N';' + @nl +
+        N'  SET @OutCsvOut = ' + @OutCsvExpr + N';' + @nl +
+        N'  IF @@TRANCOUNT > @tc0 ROLLBACK TRAN;' + @nl +
+        N'END TRY' + @nl +
+        N'BEGIN CATCH' + @nl +
+        N'  IF @@TRANCOUNT > @tc0 ROLLBACK TRAN;' + @nl +
+        N'  SET @ErrOut = N''output capture run error: '' + ERROR_MESSAGE();' + @nl +
+        N'END CATCH;';
+    BEGIN TRY
+        EXEC sys.sp_executesql @batch,
+             N'@OutCsvOut NVARCHAR(MAX) OUTPUT, @ErrOut NVARCHAR(MAX) OUTPUT',
+             @OutCsvOut = @OutCsv OUTPUT, @ErrOut = @Err OUTPUT;
+    END TRY
+    BEGIN CATCH
+        SET @Err = N'output capture batch error: ' + ERROR_MESSAGE();
+    END CATCH;
+    IF @@TRANCOUNT <> 0 ROLLBACK;
+END;
+GO
+PRINT 'TestGen.CaptureBranchOutputs created (per-branch OUTPUT-value measurement).';
+GO
+
+/*****************************************************************************
+ * TestGen.BuildLikeSkeleton  -  constant skeleton of a non-deterministic OUTPUT
+ * ---------------------------------------------------------------------------
+ * When an OUTPUT value mixes string CONSTANTS with a runtime-volatile part
+ * (e.g. SET @Result = 'Processed at ' + CONVERT(...,GETDATE()) + ' for ' + @n),
+ * an exact assertion would false-fail and skipping it asserts nothing. This
+ * builds an ordered LIKE pattern from the procedure's own string literals that
+ * actually appear in the measured value - '%' standing in for the volatile
+ * spans - so the deterministic skeleton is still verified. The literals come
+ * from the SOURCE (guaranteed constant); a literal is included only if it is a
+ * substring of the measured value (so it belongs to THIS path's output and is
+ * therefore present at run time too). LIKE wildcards in a literal are escaped.
+ * Returns NULL when no usable literal is found (caller falls back to NOT NULL).
+ *****************************************************************************/
+IF OBJECT_ID('TestGen.BuildLikeSkeleton', 'FN') IS NOT NULL
+    DROP FUNCTION TestGen.BuildLikeSkeleton;
+GO
+CREATE FUNCTION TestGen.BuildLikeSkeleton(@src NVARCHAR(MAX), @val NVARCHAR(MAX))
+RETURNS NVARCHAR(MAX)
+AS
+BEGIN
+    IF @src IS NULL OR @val IS NULL RETURN NULL;
+    DECLARE @q NCHAR(1) = NCHAR(39);
+    -- protect escaped quotes ('') so the split below sees only string boundaries
+    DECLARE @s2 NVARCHAR(MAX) = REPLACE(@src, @q + @q, NCHAR(1));
+    DECLARE @lits TABLE (vpos INT, lit NVARCHAR(MAX));
+    DECLARE @p INT = 1, @open INT, @close INT, @lit NVARCHAR(MAX), @vpos INT;
+    WHILE 1 = 1
+    BEGIN
+        SET @open = CHARINDEX(@q, @s2, @p);
+        IF @open = 0 BREAK;
+        SET @close = CHARINDEX(@q, @s2, @open + 1);
+        IF @close = 0 BREAK;
+        SET @lit = REPLACE(SUBSTRING(@s2, @open + 1, @close - @open - 1), NCHAR(1), @q);
+        IF DATALENGTH(@lit) / 2 >= 2
+        BEGIN
+            SET @vpos = CHARINDEX(@lit, @val);
+            IF @vpos > 0 AND NOT EXISTS (SELECT 1 FROM @lits WHERE lit = @lit)
+                INSERT @lits (vpos, lit) VALUES (@vpos, @lit);
+        END;
+        SET @p = @close + 1;
+    END;
+    IF NOT EXISTS (SELECT 1 FROM @lits) RETURN NULL;
+    DECLARE @pat NVARCHAR(MAX);
+    SELECT @pat = N'%' + STRING_AGG(
+                    REPLACE(REPLACE(REPLACE(lit, N'[', N'[[]'), N'%', N'[%]'), N'_', N'[_]'),
+                    N'%') WITHIN GROUP (ORDER BY vpos) + N'%'
+    FROM @lits;
+    RETURN @pat;
+END;
+GO
+PRINT 'TestGen.BuildLikeSkeleton created (volatile OUTPUT constant-skeleton).';
+GO
+
 IF OBJECT_ID('TestGen.AnalyzeBranchPaths', 'P') IS NOT NULL
     DROP PROCEDURE TestGen.AnalyzeBranchPaths;
 GO
@@ -5739,10 +5890,14 @@ BEGIN
         SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF;
         SET @S = @S + N'    -- Arrange' + @CRLF + @MockBlock + @CRLF;
         SET @S = @S + ISNULL(@OutputDecls, N'');
-        SET @S = @S + @PreCnt;
-        SET @S = @S + N'    -- Act + Assert: run under faked + seeded deps.  A throw fails the test;' + @CRLF;
-        SET @S = @S + N'    -- for a count-stable proc the before/after row-count guard then asserts' + @CRLF;
-        SET @S = @S + N'    -- no rows were added or removed.' + @CRLF;
+        -- "executes with valid inputs" is a PURE SMOKE check, uniform for read-only AND
+        -- writing procedures: the procedure must run to completion on a valid call against
+        -- its faked + seeded dependencies (a throw fails it). No row-count / footprint
+        -- assertion here - that is owned by "touches only mocked tables" (same happy-path
+        -- inputs) and the per-branch effect tests, so this test means one thing everywhere.
+        SET @S = @S + N'    -- Act + Assert (smoke): the procedure must run to completion on a valid' + @CRLF;
+        SET @S = @S + N'    -- call against its faked + seeded deps; a throw fails the test. The write' + @CRLF;
+        SET @S = @S + N'    -- footprint is asserted by "touches only mocked tables" + the branch tests.' + @CRLF;
         SET @S = @S + N'    BEGIN TRY' + @CRLF;
         SET @S = @S + N'        EXEC ' + @FullProc;
         IF LEN(@ArgListHappy) > 0
@@ -5753,7 +5908,6 @@ BEGIN
         SET @S = @S + N'        DECLARE @failMsg NVARCHAR(MAX) = N''Procedure raised an error on valid inputs: '' + ERROR_MESSAGE();' + @CRLF;
         SET @S = @S + N'        EXEC tSQLt.Fail @failMsg;' + @CRLF;
         SET @S = @S + N'    END CATCH;' + @CRLF;
-        SET @S = @S + @PostCnt;
         SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
 
         /* -- Test 2: low / high boundary -------------------------------- */
@@ -6444,15 +6598,130 @@ BEGIN
             SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
         END;
 
-        /* -- Test 6: OUTPUT parameter shape ----------------------------- */
+        /* -- Test 6: OUTPUT parameter value(s) -------------------------- */
         IF @HasOutput = 1
         BEGIN
             IF @HappySkipReason IS NOT NULL
                 SET @HappyCpList = @HappyCpList + CAST(DATALENGTH(@S) / 2 + 1 AS NVARCHAR(20)) + N',';
+
+            -- v0.14.1: this test checks the OUTPUT variable(s) ONLY. Assert the value(s)
+            -- the happy-path call produces, measured at generation time. The mocked-table
+            -- row-count guard is intentionally NOT here - that footprint is owned by
+            -- "touches only mocked tables". Falls back to smoke (no value assertion) for a
+            -- non-deterministic proc / unmeasurable capture, so there are no false-fails.
+            DECLARE @ovQ NCHAR(1) = NCHAR(39);
+            DECLARE @ovNonDet BIT = CASE WHEN @SrcU LIKE N'%GETDATE%' OR @SrcU LIKE N'%SYSDATETIME%'
+                                          OR @SrcU LIKE N'%GETUTCDATE%' OR @SrcU LIKE N'%SYSUTCDATETIME%'
+                                          OR @SrcU LIKE N'%CURRENT[_]TIMESTAMP%' OR @SrcU LIKE N'%NEWID%'
+                                          OR @SrcU LIKE N'%NEWSEQUENTIALID%' OR @SrcU LIKE N'%RAND(%'
+                                          OR @SrcU LIKE N'%CRYPT[_]GEN[_]RANDOM%'
+                                        THEN 1 ELSE 0 END;
+            DECLARE @ovCapExpr NVARCHAR(MAX) = NULL, @ovAssert NVARCHAR(MAX) = N'';
+            IF @ProbeSafe = 1
+            BEGIN
+                SELECT @ovCapExpr = STRING_AGG(CONVERT(NVARCHAR(MAX),
+                           N'ISNULL(CONVERT(NVARCHAR(MAX), @' + REPLACE(pr.name, N'@', N'') + N'_out), N''<<UAGNULL>>'')'),
+                           N' + NCHAR(2) + ') WITHIN GROUP (ORDER BY pr.parameter_id)
+                FROM sys.parameters pr JOIN sys.types t ON t.user_type_id = pr.user_type_id
+                WHERE pr.object_id = OBJECT_ID(@FullProc) AND pr.parameter_id > 0 AND pr.is_output = 1
+                  AND t.name NOT IN (N'table', N'cursor', N'xml', N'text', N'ntext', N'image', N'geography', N'geometry', N'hierarchyid');
+                IF @ovCapExpr IS NOT NULL
+                BEGIN
+                    DECLARE @ovCsv NVARCHAR(MAX) = NULL, @ovErr NVARCHAR(MAX) = NULL;
+                    DECLARE @ovCsv2 NVARCHAR(MAX) = NULL, @ovErr2 NVARCHAR(MAX) = NULL;
+                    EXEC TestGen.CaptureBranchOutputs @SetupBlock = @MockBlock, @FullProc = @FullProc,
+                         @ExecArgs = @ArgListHappy, @OutDecls = @OutputDecls, @OutCsvExpr = @ovCapExpr,
+                         @OutCsv = @ovCsv OUTPUT, @Err = @ovErr OUTPUT;
+                    -- v0.14.1: double-measure to CONFIRM the value is reproducible before baking it as
+                    -- an exact assertion. The source scan only sees volatile functions written in THIS
+                    -- proc; a second independent rolled-back run also catches non-determinism it can't
+                    -- see - a called function/proc that uses GETDATE/NEWID, a SCOPE_IDENTITY / sequence
+                    -- read, order-sensitive aggregation. Assert EXACT only when the scan is clean AND the
+                    -- two runs agree; otherwise fall back to the constant skeleton.
+                    IF @ovNonDet = 0 AND @ovErr IS NULL AND @ovCsv IS NOT NULL
+                    BEGIN
+                        -- Separate the two reads by more than one system-clock tick so that TIME-based
+                        -- hidden volatility (a nested UDF calling SYSDATETIME/GETDATE) reliably differs
+                        -- between the runs; back-to-back reads can land in the same tick and look stable.
+                        WAITFOR DELAY '00:00:00.020';
+                        EXEC TestGen.CaptureBranchOutputs @SetupBlock = @MockBlock, @FullProc = @FullProc,
+                             @ExecArgs = @ArgListHappy, @OutDecls = @OutputDecls, @OutCsvExpr = @ovCapExpr,
+                             @OutCsv = @ovCsv2 OUTPUT, @Err = @ovErr2 OUTPUT;
+                    END;
+                    IF @ovErr2 IS NOT NULL SET @ovCsv2 = NULL;
+                    IF @ovErr IS NULL AND @ovCsv IS NOT NULL
+                    BEGIN
+                        DECLARE @ovRest NVARCHAR(MAX) = @ovCsv + NCHAR(2), @ovName SYSNAME, @ovPos INT, @ovVal NVARCHAR(MAX), @ovMsg NVARCHAR(MAX), @ovPat NVARCHAR(MAX);
+                        DECLARE @ovRest2 NVARCHAR(MAX) = ISNULL(@ovCsv2, N'') + NCHAR(2), @ovPos2 INT, @ovVal2 NVARCHAR(MAX);
+                        DECLARE @ovHave2 BIT = CASE WHEN @ovCsv2 IS NOT NULL THEN 1 ELSE 0 END;
+                        DECLARE @ovV1Null BIT, @ovV2Null BIT, @ovDiffer BIT, @ovClass INT;
+                        DECLARE ovc CURSOR LOCAL FAST_FORWARD FOR
+                            SELECT pr.name FROM sys.parameters pr JOIN sys.types t ON t.user_type_id = pr.user_type_id
+                            WHERE pr.object_id = OBJECT_ID(@FullProc) AND pr.parameter_id > 0 AND pr.is_output = 1
+                              AND t.name NOT IN (N'table', N'cursor', N'xml', N'text', N'ntext', N'image', N'geography', N'geometry', N'hierarchyid')
+                            ORDER BY pr.parameter_id;
+                        OPEN ovc; FETCH NEXT FROM ovc INTO @ovName;
+                        WHILE @@FETCH_STATUS = 0
+                        BEGIN
+                            SET @ovPos = CHARINDEX(NCHAR(2), @ovRest);
+                            SET @ovVal = LEFT(@ovRest, @ovPos - 1);
+                            SET @ovRest = SUBSTRING(@ovRest, @ovPos + 1, 2000000000);
+                            IF @ovHave2 = 1
+                            BEGIN
+                                SET @ovPos2 = CHARINDEX(NCHAR(2), @ovRest2);
+                                SET @ovVal2 = LEFT(@ovRest2, @ovPos2 - 1);
+                                SET @ovRest2 = SUBSTRING(@ovRest2, @ovPos2 + 1, 2000000000);
+                            END;
+                            SET @ovV1Null = CASE WHEN @ovVal = N'<<UAGNULL>>' THEN 1 ELSE 0 END;
+                            SET @ovV2Null = CASE WHEN @ovHave2 = 1 AND @ovVal2 = N'<<UAGNULL>>' THEN 1 ELSE 0 END;
+                            SET @ovDiffer = CASE WHEN @ovHave2 = 1 AND @ovVal <> @ovVal2 THEN 1 ELSE 0 END;
+                            -- 0=exact  1=null  2=volatile(skeleton/not-null)  3=no assertion (smoke)
+                            SET @ovClass = CASE
+                                WHEN @ovV1Null = 1 AND @ovHave2 = 1 AND @ovV2Null = 0 THEN 3
+                                WHEN @ovV1Null = 0 AND @ovV2Null = 1                  THEN 3
+                                WHEN @ovV1Null = 1                                    THEN 1
+                                WHEN @ovNonDet = 1                                    THEN 2
+                                WHEN @ovDiffer = 1                                    THEN 2
+                                ELSE 0 END;
+                            SET @ovMsg = REPLACE(N'OUTPUT ' + @ovName + N' must equal the value the happy-path call produces.', @ovQ, @ovQ + @ovQ);
+                            IF @ovClass = 1
+                                SET @ovAssert = @ovAssert
+                                    + N'    EXEC tSQLt.AssertEquals @Expected = NULL, @Actual = @' + REPLACE(@ovName, N'@', N'') + N'_out,' + @CRLF
+                                    + N'         @Message = N''' + @ovMsg + N''';' + @CRLF;
+                            ELSE IF @ovClass = 0
+                                SET @ovAssert = @ovAssert
+                                    + N'    DECLARE @uag_os_' + REPLACE(@ovName, N'@', N'') + N' NVARCHAR(MAX) = CONVERT(NVARCHAR(MAX), @' + REPLACE(@ovName, N'@', N'') + N'_out);' + @CRLF
+                                    + N'    EXEC tSQLt.AssertEqualsString @Expected = N''' + REPLACE(@ovVal, @ovQ, @ovQ + @ovQ) + N''',' + @CRLF
+                                    + N'         @Actual = @uag_os_' + REPLACE(@ovName, N'@', N'') + N', @Message = N''' + @ovMsg + N''';' + @CRLF;
+                            ELSE IF @ovClass = 2
+                            BEGIN
+                                -- volatile (source-flagged OR the two runs disagreed): assert the CONSTANT
+                                -- skeleton via LIKE (source string literals present in the value, % for the
+                                -- runtime-varying spans). No usable literal -> assert it was assigned.
+                                SET @ovPat = TestGen.BuildLikeSkeleton(@ProcSource, @ovVal);
+                                SET @ovMsg = REPLACE(N'OUTPUT ' + @ovName + N' must match its constant skeleton (runtime-varying parts wildcarded).', @ovQ, @ovQ + @ovQ);
+                                IF @ovPat IS NOT NULL
+                                    SET @ovAssert = @ovAssert
+                                        + N'    DECLARE @uag_os_' + REPLACE(@ovName, N'@', N'') + N' NVARCHAR(MAX) = CONVERT(NVARCHAR(MAX), @' + REPLACE(@ovName, N'@', N'') + N'_out);' + @CRLF
+                                        + N'    EXEC tSQLt.AssertLike @ExpectedPattern = N''' + REPLACE(@ovPat, @ovQ, @ovQ + @ovQ) + N''',' + @CRLF
+                                        + N'         @Actual = @uag_os_' + REPLACE(@ovName, N'@', N'') + N', @Message = N''' + @ovMsg + N''';' + @CRLF;
+                                ELSE
+                                    SET @ovAssert = @ovAssert
+                                        + N'    DECLARE @uag_on_' + REPLACE(@ovName, N'@', N'') + N' INT = CASE WHEN @' + REPLACE(@ovName, N'@', N'') + N'_out IS NULL THEN 1 ELSE 0 END;' + @CRLF
+                                        + N'    EXEC tSQLt.AssertEquals @Expected = 0, @Actual = @uag_on_' + REPLACE(@ovName, N'@', N'') + N',' + @CRLF
+                                        + N'         @Message = N''OUTPUT ' + REPLACE(@ovName, @ovQ, @ovQ + @ovQ) + N' must be assigned (its value is non-deterministic).'';' + @CRLF;
+                            END;
+                            -- @ovClass = 3 -> value varied to/from NULL or unconfirmable: no value assertion (smoke).
+                            FETCH NEXT FROM ovc INTO @ovName;
+                        END;
+                        CLOSE ovc; DEALLOCATE ovc;
+                    END;
+                END;
+            END;
+
             SET @S = @S + N'CREATE PROCEDURE ' + QUOTENAME(@TC)
                        + N'.[test ' + @ProcName + N' assigns its OUTPUT parameters]' + @CRLF;
             SET @S = @S + N'AS' + @CRLF + N'BEGIN' + @CRLF + @MockBlock + ISNULL(@OutputDecls, N'');
-            SET @S = @S + @PreCnt;
             SET @S = @S + N'    BEGIN TRY' + @CRLF;
             SET @S = @S + N'        EXEC ' + @FullProc + N' ' + @ArgListHappy + N';' + @CRLF;
             SET @S = @S + N'    END TRY' + @CRLF;
@@ -6460,8 +6729,7 @@ BEGIN
             SET @S = @S + N'        DECLARE @failMsg NVARCHAR(MAX) = N''Procedure raised an error on valid inputs: '' + ERROR_MESSAGE();' + @CRLF;
             SET @S = @S + N'        EXEC tSQLt.Fail @failMsg;' + @CRLF;
             SET @S = @S + N'    END CATCH;' + @CRLF;
-            SET @S = @S + @PostCnt;
-            SET @S = @S + N'    -- TODO: add type-appropriate AssertEquals checks per OUTPUT parameter value.' + @CRLF;
+            SET @S = @S + CASE WHEN @ovAssert = N'' THEN N'    -- OUTPUT value not asserted (non-deterministic or not measurable); branch tests assert it per path.' + @CRLF ELSE @ovAssert END;
             SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
         END;
 
@@ -6638,7 +6906,7 @@ BEGIN
                 SET @S = @S + N';' + @CRLF;
                 SET @S = @S + N'    IF NOT EXISTS (SELECT 1 FROM #ActualResult)' + @CRLF;
                 SET @S = @S + N'        PRINT ''NOTE: result set is EMPTY for the generated seed/args - the baseline comparison is trivial; design a seed that returns rows.'';' + @CRLF;
-                SET @S = @S + N'    EXEC TestGen.AssertResultRowsMatchBaseline @TestClass = ''' + @TC + N''';' + @CRLF;
+                SET @S = @S + N'    EXEC TestGen.AssertResultRowsMatchBaseline @TestClass = ''' + @TC + N''', @ActualTable = N''#ActualResult'';' + @CRLF;
                 SET @S = @S + N'END;' + @CRLF + N'GO' + @CRLF + @CRLF;
 
                 -- v11.x: persist the EXPECTED baseline NOW (generation time, outside
@@ -8285,13 +8553,10 @@ BEGIN
     )
     BEGIN
         SET @Verdict = 'NOT_TESTABLE';
-        SET @Reason  = N'FRAMEWORK PARSER LIMITATION (not a defect in this '
-                     + N'procedure): the coverage instrumenter could not locate '
-                     + N'the AS / BEGIN boundary that marks where the body of '
-                     + @SchemaName + N'.' + @ProcName + N' begins, so the '
-                     + N'procedure cannot be instrumented.  Please report this '
-                     + N'procedure''s header style to the tSQLtAutoGen '
-                     + N'maintainers as a bug.';
+        SET @Reason  = N'The coverage instrumenter could not locate where the body of '
+                     + @SchemaName + N'.' + @ProcName + N' begins - its CREATE header and '
+                     + N'body share a single line. Format the procedure with its body on '
+                     + N'its own line(s) and regenerate, or supply a hand-written test.';
         RETURN;
     END;
 
@@ -9687,11 +9952,8 @@ BEGIN
         DECLARE @v943BodyErr NVARCHAR(2000) =
             N'TestGen.InstrumentProcedure: could not locate the body of '
           + @SchemaName + N'.' + @ProcName
-          + N' - no line marking the AS / BEGIN boundary (where the executable '
-          + N'body begins) was found, so the procedure cannot be instrumented. '
-          + N'This is a parser limitation in tSQLtAutoGen, NOT a defect in the '
-          + N'procedure; please report this procedure''s header style to the '
-          + N'tSQLtAutoGen maintainers as a bug.';
+          + N' for instrumentation - its CREATE header and body share a single line. '
+          + N'Format the procedure with its body on its own line(s) and regenerate.';
         RAISERROR(@v943BodyErr, 16, 1);
         RETURN;
     END;
@@ -17076,6 +17338,56 @@ BEGIN
     WHERE  pr.object_id = OBJECT_ID(@full) AND pr.parameter_id > 0
     ORDER  BY pr.parameter_id;
 
+    -- v0.14.1 (per-branch OUTPUT-value assertions): metadata (set once) + loop-scoped vars.
+    DECLARE @OutParams TABLE (ord INT, pname SYSNAME, tdecl NVARCHAR(100));
+    DECLARE @hasScalarOut BIT = 0, @outNonDet BIT = 0,
+            @outArgs NVARCHAR(MAX) = N'', @outDecls NVARCHAR(MAX) = N'', @outCapExpr NVARCHAR(MAX) = N'';
+    DECLARE @actArgs NVARCHAR(MAX), @actDecls NVARCHAR(MAX), @outAssert NVARCHAR(MAX),
+            @ocCsv NVARCHAR(MAX), @ocErr NVARCHAR(MAX), @ocRest NVARCHAR(MAX), @ocVal NVARCHAR(MAX),
+            @ocMsg NVARCHAR(MAX), @ocPos INT, @opName SYSNAME, @opLocal NVARCHAR(130),
+            @pat NVARCHAR(MAX), @procSrcRaw NVARCHAR(MAX);
+    -- v0.14.1 double-measure (confirm reproducibility before asserting an exact OUTPUT value)
+    DECLARE @ocCsv2 NVARCHAR(MAX), @ocErr2 NVARCHAR(MAX), @ocRest2 NVARCHAR(MAX), @ocVal2 NVARCHAR(MAX),
+            @ocPos2 INT, @ocHave2 BIT, @ocV1Null BIT, @ocV2Null BIT, @ocDiffer BIT, @ocClass INT;
+
+    -- scalar OUTPUT params -> per-branch value assertions. @outArgs binds each OUTPUT
+    -- param to a capture local (@uag_o_<p> OUTPUT); @outDecls declares them; @outCapExpr
+    -- builds the NCHAR(2)-delimited captured-value string. Skipped when the proc
+    -- references a non-deterministic function (the value would vary).
+    INSERT @OutParams (ord, pname, tdecl)
+    SELECT pr.parameter_id, pr.name,
+           TestGen.FormatTypeDecl(t.name, pr.max_length, pr.precision, pr.scale)
+    FROM   sys.parameters pr JOIN sys.types t ON t.user_type_id = pr.user_type_id
+    WHERE  pr.object_id = OBJECT_ID(@full) AND pr.parameter_id > 0 AND pr.is_output = 1
+      AND  t.name NOT IN (N'table', N'cursor', N'xml', N'text', N'ntext', N'image',
+                          N'geography', N'geometry', N'hierarchyid');
+    SET @hasScalarOut = CASE WHEN EXISTS (SELECT 1 FROM @OutParams) THEN 1 ELSE 0 END;
+    IF @hasScalarOut = 1
+    BEGIN
+        SET @procSrcRaw = ISNULL(OBJECT_DEFINITION(OBJECT_ID(@full)), N'');
+        DECLARE @srcU2 NVARCHAR(MAX) = UPPER(@procSrcRaw);
+        SET @outNonDet = CASE WHEN @srcU2 LIKE N'%GETDATE%' OR @srcU2 LIKE N'%SYSDATETIME%'
+                                OR @srcU2 LIKE N'%GETUTCDATE%' OR @srcU2 LIKE N'%SYSUTCDATETIME%'
+                                OR @srcU2 LIKE N'%CURRENT[_]TIMESTAMP%' OR @srcU2 LIKE N'%NEWID%'
+                                OR @srcU2 LIKE N'%NEWSEQUENTIALID%' OR @srcU2 LIKE N'%RAND(%'
+                                OR @srcU2 LIKE N'%CRYPT[_]GEN[_]RANDOM%'
+                              THEN 1 ELSE 0 END;
+        SELECT @outArgs = @outArgs + CASE WHEN @outArgs = N'' THEN N'' ELSE N', ' END
+                        + pr.name + N' = '
+                        + CASE WHEN op.ord IS NOT NULL
+                               THEN N'@uag_o_' + REPLACE(pr.name, N'@', N'') + N' OUTPUT'
+                               ELSE TestGen.GetSampleValueLiteral(t.name, pr.max_length, pr.precision, pr.scale, 0) END
+        FROM   sys.parameters pr
+        JOIN   sys.types t ON t.user_type_id = pr.user_type_id
+        LEFT JOIN @OutParams op ON op.ord = pr.parameter_id
+        WHERE  pr.object_id = OBJECT_ID(@full) AND pr.parameter_id > 0
+        ORDER  BY pr.parameter_id;
+        SELECT @outDecls   = STRING_AGG(CONVERT(NVARCHAR(MAX), N'    DECLARE @uag_o_' + REPLACE(pname, N'@', N'') + N' ' + tdecl + N';'), @crlf) WITHIN GROUP (ORDER BY ord),
+               @outCapExpr = STRING_AGG(CONVERT(NVARCHAR(MAX), N'ISNULL(CONVERT(NVARCHAR(MAX), @uag_o_' + REPLACE(pname, N'@', N'') + N'), N''<<UAGNULL>>'')'), N' + NCHAR(2) + ') WITHIN GROUP (ORDER BY ord)
+        FROM @OutParams;
+        SET @outDecls = @outDecls + @crlf;   -- the decls end on their own line
+    END;
+
     IF @RunId IS NULL
         SELECT TOP 1 @RunId = RunId FROM TestGen.PredicateInbox
         WHERE SchemaName = @SchemaName AND ProcName = @ProcName
@@ -17267,18 +17579,122 @@ BEGIN
                         END;
                     END;
 
+                    -- v0.14.1 OUTPUT-value assertions for THIS direction. Default: pass
+                    -- OUTPUT params by value (no capture). When the proc has scalar OUTPUT
+                    -- params and is deterministic, capture them under this direction's seed
+                    -- and assert the exact value(s) the branch yields - the branch is pinned,
+                    -- so the result is deterministic. Conservative: a capture error / in a
+                    -- transaction -> fall back to by-value (no OUTPUT assertion).
+                    SET @actArgs = @args; SET @actDecls = N''; SET @outAssert = N'';
+                    IF @hasScalarOut = 1
+                    BEGIN
+                        SET @ocCsv = NULL; SET @ocErr = NULL; SET @ocCsv2 = NULL; SET @ocErr2 = NULL;
+                        EXEC TestGen.CaptureBranchOutputs
+                             @SetupBlock = @arrange, @FullProc = @full, @ExecArgs = @outArgs,
+                             @OutDecls = @outDecls, @OutCsvExpr = @outCapExpr,
+                             @OutCsv = @ocCsv OUTPUT, @Err = @ocErr OUTPUT;
+                        -- v0.14.1: double-measure to confirm reproducibility before baking an exact value.
+                        -- A second independent rolled-back run catches non-determinism the source scan
+                        -- can't see (a called proc/UDF using GETDATE/NEWID, a SCOPE_IDENTITY / sequence
+                        -- read, order-sensitive aggregation). Exact only when the scan is clean AND both
+                        -- runs agree; otherwise the constant skeleton.
+                        IF @outNonDet = 0 AND @ocErr IS NULL AND @ocCsv IS NOT NULL
+                        BEGIN
+                            -- Separate the two reads by more than one system-clock tick so TIME-based
+                            -- hidden volatility (a nested UDF calling SYSDATETIME/GETDATE) reliably
+                            -- differs between the runs; back-to-back reads can share a tick.
+                            WAITFOR DELAY '00:00:00.020';
+                            EXEC TestGen.CaptureBranchOutputs
+                                 @SetupBlock = @arrange, @FullProc = @full, @ExecArgs = @outArgs,
+                                 @OutDecls = @outDecls, @OutCsvExpr = @outCapExpr,
+                                 @OutCsv = @ocCsv2 OUTPUT, @Err = @ocErr2 OUTPUT;
+                        END;
+                        IF @ocErr2 IS NOT NULL SET @ocCsv2 = NULL;
+                        IF @ocErr IS NULL AND @ocCsv IS NOT NULL
+                        BEGIN
+                            SET @actArgs = @outArgs; SET @actDecls = @outDecls;
+                            SET @ocRest = @ocCsv + NCHAR(2);
+                            SET @ocRest2 = ISNULL(@ocCsv2, N'') + NCHAR(2);
+                            SET @ocHave2 = CASE WHEN @ocCsv2 IS NOT NULL THEN 1 ELSE 0 END;
+                            DECLARE opc CURSOR LOCAL FAST_FORWARD FOR SELECT pname FROM @OutParams ORDER BY ord;
+                            OPEN opc; FETCH NEXT FROM opc INTO @opName;
+                            WHILE @@FETCH_STATUS = 0
+                            BEGIN
+                                SET @ocPos = CHARINDEX(NCHAR(2), @ocRest);
+                                SET @ocVal = LEFT(@ocRest, @ocPos - 1);
+                                SET @ocRest = SUBSTRING(@ocRest, @ocPos + 1, 2000000000);
+                                IF @ocHave2 = 1
+                                BEGIN
+                                    SET @ocPos2 = CHARINDEX(NCHAR(2), @ocRest2);
+                                    SET @ocVal2 = LEFT(@ocRest2, @ocPos2 - 1);
+                                    SET @ocRest2 = SUBSTRING(@ocRest2, @ocPos2 + 1, 2000000000);
+                                END;
+                                SET @ocV1Null = CASE WHEN @ocVal = N'<<UAGNULL>>' THEN 1 ELSE 0 END;
+                                SET @ocV2Null = CASE WHEN @ocHave2 = 1 AND @ocVal2 = N'<<UAGNULL>>' THEN 1 ELSE 0 END;
+                                SET @ocDiffer = CASE WHEN @ocHave2 = 1 AND @ocVal <> @ocVal2 THEN 1 ELSE 0 END;
+                                -- 0=exact  1=null  2=volatile(skeleton/not-null)  3=no assertion (smoke)
+                                SET @ocClass = CASE
+                                    WHEN @ocV1Null = 1 AND @ocHave2 = 1 AND @ocV2Null = 0 THEN 3
+                                    WHEN @ocV1Null = 0 AND @ocV2Null = 1                  THEN 3
+                                    WHEN @ocV1Null = 1                                    THEN 1
+                                    WHEN @outNonDet = 1                                   THEN 2
+                                    WHEN @ocDiffer = 1                                    THEN 2
+                                    ELSE 0 END;
+                                SET @opLocal = N'@uag_o_' + REPLACE(@opName, N'@', N'');
+                                SET @ocMsg = REPLACE(N'branch ' + @dir + N': OUTPUT ' + @opName
+                                           + N' must equal the value this path produces.', @q, @q + @q);
+                                IF @ocClass = 1
+                                    SET @outAssert = @outAssert
+                                        + N'    EXEC tSQLt.AssertEquals @Expected = NULL, @Actual = ' + @opLocal + N',' + @crlf
+                                        + N'         @Message = N''' + @ocMsg + N''';' + @crlf;
+                                ELSE IF @ocClass = 0
+                                    -- deterministic + reproducible: assert the EXACT value (assign
+                                    -- CONVERT(...) to a local first - a function call cannot be an EXEC param).
+                                    SET @outAssert = @outAssert
+                                        + N'    DECLARE @uag_os_' + REPLACE(@opName, N'@', N'') + N' NVARCHAR(MAX) = CONVERT(NVARCHAR(MAX), ' + @opLocal + N');' + @crlf
+                                        + N'    EXEC tSQLt.AssertEqualsString @Expected = N''' + REPLACE(@ocVal, @q, @q + @q) + N''',' + @crlf
+                                        + N'         @Actual = @uag_os_' + REPLACE(@opName, N'@', N'') + N', @Message = N''' + @ocMsg + N''';' + @crlf;
+                                ELSE IF @ocClass = 2
+                                BEGIN
+                                    -- volatile (source-flagged OR the two runs disagreed): assert the
+                                    -- CONSTANT skeleton via LIKE (the proc's own string literals present in
+                                    -- the value, '%' for the runtime-varying spans). No usable literal ->
+                                    -- assert it was assigned (non-NULL). Never asserts the volatile value.
+                                    SET @pat = TestGen.BuildLikeSkeleton(@procSrcRaw, @ocVal);
+                                    SET @ocMsg = REPLACE(N'branch ' + @dir + N': OUTPUT ' + @opName
+                                               + N' must match its constant skeleton (runtime-varying parts wildcarded).', @q, @q + @q);
+                                    IF @pat IS NOT NULL
+                                        SET @outAssert = @outAssert
+                                            + N'    DECLARE @uag_os_' + REPLACE(@opName, N'@', N'') + N' NVARCHAR(MAX) = CONVERT(NVARCHAR(MAX), ' + @opLocal + N');' + @crlf
+                                            + N'    EXEC tSQLt.AssertLike @ExpectedPattern = N''' + REPLACE(@pat, @q, @q + @q) + N''',' + @crlf
+                                            + N'         @Actual = @uag_os_' + REPLACE(@opName, N'@', N'') + N', @Message = N''' + @ocMsg + N''';' + @crlf;
+                                    ELSE
+                                        SET @outAssert = @outAssert
+                                            + N'    DECLARE @uag_on_' + REPLACE(@opName, N'@', N'') + N' INT = CASE WHEN ' + @opLocal + N' IS NULL THEN 1 ELSE 0 END;' + @crlf
+                                            + N'    EXEC tSQLt.AssertEquals @Expected = 0, @Actual = @uag_on_' + REPLACE(@opName, N'@', N'') + N',' + @crlf
+                                            + N'         @Message = N''branch ' + @dir + N': OUTPUT ' + REPLACE(@opName, @q, @q + @q) + N' must be assigned (its value is non-deterministic).'';' + @crlf;
+                                END;
+                                -- @ocClass = 3 -> value varied to/from NULL or unconfirmable: no value assertion.
+                                FETCH NEXT FROM opc INTO @opName;
+                            END;
+                            CLOSE opc; DEALLOCATE opc;
+                        END;
+                    END;
+
                     -- ASSEMBLE in Arrange -> (before snapshot) -> Act -> Assert order.
                     SET @body = N'CREATE PROCEDURE ' + QUOTENAME(@TestClassName) + N'.' + QUOTENAME(@tname) + @crlf
                         + N'AS' + @crlf + N'BEGIN' + @crlf
                         + @arrange
+                        + @actDecls
                         + @tgtBefore
                         + N'    BEGIN TRY' + @crlf
-                        + N'        EXEC ' + @full + N' ' + @args + N';' + @crlf
+                        + N'        EXEC ' + @full + N' ' + @actArgs + N';' + @crlf
                         + N'    END TRY BEGIN CATCH' + @crlf
                         + N'        DECLARE @uag_e NVARCHAR(MAX) = N''branch ' + @dir + N' EXEC failed: '' + ERROR_MESSAGE();' + @crlf
                         + N'        EXEC tSQLt.Fail @uag_e;' + @crlf
                         + N'    END CATCH;' + @crlf
                         + @tgtAssert
+                        + @outAssert
                         + N'END;';
                 END
                 ELSE

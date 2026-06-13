@@ -76,10 +76,28 @@ are reported as honest gaps. Row/value characterization of a table-reading
 function still needs a manual blessed baseline (emitted as a `SkipTest`).
 
 **OUTPUT parameters.** Procedures with `OUTPUT` parameters are handled — they're
-passed correctly in the generated `EXEC` calls and a test confirms the procedure
-*assigns* its OUTPUT parameters. Asserting the exact returned *value* of each
-OUTPUT parameter is still being refined; today the generated test verifies the
-parameters are populated (shape), not yet their specific values.
+passed correctly in the generated `EXEC` calls, and each scalar OUTPUT parameter's
+*value* is asserted. For a **deterministic** output the test asserts the exact value
+the call produces (measured at generation time under the test's own faked + seeded
+inputs); the per-branch tests additionally assert the value each branch path yields,
+so the same parameter is checked against the right value on each path. When the output
+is **non-deterministic** — it mixes string constants with a runtime-volatile part such
+as `GETDATE()` or `NEWID()` — the test asserts the **constant skeleton** via `LIKE`: the
+procedure's own string literals, in order, with `%` standing in for the volatile spans
+(e.g. `'%Receipt for % at %'`). That verifies the deterministic structure without
+false-failing on the volatile part. If no constant literal can be identified (a purely
+volatile value), the test falls back to asserting the parameter was assigned (non-NULL).
+
+Determinism is *confirmed by measurement*, not assumed. Detecting volatile functions by
+scanning the procedure text alone would miss non-determinism hidden in a called
+function/procedure (a UDF that calls `GETDATE`/`SYSDATETIME`), a `SCOPE_IDENTITY` or
+sequence read, or order-sensitive aggregation. So the generator measures each OUTPUT
+value **twice**, in two independent rolled-back runs separated by more than one clock
+tick, and asserts the exact value only when the text scan is clean *and* the two runs
+agree; if they disagree it treats the value as volatile and uses the `LIKE` skeleton.
+The worst case is conservative: an output that is volatile in a way no run revealed may
+still be asserted exactly and fail later — a signal for the developer to relax that one
+assertion, never a silently wrong test.
 
 ## Not yet supported
 

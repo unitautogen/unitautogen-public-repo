@@ -8133,3 +8133,108 @@ BUGS.md (new defect ledger + INV-1), VERSION, powershell/UnitAutogen/UnitAutogen
 docs/strong-assertions.md, tools/tsql_lint.py (BEGIN/END check downgraded to a
 non-fatal warning - it miscounts generated-SQL-heavy files; PARSEONLY is the
 authority). NOTE: v0.14.0 also carries the ExportTestClasses feature (entry above).
+
+================================================================================
+2026-06-13  (post-0.14.0)  -  "executes with valid inputs" is now uniform pure smoke
+================================================================================
+The happy-path test "test <proc> executes with valid inputs" no longer carries the
+before/after row-count guard for count-stable (read-only / UPDATE-only) procedures -
+it is now a PURE SMOKE check for ALL procedures (fake + seed + EXEC in TRY/CATCH; a
+throw fails it). Rationale: on the happy-path inputs that guard duplicated what
+"touches only mocked tables" already asserts (same inputs), and writing procs never
+had it - so the test now means ONE thing everywhere. No coverage change; the write
+footprint stays owned by "touches only mocked tables" + the per-branch effect tests.
+The boundary tests' count guard is unchanged (different inputs). VALIDATED: HVC
+AssessCustomer regenerated 11/11 pass, 100% line+branch, happy-path test now smoke-only.
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql.
+Bump to v0.14.1 when committing.
+
+================================================================================
+2026-06-13  (post-0.14.0)  -  per-branch OUTPUT-parameter value assertions
+================================================================================
+Predicate-branch tests now assert each scalar OUTPUT parameter's VALUE, not just that
+the branch ran. New TestGen.CaptureBranchOutputs runs the direction's Arrange + the proc
+in a rolled-back transaction and captures the OUTPUT value(s); the branch test binds each
+OUTPUT param to a local (@p = @uag_o_<p> OUTPUT) and asserts the captured value via
+tSQLt.AssertEqualsString (the branch is pinned, so the value is deterministic). New
+TestGen.FormatTypeDecl builds the capture local's type. Conservative: falls back to
+pass-by-value with NO assertion when the proc has no scalar OUTPUT params, references a
+non-deterministic function (GETDATE/NEWID/RAND/...), runs in a transaction, or the capture
+errors - so no false-fails. Resolves the disconnect where the separate "assigns its OUTPUT
+parameters" test ran with generic input and only carried a TODO for the value check.
+VALIDATED on HighValueCustomer AssessCustomer: branch 1 FALSE asserts
+NO_DISCOUNT;FEW_ITEMS;STANDARD, TRUE asserts DISCOUNTED;FEW_ITEMS;STANDARD; 11/11 pass,
+100% line+branch. MUTATION: change a branch's emitted literal -> that branch test FAILS;
+restore -> green.
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(TestGen.FormatTypeDecl + TestGen.CaptureBranchOutputs added; GeneratePredicateBranchTests
+extended). Bump to v0.14.1 when committing.
+
+================================================================================
+2026-06-13  (post-0.14.0)  -  OUTPUT-value test checks the variable, not the tables
+================================================================================
+The "test <proc> assigns its OUTPUT parameters" test no longer carries the mocked-table
+row-count guard (that footprint is owned by "touches only mocked tables"). It now asserts
+the OUTPUT parameter VALUE(s) the happy-path call produces - measured at generation time
+via TestGen.CaptureBranchOutputs and asserted with tSQLt.AssertEqualsString (this fills the
+prior TODO). Conservative: smoke-only (no value assertion) for a non-deterministic proc, a
+transactional context, or an unmeasurable capture - no false-fails. VALIDATED on HVC
+AssessCustomer: asserts NO_DISCOUNT;FEW_ITEMS;STANDARD; 11/11 pass, 100% line+branch.
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql. Part of v0.14.1.
+
+================================================================================
+2026-06-13  (post-0.14.0)  -  OUTPUT-value assertions for NON-deterministic outputs
+================================================================================
+An OUTPUT parameter whose value mixes string CONSTANTS with a runtime-volatile part
+(e.g. N'Processed at ' + CONVERT(...,GETDATE()) + N' for ' + @n) is no longer skipped.
+New TestGen.BuildLikeSkeleton extracts the procedure's own string literals that appear
+in the measured value and builds an ordered LIKE pattern ('%lit1%lit2%...', LIKE
+wildcards escaped) with '%' for the runtime-varying spans. Both the predicate-branch
+tests and the "assigns its OUTPUT parameters" test now: deterministic output ->
+AssertEqualsString (exact); volatile output -> tSQLt.AssertLike on the constant skeleton;
+no usable literal -> assert the param was assigned (non-NULL). No false-fails: the literals
+are guaranteed constants of that path and the volatile span is wildcarded. VALIDATED on
+HighValueCustomer - AssessCustomer (deterministic) still asserts exact, 11/11; a volatile
+receipt proc asserts LIKE '%RECEIPT for % at %' in BOTH its OUTPUT test and branch TRUE test,
+mutation-proven (RECEIPT->INVOICE fails both; the GETDATE part is correctly ignored).
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(TestGen.BuildLikeSkeleton added; GeneratePredicateBranchTests + the OUTPUT test extended).
+Part of v0.14.1.
+
+================================================================================
+2026-06-13  (post-0.14.0)  -  OUTPUT-value determinism CONFIRMED by double-measure
+================================================================================
+The exact-vs-skeleton decision for OUTPUT-value assertions no longer relies on the
+source-text scan alone. That scan only sees volatile functions written in the procedure
+itself; non-determinism hidden in a called function/procedure (a UDF that calls GETDATE/
+SYSDATETIME), a SCOPE_IDENTITY or sequence read, or order-sensitive aggregation would slip
+past it and bake an exact value that then false-fails. The generator now measures each
+OUTPUT value TWICE, in two independent rolled-back runs separated by a >1-clock-tick
+WAITFOR DELAY (back-to-back reads can share a tick and hide time-based volatility), and
+asserts the EXACT value only when the source scan is clean AND the two runs agree; if they
+disagree it treats the value as volatile and uses the LIKE constant skeleton, or (value seen
+NULL in one run / otherwise unconfirmable) a smoke check. Applies to BOTH the "assigns its
+OUTPUT parameters" test and the per-branch OUTPUT assertions.
+VALIDATED on HighValueCustomer: AssessCustomer (deterministic) still asserts exact, 11/11;
+a proc whose output is 'FOUND-'/'MISSING-' + a nested-UDF SYSDATETIME (source scan CLEAN) now
+asserts LIKE '%FOUND-%' / '%MISSING-%' on the base AND both branch tests, 7/7 pass - the
+pre-fix build baked an exact timestamp and failed its own run. Worst case is conservative: an
+output volatile in a way neither run revealed may still be asserted exactly and fail later,
+a signal to relax that one assertion - never a silently wrong test.
+Also: the two body-boundary NOT_TESTABLE / instrumentation messages were reworded to neutral,
+professional guidance (dropped "parser limitation" / "report as a bug").
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql.
+Part of v0.14.1.
+
+================================================================================
+2026-06-13  (post-0.14.0)  -  baseline-row assert names its table explicitly
+================================================================================
+The generated "returns rows matching baseline" test now emits
+  EXEC TestGen.AssertResultRowsMatchBaseline @TestClass='<class>', @ActualTable=N'#ActualResult';
+instead of relying on the helper's @ActualTable default. The #ActualResult name was always an
+implicit caller contract (the CREATE TABLE #ActualResult two lines above had to match the proc's
+default), i.e. action-at-a-distance. Naming it at the call site is self-documenting, robust to a
+hand-edit that renames the temp table, and consistent with tSQLt's own explicit-table-name style
+(AssertEqualsTable '#Expected','#Actual'). Pure readability/robustness change - assertion behavior
+is identical (verified on AdventureWorks2025 pz.ContradictionGate: 4 pass / 1 skip, 0 fail; the skip
+is the hand-built-expectation scaffold). Part of v0.14.1.
