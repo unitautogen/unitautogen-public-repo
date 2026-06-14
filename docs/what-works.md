@@ -26,8 +26,8 @@ These are the patterns UnitAutogen was designed for and is most reliable at.
 **Procedural T-SQL.** Procedures structured around `IF` / `CASE` / `EXISTS`
 branches with `INSERT` / `UPDATE` / `DELETE` / `SELECT` statements inside the
 branches. This is the core target — generation produces one test per branch
-path, coverage probes fire reliably, and the v9.4 snapshot-and-replay
-assertions verify each branch's table effect rather than just executing it.
+path, coverage probes fire reliably, and each branch test asserts the branch's
+measured effect — the rows it inserts, deletes, or updates — rather than just executing it.
 
 **Multi-condition predicates.** `IF EXISTS (... AND ...)`, `CASE WHEN` value
 assignments to locals then branched on, `IN (...)` lists with multiple values,
@@ -57,10 +57,11 @@ statement. You'll get statement-level smoke coverage (the proc ran or it
 didn't) but no per-branch breakdown, because there are no branches to
 instrument. This is the framework's fundamental limit; documented and intentional.
 
-**Result-set-only branches.** Branches whose only effect is changing the
-returned result set (no `INSERT` / `UPDATE` / `DELETE`) get a smoke assertion
-("the branch executed") rather than the v9.4 snapshot-and-replay table
-assertion. Characterising result sets needs a separate feature (planned).
+**Result-set-only branches.** A branch whose only effect is changing the
+returned result set (no `INSERT` / `UPDATE` / `DELETE`) gets a smoke assertion at
+the branch level ("the branch executed"). The procedure's result set as a whole
+is separately characterized by the generated shape, baseline, and
+hand-built-expectation tests.
 
 **Compound bodies.** Branches whose body is a nested IF tree rather than a
 single leaf DML statement fall back to smoke assertions for the same reason —

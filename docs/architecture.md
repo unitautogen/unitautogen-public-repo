@@ -99,10 +99,10 @@ consumes:
 This layer replaces AnalyzeBranchPaths and ExtractLeafDml.
 
 **(b) Generator, rebuilt to consume the model.** GenerateTestsForProcedure is
-repointed at the normalized model. The *emission* logic from v9.4.2 - the
-FakeTable scaffolding, snapshot-and-replay AssertEqualsTable, the before/after
-delta assertions, the result-shape test, ancestor-chain seeding - is sound and
-is **kept**; it simply consumes a reliable model instead of the fragile
+repointed at the normalized model. The *emission* logic - the FakeTable
+scaffolding, the measured-effect branch assertions (Arrange-Act-Assert), the
+OUTPUT-value assertions, the result-shape test, ancestor-chain seeding - is sound
+and is **kept**; it simply consumes a reliable model instead of the fragile
 #Paths. New work: branch bodies that are multi-statement or compound, WHILE
 bodies, TRY/CATCH paths, MERGE.
 
@@ -280,8 +280,8 @@ where an unseeded branch could still report green off a tautological assertion.
 
 ## 9. What stays true from v9.4.2
 
-The v9.4.2 assertion design carries forward intact - snapshot-and-replay
-AssertEqualsTable, the before/after delta assertions, the result-set shape
+The assertion philosophy carries forward intact - Arrange-Act-Assert,
+measured-effect branch assertions, OUTPUT-value checks, the result-set shape
 test, the no-tautology rule. v10 changes how the framework *understands* a
 procedure (a real AST instead of string scanning); it does not change what a
 good generated test looks like.

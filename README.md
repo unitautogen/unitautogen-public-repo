@@ -41,7 +41,7 @@ IF (SELECT COUNT(*) FROM Sales.Orders WHERE CustomerID = @CustomerID) > 5
     ...
 ```
 
-Faking `Sales.Orders` gives you an empty table, so you only ever hit the `<= 5` arm (~50% branch coverage). UnitAutogen reads the gate and manufactures two seeds — one with 6 matching orders to drive the `> 5` arm, one with fewer to drive the `<= 5` arm — so **both** branches run. Every seed carries a **strong assertion** that it actually drove the predicate the intended way, so a wrong seed fails loudly instead of ghost-passing.
+Faking `Sales.Orders` gives you an empty table, so you only ever hit the `<= 5` arm (~50% branch coverage). UnitAutogen reads the gate and manufactures two seeds — one with 6 matching orders to drive the `> 5` arm, one with fewer to drive the `<= 5` arm — so **both** branches run. Each branch test follows **Arrange-Act-Assert**: seed, run the procedure, then assert the branch's *observed effect* — the rows it inserts, deletes, or updates, captured before and after the call. A broken branch (a missing `INSERT`, a wrong-`WHERE` `UPDATE`) fails loudly instead of ghost-passing.
 
 That reverse step — deriving satisfying data from arbitrary T-SQL (joins, aggregates, DNF, `NULL` semantics, local-variable data-flow) — is the hard part, and it's what turns "we faked the table" into "we exercised the branch." When a direction genuinely can't be satisfied (a contradiction, an unreachable arm), it's reported as `NOT_TESTABLE` with the reason — never faked into a pass.
 
@@ -153,7 +153,7 @@ Full usage guide: [`powershell/USAGE.md`](powershell/USAGE.md).
 | [docs/REFERENCE_GUIDE.md](docs/REFERENCE_GUIDE.md)| Complete reference - every method, the coverage architecture, troubleshooting, feature history.|
 | [docs/what-works.md](docs/what-works.md)          | Honest scope - what UnitAutogen handles well, partially, or not yet.                           |
 | [docs/architecture.md](docs/architecture.md)      | How coverage instrumentation works under the hood.                                             |
-| [docs/strong-assertions.md](docs/strong-assertions.md) | The snapshot-and-replay assertion mechanism for branch tests.                             |
+| [docs/strong-assertions.md](docs/strong-assertions.md) | How branch tests assert real effects (Arrange-Act-Assert) and how OUTPUT values are checked. |
 | [docs/advanced-snippets.sql](docs/advanced-snippets.sql) | Paste-ready SQL for the advanced workflows above.                                        |
 | [INSTALL.md](INSTALL.md)                          | Full installation options, upgrade paths, modular install.                                     |
 | [powershell/USAGE.md](powershell/USAGE.md)        | PowerShell wrapper — CI/CD usage, Windows/SQL auth, Azure DevOps and GitHub Actions YAML.     |
@@ -164,7 +164,7 @@ Honest scope is in [docs/what-works.md](docs/what-works.md). Short version: Unit
 
 ## How it works
 
-In one paragraph: UnitAutogen parses your procedure body, builds a path table of every IF / CASE / EXISTS branch, generates a test per path with appropriate seed data, instruments a copy of the procedure with Extended Events line probes, runs the test class, captures hit lines from the XEvent file, and produces a line/branch coverage report. v9.4 added snapshot-and-replay assertions so each branch's table effect is verified, not just executed. v10 added universal generation, NOT-TESTABLE detection, and in-place test preservation across regenerations. By default, generation now covers the NULL handling a procedure actually contains rather than injecting a speculative NULL test into every parameter — set `@EmitNullChecks = 1` to opt back into per-parameter NULL tests.
+In one paragraph: UnitAutogen parses your procedure body, builds a path table of every IF / CASE / EXISTS branch, generates a test per path with appropriate seed data, instruments a copy of the procedure with Extended Events line probes, runs the test class, captures hit lines from the XEvent file, and produces a line/branch coverage report. Branch tests follow **Arrange-Act-Assert** and assert each branch's *measured* effect — `INSERT` adds rows, `DELETE` removes them, `UPDATE` changes content with the row count held — captured before and after the call, so a broken branch fails instead of ghost-passing. Scalar `OUTPUT` parameters are value-asserted: the exact value when the output is deterministic, or a constant `LIKE` skeleton when it mixes literals with runtime-volatile parts (`GETDATE`, `NEWID`, …), with determinism confirmed by measuring twice. NULL handling is tested as the procedure actually contains it rather than injected into every parameter — set `@EmitNullChecks = 1` to opt back in. NOT-TESTABLE procedures are detected and labelled, and generated test classes are preserved in place across regenerations.
 
 Full architecture: [docs/architecture.md](docs/architecture.md).
 
@@ -172,12 +172,13 @@ Full architecture: [docs/architecture.md](docs/architecture.md).
 
 UnitAutogen is in active Beta, labelled Beta because real-world testing only happens at scale once strangers run it on their own schemas. The engineering has been validated on three reference databases at high coverage, but you will surface things on production schemas that nobody has tried. Bug reports are the most valuable thing you can give us right now.
 
-**Shipped in this release:**
+**Recently shipped (v0.13 → v0.14.1):**
 
-- Cobertura XML + JUnit XML output — natively consumed by Azure DevOps, GitHub Actions, Jenkins, GitLab CI, SonarQube
-- HTML coverage report re-export without re-running tests
-- PowerShell wrapper module (`UnitAutogen.psm1`) with Windows and SQL auth support
-- Ready-to-use Azure DevOps and GitHub Actions pipeline YAML samples
+- Branch tests rebuilt to **Arrange-Act-Assert** with *measured effect* assertions — INSERT / DELETE / UPDATE effects verified before and after the call, not merely executed (fixes an assert-before-run defect)
+- **Scalar OUTPUT-parameter value assertions** — exact for deterministic outputs, a constant `LIKE` skeleton for volatile ones, with determinism confirmed by double measurement
+- NULL tests **off by default** — covers the NULL handling a procedure actually contains rather than a speculative per-parameter test (`@EmitNullChecks = 1` opts back in)
+- Independent core-engine code review and correctness fixes (alias-type seeding, NULL comparands, in-database parser detection, NOT_TESTABLE annotation escaping)
+- Cobertura XML + JUnit XML + HTML coverage output, PowerShell wrapper (Windows / SQL auth), an Azure DevOps Pipelines task, and ready-to-use Azure DevOps / GitHub Actions YAML
 
 **What's coming next (your input shapes the order):**
 

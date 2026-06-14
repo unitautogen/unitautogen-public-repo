@@ -187,7 +187,10 @@ ran the `INSERT` that satisfied that — so the assertion was satisfied by the
 seed, not by the procedure. `EXISTS_FALSE` tests asserted `1 = 1`. A branch
 body gutted to do nothing would still pass.
 
-v9.4 fixes this with **snapshot-and-replay**:
+v9.4 first fixed this with **snapshot-and-replay**; the current engine (v0.14)
+supersedes it with a *measured-effect* assertion in proper Arrange-Act-Assert
+order — see [strong-assertions.md](strong-assertions.md) for the canonical,
+up-to-date description. For the record, the v9.4 approach worked as follows:
 
 - For a branch whose body is a single leaf `UPDATE`/`INSERT`, the generated
   test snapshots the target table, replays the branch's *own* parsed DML onto
@@ -384,9 +387,9 @@ statement, and creates `<ProcName>_cov`.
 
 (Usually called by `GenerateTestsForProcedure`, not directly.) Parses a
 procedure's body to find all branch conditions and emit a path table that
-drives test generation. As of v9.4 it also captures each leaf branch body's
-single `UPDATE`/`INSERT` (`BodyDmlKind` / `BodyDmlTable` / `BodyDmlText`) for
-the snapshot-and-replay assertion.
+drives test generation. It also records each leaf branch body's single
+`UPDATE`/`INSERT`; the current engine *measures* that branch's effect at run time
+to form the assertion (see [strong-assertions.md](strong-assertions.md)).
 
 ### `TestGen.ExtractLeafDml`
 
@@ -677,7 +680,7 @@ to pick up framework updates.
                 │ GenerateTestsForProc   │         │ EXEC arglist     │
                 │ - builds EXEC arglist  │◄────────┤ uses sample      │
                 │ - INSERT+UPDATE seeds  │         │ values for non-  │
-                │ - snapshot-and-replay  │         │ branch params    │
+                │ - measured effects     │         │ branch params    │
                 │ - one test per branch  │         └──────────────────┘
                 └──────────┬─────────────┘
                            │
