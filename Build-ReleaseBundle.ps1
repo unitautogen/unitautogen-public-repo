@@ -63,6 +63,7 @@ Per procedure:
     EXEC TestGen.ParseProcedurePredicates  @Schema = N'dbo', @ProcName = N'YourProc';
     EXEC TestGen.GenerateTestsForProcedure @SchemaName = N'dbo', @ProcName = N'YourProc', @ExecuteScript = 1;
     EXEC TestGen.RunCoverage               @SchemaName = N'dbo', @ProcName = N'YourProc', @OutputMode = N'TEXT';
+    EXEC TestGen.RunTests                  @SchemaName = N'dbo', @ProcName = N'YourProc';  -- run tests (pass/fail), handles procs that manage their own transactions
 
 ## CI/CD
     Install-Module UnitAutogen

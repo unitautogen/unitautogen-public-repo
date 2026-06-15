@@ -1,5 +1,5 @@
-@{
-    ModuleVersion     = '0.14.1'
+﻿@{
+    ModuleVersion     = '0.16.1'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -40,65 +40,150 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
-## v0.14.1 (beta) - 2026-06-13
+## v0.16.1 (beta) - 2026-06-15
 
-OUTPUT-value assertions get smarter, plus result-set test polish. All changes are additive
-and conservative (no false failures); regenerate existing test classes to adopt them.
+Two narrower derived-value and aggregate shapes are now seeded to full branch coverage.
 
-- Scalar OUTPUT parameters are now VALUE-asserted. The "assigns its OUTPUT parameters" test and
-  the per-branch tests assert each output value -- exact (AssertEqualsString) for a deterministic
-  output, or a constant LIKE skeleton (the string literals in the procedure body, with the
-  runtime-varying spans wildcarded) when the output mixes constants with GETDATE / NEWID / RAND.
-- Determinism is CONFIRMED BY MEASUREMENT, not just a source scan. Each output is measured twice
-  in independent rolled-back runs separated past a clock tick; the exact value is asserted only
-  when the source scan is clean AND both runs agree, otherwise it falls back to the skeleton -- so
-  non-determinism hidden in a called function/procedure, a SCOPE_IDENTITY / sequence read, or
-  order-sensitive aggregation cannot bake a value that later false-fails.
-- The "executes with valid inputs" test is now a uniform smoke check for both read and write
-  procedures, and the "returns rows matching baseline" test names its table explicitly
-  (@ActualTable = N'#ActualResult'), matching the tSQLt table-name convention.
-- NOT_TESTABLE and instrumentation messages reworded to neutral, professional guidance.
+- A derived local that uses SUBTRACTION (e.g. value = qty * price - fee, or qty * price
+  - 100) is now covered. A subtracted column is neutralised to 0 like any other term; a
+  subtracted (or added) numeric constant is folded into the knob so the driving term
+  still crosses the threshold exactly.
+- An aggregate gate whose source has a NON-equality filter is now satisfied: numeric
+  >, >=, <, <= seed a value just inside the bound; IN (...) seeds the first list value;
+  BETWEEN seeds the low bound. (Equality and date ">=" windows were already handled.)
+- Validated on a synthetic loop procedure (100% line + branch); full regression on
+  AdventureWorks2025 (PredicateZoo aggregate/scalar gates), a JSON/MERGE/transaction
+  procedure, and a multi-procedure analytics DB all unchanged. No C#/CLR change.
 
-Regression-clean on AdventureWorks2025, HighValueCustomer and WideWorldImporters (0 fail / 0 err).
+## v0.16.0 (beta) - 2026-06-15
 
-## v0.14.0 (beta) - 2026-06-12
+Two more derived-value and aggregate shapes are now seeded to full branch coverage.
 
-BUG-001 FIX - generated branch tests restored to Arrange-Act-Assert with real effect
-assertions; plus the new Export-UnitAutogenTests command.
+- A derived local that MIXES multiplication and addition (e.g. value = qty * price +
+  fee) is now covered. The generator splits the expression into additive terms, drives
+  the term holding the chosen column and neutralises the rest, so the computed value
+  crosses the threshold exactly. Pure-product and pure-sum cases are unchanged.
+- An aggregate gate whose source has a NON-date filter (e.g. AVG(Score) FROM Metrics
+  WHERE Status='ACTIVE') now seeds a row that PASSES the filter instead of a placeholder
+  the filter excluded (which left the aggregate NULL and the branch uncovered). This also
+  fixes compound gates that reuse such an aggregate to set a flag.
+- Validated on a synthetic loop procedure (100% line + branch); full regression on
+  AdventureWorks2025 (PredicateZoo aggregate/scalar gates), a JSON/MERGE/transaction
+  procedure, and a multi-procedure analytics DB all unchanged. No C#/CLR change.
 
-- Seeded predicate-branch tests previously asserted the gate predicate on the seed BEFORE
-  running the procedure (Arrange-Assert-Act) and never checked what the branch did -- a
-  wrong-value / wrong-WHERE write passed the whole class green. They now run
-  Arrange -> Act -> Assert and assert the arm's OBSERVED effect: INSERT adds rows, DELETE
-  removes rows, UPDATE changes content with the row count held. The test captures its own
-  before/after, so GETDATE()-style non-determinism cannot false-fail; anything the
-  generator cannot resolve falls back to the previous smoke test (no false failures).
-- New scripts/Check_Invariants.sql - a CI guard that fails if any generated test asserts
-  before it executes the procedure under test. Regenerate existing test classes to adopt
-  the new assertions.
-- New Export-UnitAutogenTests scripts in-database test classes into a portable, idempotent
-  .sql with a pre-flight guard requiring tSQLt + TestGen on the target.
+## v0.15.9 (beta) - 2026-06-15
 
-## v0.13.0 (beta) - 2026-06-11
+A correctness fix to derived-arithmetic seeding, plus several seeding bug fixes.
 
-CORRECTNESS FIXES (independent core-engine review) + NULL tests now OFF by default.
+- FIX: a witness for a derived-arithmetic branch could PASS without actually COVERING
+  its arm when the value was derived through an aggregate over another table - the
+  test's baseline seed row for that table shifted the aggregate, so the computed value
+  missed the threshold. The generator now clears such aggregate-source tables after the
+  baseline seeding, so the witness's own seed controls the aggregate. On a trade-
+  reconciliation procedure this lifted branch coverage from 62.5% to 93.8%.
+- More gate shapes are now seeded: an aggregate-band gate over a date-windowed table (a
+  previous illegal EXEC-argument expression is fixed), an operand assigned from a loop
+  #temp, and an OR of column comparisons.
+- Validated; full regression on AdventureWorks2025 (PredicateZoo), a JSON/MERGE/
+  transaction procedure, and a multi-procedure analytics DB all unchanged. No C#/CLR change.
 
-- @EmitNullChecks now DEFAULTS TO 0. The per-parameter "accepts NULL" smoke tests are no longer
-  forced; genuine NULL handling in a procedure is covered as a normal branch/line. Pass
-  @EmitNullChecks = 1 to restore the previous per-parameter NULL tests.
-- Alias / user-defined scalar types (e.g. dbo.Flag, dbo.Name) now resolve to their base type when
-  sampling values, so alias-typed parameters and columns get real seeds and arguments instead of
-  NULL -- fixes weakened WHERE lookups and seed inserts on alias-heavy schemas.
-- Equality seeding now skips (rather than emitting `col = NULL`) when a comparand is NULL, so a
-  branch over an unknown-typed value no longer self-fails its own assertion.
-- The in-database SQLCLR predicate parser is now detected correctly by GenerateAndRunCoverage (the
-  guard tested for a T-SQL proc type and silently skipped the CLR parser), so single-proc runs
-  parse predicates and emit data-shape branch tests when the parser is installed.
-- NOT_TESTABLE skip annotations now escape apostrophes in the reason ("unmatched quote" fixed).
-- The interrupted-run self-heal now also recovers a procedure left missing after a crash between
-  the rename and the synonym create (previously only the synonym-present state was detected).
+## v0.15.8 (beta) - 2026-06-15
 
-Regression-clean on AdventureWorks2025, HighValueCustomer and WideWorldImporters (0 fail / 0 err).
+Reverse seeding for derived arithmetic locals now also handles compound conditions
+and sum / multi-step expressions.
+
+- A compound branch like "IF @AdjustedValue > 100000 AND @WavePatternPhase = 'C'",
+  where the second test depends on a different source (a flag set from an aggregate
+  over another table), is now seeded by coordinating BOTH sources: the arithmetic
+  driver as before, plus a synthesised seed for the aggregate that sets the flag (one
+  row past the threshold, with any date-window filter satisfied). A compound gate
+  whose extra condition cannot be satisfied still stays honestly NOT_TESTABLE.
+- Derived locals built with addition (a + b) are now handled alongside products, and
+  the driver is traced through intermediate locals (a = b; b = c * Col) - multi-hop -
+  to its source column.
+- Validated: a trade-reconciliation proc's compound risk-limit branch went from
+  skipped to covered, and a synthetic loop proc's sum and multi-hop branches reached
+  100%. Full regression on AdventureWorks2025 (PredicateZoo), a JSON/MERGE/transaction
+  proc, and a multi-procedure analytics DB all unchanged. No C#/CLR change.
+
+## v0.15.7 (beta) - 2026-06-15
+
+Reverse seeding now covers a branch whose condition compares a DERIVED arithmetic
+local to a literal - e.g. "IF @AdjustedValue > 50000" where
+@AdjustedValue = @Volume * @Price * @RiskMultiplier is computed from per-row loop
+columns and other locals.
+
+- Such a gate was previously skipped NOT_TESTABLE ("comparison does not involve an
+  aggregate/scalar subquery"). The seeder now traces the operand through its arithmetic
+  to the source columns, neutralises the co-factor columns (so the product reduces to a
+  single driving column), pins non-row factors via the existing FakeTable of every
+  referenced table, and sets the driving column deterministically just past the literal -
+  covering the arm without a search (which also avoids the per-gate sweep timeout on loop
+  procedures).
+- Restricted to a simple single comparison; a compound gate (e.g. "@v > 100000 AND
+  @phase = 'C'") with a conjunct the path cannot satisfy stays honestly NOT_TESTABLE.
+- Validated on a trade-reconciliation loop procedure (two derived-local arms skip ->
+  covered, with verified seeds + an OUTPUT assertion); full regression on
+  AdventureWorks2025 (PredicateZoo), a JSON/MERGE/transaction procedure, and a
+  multi-procedure analytics database all unchanged. No C#/CLR change.
+
+## v0.15.6 (beta) - 2026-06-15
+
+Statement-aware coverage instrumentation - dense one-liner procedures now report
+honest branch coverage instead of a false 0%.
+
+- A procedure written with an IF, its THEN body, and its ELSE all on one physical
+  line (or several statements separated by ; on one line) previously defeated the
+  line-based coverage walker: the branch arms shared the predicate's line, so none
+  could be measured (0% branch) even though the generated tests exercised them all.
+- A new normalization pass (run before instrumentation) reformats such lines onto
+  canonical one-statement-per-line form so every arm is measured. It is quote /
+  comment / bracket / paren / CASE aware (a CASE expression's WHEN/THEN/ELSE/END is
+  never mistaken for control flow), idempotent, and a no-op on already-well-formatted
+  procedures - so it changes nothing for procedures that already measured correctly.
+- Validated: a dense IF/ELSE procedure went from a false 0% branch to a true 100%
+  (6/6) with no source change; full regression on AdventureWorks2025 (PredicateZoo),
+  a JSON/MERGE/transaction procedure, and a multi-procedure analytics database all
+  unchanged. No C#/CLR change.
+
+## v0.15.5 (beta) - 2026-06-14
+
+Auto-generation now drives JSON-shredding, transaction-managing procedures to full
+coverage - deterministic "deep-gate" witnesses for the branch shapes the iterative
+search could not reach.
+
+- A new derivation (TestGen.DeriveDeepGateWitnesses) reads the procedure's own structure -
+  the key-lookup SELECT (table, key column/param, the local-to-column map), and the
+  OPENJSON(@param) WITH(...) shred + catalog JOIN + filter - and synthesises a valid JSON
+  parameter literal plus coordinated real-table seeds. It then emits verified witness tests for:
+  parameter NULL-guards, @@ROWCOUNT "not found" checks, key-lookup status scalars
+  (e.g. an "is active" flag), and aggregate gates over a table VARIABLE populated by the JSON
+  shred (e.g. total-due vs a credit-limit column, or a shortage count) - pivoting the seed to
+  the comparand's real source column instead of the un-seedable table variable - plus a
+  happy-path scenario that falls through every gate.
+- These run BEFORE the iterative search, which now skips any gate already witnessed - so this
+  whole class of procedure is covered deterministically and fast (no per-candidate sweep).
+- Self-contained witnesses (which provide their own arguments + seeds) no longer get a
+  spurious ExpectException when the procedure catches its own RAISERROR internally.
+- The generic base tests are also more robust on this proc shape: a parameter consumed by
+  OPENJSON gets valid JSON in the smoke tests (not arbitrary text that breaks parsing); the
+  "raises"/"rejects" error-expectation tests are skipped when the procedure swallows its own
+  errors in a non-rethrowing CATCH; and the OUTPUT constant-skeleton no longer mashes a literal
+  that is a substring of a longer one (e.g. ''SUCCESS'' inside ''FULL_SUCCESS'').
+- Validated: a complex order-processing proc (OPENJSON shred + window CTEs + MERGE + a
+  self-managed transaction with several rejection paths) goes from a partial result to
+  100% line (35/35) and 100% branch (6/6), with the whole generated suite green
+  (11 passed / 0 failed / 0 errored / 8 honest skips).
+  PredicateZoo regression on AdventureWorks2025 green (deep-gate derivation is a no-op on
+  procedures without that shape). No C#/CLR change.
+- The generic boundary "accepts" tests are no longer falsely skipped on a procedure that manages
+  its own transaction: the generation-time probe now recognises that a "mismatching BEGIN and
+  COMMIT" error (266) is the procedure's own transaction control, not a rejected input.
+- NEW TestGen.RunTests @SchemaName, @ProcName runs a procedure's generated tests and returns
+  pass/fail. It handles a procedure that manages its OWN transactions - which a direct tSQLt.Run
+  cannot, because the procedure's ROLLBACK collapses tSQLt's per-test transaction and FakeTable
+  setup - by running those tests against the transaction-neutralized shadow (reusing the coverage
+  swap; no coverage permission required, it degrades gracefully). Plain procedures run directly.
 
 ## Earlier releases
 

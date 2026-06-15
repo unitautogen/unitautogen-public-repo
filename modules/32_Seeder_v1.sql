@@ -99,6 +99,99 @@ END;
 GO
 
 /*-----------------------------------------------------------------------------
+ * TestGen.SatisfyAll  (v0.15.2; =/<>/string in v0.15.3)
+ * Intersect MULTIPLE comparison constraints on ONE column into a single satisfying
+ * value. Used when a column must satisfy several comparisons at once - e.g.
+ * a.X > b.Y AND a.X > c.Z (beat BOTH), a.X = b.Y AND a.X = c.Z (equal BOTH),
+ * a.X <> b.Y AND a.X <> c.Z (differ from BOTH), or a.X > b.Y AND a.X > 100
+ * (column vs another column AND a literal) - which a per-anchor MAX cannot do
+ * (and string MAX is lexical: '43' > '101').
+ *   @ConstraintsJson = [{"op":">","val":"42","want":1}, {"op":">","val":"100","want":1}]
+ *   want=0 violates that op.
+ * NUMERIC: lo = max of lower bounds (>,>=), hi = min of upper bounds (<,<=); a
+ *   single '=' must fall in [lo,hi] and dodge '<>'; '<>'-only picks above all
+ *   exclusions. STRING: a single '=' returns that value, '<>'-only returns a
+ *   guaranteed-non-matching sentinel.
+ * Returns NULL - caller leaves the column unresolved (honest residue, never a
+ * wrong seed) - for an empty intersection (lo > hi), conflicting equalities,
+ * a numeric inequality over a string, or any case it cannot satisfy.
+ *---------------------------------------------------------------------------*/
+IF OBJECT_ID('TestGen.SatisfyAll', 'FN') IS NOT NULL DROP FUNCTION TestGen.SatisfyAll;
+GO
+CREATE FUNCTION TestGen.SatisfyAll (@ConstraintsJson NVARCHAR(MAX))
+RETURNS NVARCHAR(400)
+AS
+BEGIN
+    -- normalize each constraint to want=1, classify numeric vs string.
+    DECLARE @c TABLE (op VARCHAR(8), num FLOAT, sval NVARCHAR(400), isnum BIT);
+    INSERT @c (op, num, sval, isnum)
+    SELECT CASE WHEN w = 1 THEN o
+                ELSE CASE o WHEN '>' THEN '<=' WHEN '>=' THEN '<' WHEN '<' THEN '>='
+                            WHEN '<=' THEN '>' WHEN '=' THEN '<>' WHEN '<>' THEN '=' ELSE o END END,
+           n, v, CASE WHEN n IS NULL THEN 0 ELSE 1 END
+    FROM (
+        SELECT o = UPPER(LTRIM(RTRIM(JSON_VALUE([value],'$.op')))),
+               w = ISNULL(TRY_CAST(JSON_VALUE([value],'$.want') AS BIT), 1),
+               n = TRY_CAST(JSON_VALUE([value],'$.val') AS FLOAT),
+               v = JSON_VALUE([value],'$.val')
+        FROM   OPENJSON(ISNULL(@ConstraintsJson, N'[]'))
+    ) x;
+
+    IF NOT EXISTS (SELECT 1 FROM @c) RETURN NULL;
+
+    -- STRING fan: equality / inequality only (no ordering on strings).
+    IF EXISTS (SELECT 1 FROM @c WHERE isnum = 0)
+    BEGIN
+        IF EXISTS (SELECT 1 FROM @c WHERE op IN ('>','>=','<','<=')) RETURN NULL;
+        IF (SELECT COUNT(DISTINCT sval) FROM @c WHERE op = '=') > 1 RETURN NULL;
+        DECLARE @seq NVARCHAR(400) = (SELECT MIN(sval) FROM @c WHERE op = '=');
+        IF @seq IS NOT NULL
+        BEGIN
+            IF EXISTS (SELECT 1 FROM @c WHERE op = '<>' AND sval = @seq) RETURN NULL;
+            RETURN @seq;
+        END;
+        IF EXISTS (SELECT 1 FROM @c WHERE op = '<>') RETURN N'N''__UAG_NOMATCH__''';
+        RETURN NULL;
+    END;
+
+    -- NUMERIC fan.
+    IF (SELECT COUNT(DISTINCT num) FROM @c WHERE op = '=') > 1 RETURN NULL;     -- = k1 AND = k2
+    DECLARE @lo FLOAT = (SELECT MAX(CASE WHEN op='>' THEN num+1 WHEN op='>=' THEN num END) FROM @c);
+    DECLARE @hi FLOAT = (SELECT MIN(CASE WHEN op='<' THEN num-1 WHEN op='<=' THEN num END) FROM @c);
+    DECLARE @eq FLOAT = (SELECT MIN(num) FROM @c WHERE op = '=');
+
+    IF @eq IS NOT NULL
+    BEGIN
+        IF (@lo IS NOT NULL AND @eq < @lo) OR (@hi IS NOT NULL AND @eq > @hi) RETURN NULL;
+        IF EXISTS (SELECT 1 FROM @c WHERE op = '<>' AND num = @eq) RETURN NULL;
+        RETURN CASE WHEN @eq = FLOOR(@eq) THEN CAST(CAST(@eq AS BIGINT) AS NVARCHAR(50)) ELSE CAST(@eq AS NVARCHAR(50)) END;
+    END;
+
+    IF @lo IS NOT NULL AND @hi IS NOT NULL AND @lo > @hi RETURN NULL;           -- empty range
+
+    DECLARE @v FLOAT;
+    IF @lo IS NULL AND @hi IS NULL
+        SET @v = ISNULL((SELECT MAX(num) + 1 FROM @c WHERE op = '<>'), 0);      -- above all <>, else 0
+    ELSE
+    BEGIN
+        SET @v = COALESCE(@lo, @hi);
+        IF EXISTS (SELECT 1 FROM @c WHERE op = '<>' AND num = @v)
+        BEGIN
+            IF @lo IS NOT NULL
+            BEGIN
+                SET @v = (SELECT MAX(num) + 1 FROM @c WHERE op = '<>' AND num >= @lo);
+                IF @hi IS NOT NULL AND @v > @hi RETURN NULL;
+            END
+            ELSE
+                SET @v = (SELECT MIN(num) - 1 FROM @c WHERE op = '<>' AND num <= @hi);
+        END;
+    END;
+    RETURN CASE WHEN @v = FLOOR(@v) THEN CAST(CAST(@v AS BIGINT) AS NVARCHAR(50))
+                ELSE CAST(@v AS NVARCHAR(50)) END;
+END;
+GO
+
+/*-----------------------------------------------------------------------------
  * TestGen.BuildSeedInsert
  * Build an INSERT that puts @Count identical rows into a faked table.
  *   - Column list excludes identity / computed / rowversion (resolved Q4).
@@ -320,6 +413,23 @@ BEGIN
         RETURN TestGen.SatisfyingValue(@ssop, @ssrv, @ssw);
     END;
 
+    -- { "satisfyother": { op, want, oschema, otable, ocol } } (v0.15.0)
+    -- Cross-column WHERE a.x <op> b.y: derive THIS column's value from the OTHER
+    -- column's typed sample, so a.x <op> b.y holds regardless of the two types.
+    DECLARE @soj NVARCHAR(MAX) = JSON_QUERY(@vspec, '$.satisfyother');
+    IF @soj IS NOT NULL
+    BEGIN
+        DECLARE @soop VARCHAR(8) = JSON_VALUE(@soj, '$.op');
+        DECLARE @sow  BIT        = TRY_CAST(JSON_VALUE(@soj, '$.want') AS BIT);
+        DECLARE @ooid INT = OBJECT_ID(QUOTENAME(JSON_VALUE(@soj, '$.oschema')) + N'.' + QUOTENAME(JSON_VALUE(@soj, '$.otable')));
+        DECLARE @ocol SYSNAME = JSON_VALUE(@soj, '$.ocol');
+        DECLARE @obase NVARCHAR(400) = NULL;
+        SELECT @obase = TestGen.GetSampleValueLiteral(t.name, c.max_length, c.precision, c.scale, 0)
+        FROM   sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id
+        WHERE  c.object_id = @ooid AND c.name = @ocol;
+        RETURN TestGen.SatisfyingValue(@soop, @obase, @sow);
+    END;
+
     RETURN NULL;
 END;
 GO
@@ -415,6 +525,151 @@ BEGIN
     DECLARE @K INT, @kshape VARCHAR(32), @kcmp VARCHAR(16), @kcd NVARCHAR(MAX), @kwant BIT, @mode VARCHAR(8), @spec INT, @dovJson NVARCHAR(MAX);
     DECLARE @dK INT, @dmode VARCHAR(8), @satisfied INT, @need INT, @eOv NVARCHAR(MAX), @eN INT, @tot INT;
 
+    -- ============================================================
+    -- v0.15.1: cross-column value propagation (transitive chains).
+    -- Resolve every override's value GLOBALLY, in dependency order, so a
+    -- {satisfyother} column derives from its anchor column's ACTUAL resolved
+    -- value rather than a generic type sample. This makes transitive chains
+    -- (a.x > b.y AND b.y > c.z) seed correctly: c.z is sampled, b.y is derived to
+    -- beat c.z, then a.x is derived to beat b.y's ACTUAL value. A column that is
+    -- both an anchor and constrained (carries {sample} AND {satisfyother}) takes
+    -- the constrained value. A true cycle (contradiction: a.x>b.y AND b.y>a.x)
+    -- never resolves and falls back to the anchor's TYPE sample - the pre-v0.15.1
+    -- behaviour - so the impossible arm stays honestly uncovered, never faked.
+    -- @cc_chosen[fullcol] becomes the authoritative value the emit loop uses.
+    -- ============================================================
+    DECLARE @cc_spec TABLE (fullcol NVARCHAR(400), col SYSNAME, isOther BIT,
+                            op VARCHAR(8), want BIT, anchor NVARCHAR(400), oobjid INT, ocol NVARCHAR(128),
+                            litImm NVARCHAR(400));
+    DECLARE @cc_chosen TABLE (fullcol NVARCHAR(400) PRIMARY KEY, lit NVARCHAR(400));
+    DECLARE @cc_next   TABLE (fullcol NVARCHAR(400) PRIMARY KEY, v NVARCHAR(400));
+    DECLARE @cc_rounds INT = 0, @cc_changed INT = 1;
+
+    ;WITH cc_tbls AS (
+        SELECT JSON_VALUE(t.[value],'$.schema') sch, JSON_VALUE(t.[value],'$.table') tbl, t.[value] tval
+        FROM   OPENJSON(@plan,'$.tables') t
+    ),
+    cc_ovs AS (
+        SELECT b.sch, b.tbl, JSON_VALUE(o.[value],'$.col') col, JSON_QUERY(o.[value],'$.vspec') vspec
+        FROM   cc_tbls b
+        CROSS APPLY OPENJSON(b.tval,'$.demands') d
+        CROSS APPLY OPENJSON(JSON_QUERY(d.[value],'$.overrides')) o
+    )
+    INSERT @cc_spec (fullcol, col, isOther, op, want, anchor, oobjid, ocol, litImm)
+    SELECT LOWER(sch+N'.'+tbl+N'.'+col), col,
+           CASE WHEN JSON_QUERY(vspec,'$.satisfyother') IS NOT NULL THEN 1 ELSE 0 END,
+           JSON_VALUE(vspec,'$.satisfyother.op'),
+           TRY_CAST(JSON_VALUE(vspec,'$.satisfyother.want') AS BIT),
+           LOWER(JSON_VALUE(vspec,'$.satisfyother.oschema')+N'.'+JSON_VALUE(vspec,'$.satisfyother.otable')+N'.'+JSON_VALUE(vspec,'$.satisfyother.ocol')),
+           OBJECT_ID(QUOTENAME(JSON_VALUE(vspec,'$.satisfyother.oschema'))+N'.'+QUOTENAME(JSON_VALUE(vspec,'$.satisfyother.otable'))),
+           JSON_VALUE(vspec,'$.satisfyother.ocol'),
+           CASE WHEN JSON_QUERY(vspec,'$.satisfyother') IS NULL
+                THEN TestGen.ResolveVspec(vspec, @procObj, OBJECT_ID(QUOTENAME(sch)+N'.'+QUOTENAME(tbl)), col)
+                ELSE NULL END
+    FROM   cc_ovs
+    WHERE  col IS NOT NULL;
+
+    -- v0.15.3: capture {satisfy} literal/param comparisons as constraints too, so a
+    -- column compared to BOTH another column and a literal (a.X > b.Y AND a.X > 100)
+    -- intersects them, rather than letting the satisfyother overwrite the literal.
+    DECLARE @cc_cmp TABLE (fullcol NVARCHAR(400), op VARCHAR(8), want BIT, cval NVARCHAR(400));
+    ;WITH cc_tbls AS (
+        SELECT JSON_VALUE(t.[value],'$.schema') sch, JSON_VALUE(t.[value],'$.table') tbl, t.[value] tval
+        FROM   OPENJSON(@plan,'$.tables') t
+    ),
+    cc_ovs AS (
+        SELECT b.sch, b.tbl, JSON_VALUE(o.[value],'$.col') col, JSON_QUERY(o.[value],'$.vspec') vspec
+        FROM   cc_tbls b
+        CROSS APPLY OPENJSON(b.tval,'$.demands') d
+        CROSS APPLY OPENJSON(JSON_QUERY(d.[value],'$.overrides')) o
+    )
+    INSERT @cc_cmp (fullcol, op, want, cval)
+    SELECT LOWER(sch+N'.'+tbl+N'.'+col),
+           JSON_VALUE(vspec,'$.satisfy.op'),
+           ISNULL(TRY_CAST(JSON_VALUE(vspec,'$.satisfy.want') AS BIT), 1),
+           CASE WHEN JSON_VALUE(vspec,'$.satisfy.valKind') = 'param'
+                THEN (SELECT TestGen.GetSampleValueLiteral(t.name, pr.max_length, pr.precision, pr.scale, 0)
+                      FROM   sys.parameters pr JOIN sys.types t ON t.user_type_id = pr.user_type_id
+                      WHERE  pr.object_id = @procObj AND pr.name = JSON_VALUE(vspec,'$.satisfy.val'))
+                ELSE JSON_VALUE(vspec,'$.satisfy.val') END
+    FROM   cc_ovs
+    WHERE  col IS NOT NULL AND JSON_QUERY(vspec,'$.satisfy') IS NOT NULL;
+
+    -- round 0: the non-satisfyother (lit/param/sample) values
+    INSERT @cc_chosen (fullcol, lit)
+    SELECT fullcol, MAX(litImm) FROM @cc_spec WHERE isOther = 0 GROUP BY fullcol;
+
+    -- relaxation: derive each satisfyother value from its (chosen) anchor until stable
+    WHILE @cc_changed = 1 AND @cc_rounds < 64
+    BEGIN
+        SET @cc_rounds += 1;
+        DELETE FROM @cc_next;
+        -- resolve a satisfyother column only when ALL its anchors are chosen;
+        -- single anchor -> SatisfyingValue (unchanged); multiple anchors ->
+        -- SatisfyAll numeric intersection (NULL -> leave for the cycle fallback).
+        ;WITH oan AS (   -- satisfyother rows + anchor readiness
+            SELECT s.fullcol, s.op, s.want, ca.lit AS aval,
+                   ocnt = COUNT(*)          OVER (PARTITION BY s.fullcol),
+                   ordy = COUNT(ca.fullcol) OVER (PARTITION BY s.fullcol)
+            FROM   @cc_spec s
+            LEFT JOIN @cc_chosen ca ON ca.fullcol = s.anchor
+            WHERE  s.isOther = 1
+        ),
+        ready AS ( SELECT DISTINCT fullcol FROM oan WHERE ocnt = ordy ),
+        hard AS (   -- total hard constraints on a ready column: satisfyother + satisfy
+            SELECT r.fullcol,
+                   n = (SELECT COUNT(*) FROM @cc_spec s2 WHERE s2.fullcol = r.fullcol AND s2.isOther = 1)
+                     + (SELECT COUNT(*) FROM @cc_cmp  m2 WHERE m2.fullcol = r.fullcol)
+            FROM   ready r
+        )
+        INSERT @cc_next (fullcol, v)
+        SELECT z.fullcol, z.v FROM (
+            SELECT h.fullcol,
+                   v = CASE WHEN h.n = 1
+                            -- single satisfyother, no literal -> original fast path
+                            THEN (SELECT MAX(TestGen.SatisfyingValue(o.op, o.aval, o.want))
+                                  FROM oan o WHERE o.fullcol = h.fullcol)
+                            -- 2+ constraints (multi-anchor, or anchor + literal) -> intersect
+                            ELSE TestGen.SatisfyAll((
+                                  SELECT op, want, val FROM (
+                                      SELECT o.op AS op, o.want AS want, o.aval AS val
+                                      FROM   oan o WHERE o.fullcol = h.fullcol
+                                      UNION ALL
+                                      SELECT m.op, m.want, m.cval
+                                      FROM   @cc_cmp m WHERE m.fullcol = h.fullcol
+                                  ) q FOR JSON PATH)) END
+            FROM   hard h
+        ) z
+        WHERE  z.v IS NOT NULL;
+
+        SET @cc_changed = CASE WHEN EXISTS (
+            SELECT 1 FROM @cc_next n LEFT JOIN @cc_chosen c ON c.fullcol = n.fullcol
+            WHERE c.fullcol IS NULL OR ISNULL(c.lit, N'<<uagx>>') <> ISNULL(n.v, N'<<uagx>>')
+        ) THEN 1 ELSE 0 END;
+
+        UPDATE c SET c.lit = n.v
+        FROM   @cc_chosen c JOIN @cc_next n ON n.fullcol = c.fullcol
+        WHERE  ISNULL(c.lit, N'<<uagx>>') <> ISNULL(n.v, N'<<uagx>>');
+
+        INSERT @cc_chosen (fullcol, lit)
+        SELECT n.fullcol, n.v FROM @cc_next n
+        WHERE  NOT EXISTS (SELECT 1 FROM @cc_chosen c WHERE c.fullcol = n.fullcol);
+    END;
+
+    -- cycle fallback: a satisfyother col still unresolved (its anchor never resolved
+    -- = a contradiction/cycle) derives from the anchor column's TYPE sample - the
+    -- pre-v0.15.1 best-effort. If that cannot satisfy, the branch stays honestly
+    -- uncovered (no phantom pass), exactly as a contradiction should.
+    INSERT @cc_chosen (fullcol, lit)
+    SELECT s.fullcol, MAX(TestGen.SatisfyingValue(s.op,
+               TestGen.GetSampleValueLiteral(t.name, c.max_length, c.precision, c.scale, 0), s.want))
+    FROM   @cc_spec s
+    JOIN   sys.columns c ON c.object_id = s.oobjid AND c.name = s.ocol
+    JOIN   sys.types   t ON t.user_type_id = c.user_type_id
+    WHERE  s.isOther = 1
+      AND  NOT EXISTS (SELECT 1 FROM @cc_chosen ch WHERE ch.fullcol = s.fullcol)
+    GROUP  BY s.fullcol;
+
     DECLARE tc CURSOR LOCAL FAST_FORWARD FOR
         SELECT JSON_VALUE([value], '$.schema'), JSON_VALUE([value], '$.table'), JSON_QUERY([value], '$.demands')
         FROM   OPENJSON(@plan, '$.tables');
@@ -468,10 +723,14 @@ BEGIN
             IF @K IS NULL SET @K = 0;
 
             DELETE FROM @ovt;
+            -- v0.15.1: use the globally propagated value (@cc_chosen) so cross-column
+            -- chains resolve; fall back to per-column ResolveVspec defensively.
             INSERT @ovt (col, val)
             SELECT JSON_VALUE(o.[value], '$.col'),
-                   TestGen.ResolveVspec(JSON_QUERY(o.[value], '$.vspec'), @procObj, @objid, JSON_VALUE(o.[value], '$.col'))
-            FROM   OPENJSON(ISNULL(@dov, N'[]')) o;
+                   ISNULL(ch.lit,
+                          TestGen.ResolveVspec(JSON_QUERY(o.[value], '$.vspec'), @procObj, @objid, JSON_VALUE(o.[value], '$.col')))
+            FROM   OPENJSON(ISNULL(@dov, N'[]')) o
+            LEFT  JOIN @cc_chosen ch ON ch.fullcol = LOWER(@tsch + N'.' + @ttbl + N'.' + JSON_VALUE(o.[value], '$.col'));
             SET @dovJson = ISNULL((SELECT col AS [col], MAX(val) AS [val] FROM @ovt GROUP BY col FOR JSON PATH), N'[]');
             SET @spec = (SELECT COUNT(DISTINCT col) FROM @ovt);
             INSERT @demT (K, ovJson, spec, mode) VALUES (@K, @dovJson, @spec, @mode);
@@ -539,7 +798,7 @@ BEGIN
     END;
     CLOSE tc; DEALLOCATE tc;
 
-    SET @SeedSql = N'    -- v0.12 ' + @Direction + N' seed for: ' + LEFT(@PredText, 200) + CHAR(13) + CHAR(10)
+    SET @SeedSql = N'    -- v0.12 ' + @Direction + N' seed for: ' + REPLACE(REPLACE(REPLACE(LEFT(@PredText, 200), CHAR(13), N' '), CHAR(10), N' '), CHAR(9), N' ') + CHAR(13) + CHAR(10)
                  + CASE WHEN @seed = N'' THEN N'    -- (faked tables left empty for this direction)' ELSE @seed END;
     SET @Supported = 1;
 END;
@@ -1115,7 +1374,7 @@ BEGIN
         RETURN;
     END;
 
-    SET @SeedSql = N'    -- predicate ' + @Direction + N' seed for: ' + LEFT(@PredText, 200) + CHAR(13) + CHAR(10)
+    SET @SeedSql = N'    -- predicate ' + @Direction + N' seed for: ' + REPLACE(REPLACE(REPLACE(LEFT(@PredText, 200), CHAR(13), N' '), CHAR(10), N' '), CHAR(9), N' ') + CHAR(13) + CHAR(10)
                  + N'    ' + @insert;
     SET @Supported = 1;
 END;

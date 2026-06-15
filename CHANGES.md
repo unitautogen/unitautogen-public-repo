@@ -8238,3 +8238,712 @@ hand-edit that renames the temp table, and consistent with tSQLt's own explicit-
 (AssertEqualsTable '#Expected','#Actual'). Pure readability/robustness change - assertion behavior
 is identical (verified on AdventureWorks2025 pz.ContradictionGate: 4 pass / 1 skip, 0 fail; the skip
 is the hand-built-expectation scaffold). Part of v0.14.1.
+
+================================================================================
+2026-06-14  -  v0.15.0  -  cross-column WHERE seeding (column vs column) + multi-line predicate fix
+================================================================================
+NEW CAPABILITY. The reverse seeder now drives a WHERE that compares one column to another -
+same-table (WHERE Lo > Hi) or cross-table (a JOIN b ... WHERE a.Amount > b.Threshold), any
+operator, single or multi-condition, coordinated with the join keys. Previously such a
+predicate was fenced NOT_TESTABLE ("conjunct is not <column> <op> <literal|@param>"); now it
+seeds BOTH arms to 100% branch.
+
+HOW. The SQLCLR parser (clr/UnitAutogenClr.cs) detects a column-vs-column comparison in
+WhereLeaf and emits a "colcol" leaf; DriveWhere anchors the RIGHT column on its own typed
+sample ({sample}) and the LEFT column on a new vspec
+{satisfyother:{op,want,oschema,otable,ocol}} that derives a satisfying/violating value from
+the OTHER column's typed sample - robust across differing column types, unlike the same-type
+{satisfysample} used for non-equi JOIN coordination. PlanAtom builds an alias->[schema,table]
+map so satisfyother resolves the real owning table. T-SQL TestGen.ResolveVspec gained a
+satisfyother branch: it samples the other column's type and returns
+TestGen.SatisfyingValue(op, that-sample, want). Existing join-key coordination
+(CoordinateJoins) is unchanged, so the seeded rows still join.
+
+BUG-002 FIX (multi-line predicate emission). The seed block embedded the raw predicate text
+into a single-line "-- ... seed for: <text>" comment. When the predicate spanned more than one
+source line, the embedded newline terminated the comment and the continuation (e.g. a wrapped
+"WHERE ...") became live SQL -> "Incorrect syntax near 'WHERE'" -> sp_executesql threw and the
+class emitted ZERO predicate-branch tests (silently, inside the sweep) -> the branch showed as
+a 50% gap. This hit ANY multi-line predicate, not just column-vs-column, but would have
+crippled the new feature in practice (cross-table predicates are usually written as wrapped
+EXISTS subqueries). FIX: strip CR/LF/TAB from the embedded comment text in BOTH seeders
+(ExecuteSeedPlan and SatisfyPredicate). The seed plan itself was always correct; only the
+comment rendering broke.
+
+HONEST BOUNDARY (unchanged spine). A genuine contradiction (WHERE a.x > b.y AND a.x < b.y) has
+no seed by definition; it is not faked. Both branch tests still emit, but branch coverage
+honestly reports the impossible arm as unreached (50%) - the red number is the signal, never a
+phantom green.
+
+VALIDATED on AdventureWorks2025 (CLR rebuilt + re-trusted; registered assembly hash
+0x9FF0ADFE...): single cross-table (a.Amount>b.Threshold) NOT_TESTABLE->100%; same-table
+(Lo>Hi) 100%; multi-condition cross-table (a.Amount>b.Threshold AND a.Rnk<b.Cap) 100% whether
+written on one OR multiple source lines; contradiction stays honest 50%; single-column
+multi-line (wrapped WHERE p.Amount>100) NOT_TESTABLE-regression FIXED ->100%. REGRESSION:
+PredicateZoo re-parsed clean (28 PREDTREE; the only 5 UNRECOGNISED are the by-design
+loop-accumulator gates) and 23 distinct seedable gates re-ran GREEN at 100% branch (incl.
+NonEquiJoinGate, SelfJoinGate, SharedTableGate, ParamComparandGate, OrCompositionGate, the
+Count*/agg family); ContradictionGate honest 50%.
+FILES: clr/UnitAutogenClr.cs + clr/lib/UnitAutogenClr.dll + clr/Install-UnitAutogenClr.SSMS.sql
+(rebuilt, new hash); Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
++ modules/32_Seeder_v1.sql (ResolveVspec satisfyother + comment sanitize); clr/Build-Clr.ps1
+(spaced-path + self-copy build fixes). Bump to v0.15.0 when committing.
+
+================================================================================
+2026-06-14  -  v0.15.1  -  cross-column seeding solves transitive chains (multi-table)
+================================================================================
+Extends v0.15.0 cross-column seeding to TRANSITIVE CHAINS across any number of joined
+tables: a WHERE that chains comparisons through a shared column - a.X > b.Y AND b.Y > c.Z -
+now seeds BOTH arms to 100% branch (was an honest 50% residue in v0.15.0).
+
+ROOT CAUSE. ExecuteSeedPlan resolved each override INDEPENDENTLY and per-table, and a
+{satisfyother} column derived its value from the OTHER column's generic TYPE SAMPLE, not the
+other column's ACTUAL seeded value. In a chain the middle column (b.Y) is squeezed from both
+sides - the sample-anchor for "a.X > b.Y" and itself derived for "b.Y > c.Z" - so a.X was
+computed against b.Y's type sample (42) while b.Y was actually bumped to 43 -> 43 > 43 false
+-> TRUE arm unreached -> 50%.
+
+FIX (T-SQL only; the parser already emits the right structure - b.Y carries both {sample}
+and {satisfyother against c.Z}, a.X carries {satisfyother against b.Y}). ExecuteSeedPlan
+gains a global value-propagation pre-pass: collect every override across all tables, seed the
+free (lit/param/sample) columns, then RELAX - repeatedly derive each {satisfyother} value
+from its anchor's ACTUAL chosen value (SatisfyingValue(op, anchor's resolved literal, want))
+until stable. A column carrying both {sample} and {satisfyother} takes the constrained value.
+The emit loop then reads the propagated @cc_chosen[fullcol] for every column. So c.Z=42 ->
+b.Y=43 (beats c.Z) -> a.X=44 (beats b.Y's ACTUAL 43): 44 > 43 > 42.
+
+HONEST BOUNDARY. A true cycle (a.X > b.Y AND b.Y > a.X) never resolves (no free anchor); it
+falls back to the pre-v0.15.1 type-sample best-effort and the impossible arm stays honestly
+uncovered (50%) - no phantom pass, no hang (the relaxation is capped at 64 rounds).
+
+VALIDATED on AdventureWorks2025: transitive chain a.X>b.Y>c.Z NOT_TESTABLE/50% -> 100%
+(seed TA.X=44, TB.Y=43, TC.Z=42); disjoint 3-table and shared-right-column still 100%;
+contradiction and cycle stay honest 50% (no hang/error). REGRESSION: PredicateZoo re-parsed
+clean (28 PREDTREE, 5 by-design loop gates) and 13 seedable gates re-ran GREEN at 100%
+(NonEquiJoin/SelfJoin/SharedTable/ParamComparand/Exists/NotExists/Or/ScalarCmp/Count*/Sum
+OverJoin/CountBetween); ContradictionGate honest 50%. PARSEONLY over the installer: 0 errors.
+NO C# / CLR change (assembly hash unchanged).
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(byte-identical) + modules/32_Seeder_v1.sql (TestGen.ExecuteSeedPlan propagation pre-pass +
+@cc_chosen lookup in the emit loop). Bump to v0.15.1 when committing.
+
+================================================================================
+2026-06-14  -  v0.15.2  -  cross-column seeding: a column constrained by MANY comparisons
+================================================================================
+Extends cross-column seeding to a column that must satisfy SEVERAL comparisons at once:
+a.X > b.Y AND a.X > c.Z (a.X must beat BOTH anchors), or a range a.X >= b.Y AND a.X <= c.Z.
+These now seed to 100% branch (was honest 50% residue).
+
+ROOT CAUSE. The relaxation resolved a multi-constraint column by taking MAX over a
+SatisfyingValue computed per anchor. That is wrong twice over: (1) MAX over the string
+literals is LEXICAL, so '43' > '101' and a.X would be seeded below the larger anchor; and
+(2) for mixed operators (a range) neither MAX nor MIN of the per-anchor values is correct.
+
+FIX (T-SQL only). New scalar TestGen.SatisfyAll(@constraintsJson) intersects a column's
+numeric comparison constraints into ONE satisfying value: lo = max of the lower bounds
+(> -> val+1, >= -> val), hi = min of the upper bounds (< -> val-1, <= -> val), returns a
+value in [lo,hi] - NUMERIC, not lexical. The ExecuteSeedPlan relaxation now resolves a
+satisfyother column only once ALL its anchors are chosen; a single anchor still uses
+SatisfyingValue (unchanged), multiple anchors use SatisfyAll over the anchors' ACTUAL
+resolved values. An empty intersection (a.X > 100 AND a.X < 50) or an '='/'<>'/non-numeric
+fan returns NULL, so the column is left for the cycle fallback and the impossible arm stays
+honestly uncovered - never a wrong seed.
+
+VALIDATED on AdventureWorks2025. SatisfyAll unit tests: >9 AND >100 -> 101 (NOT lexical 10);
+>=42 AND <=100 -> 42; >100 AND <50 -> NULL; '='-fan -> NULL. Integration: a.X>b.Y AND a.X>c.Z
+-> 100% (seed a.X=43 beats both). REGRESSION: transitive chain and disjoint-pairs still 100%;
+PredicateZoo green (NonEquiJoin/SelfJoin/SharedTable/CountEq/ScalarCmp/OrComposition 100%,
+ContradictionGate honest 50%). Single-anchor resolution is byte-for-byte unchanged (cnt=1
+branch). PARSEONLY over the installer: 0 errors. NO C#/CLR change (assembly hash unchanged).
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(byte-identical) + modules/32_Seeder_v1.sql (new TestGen.SatisfyAll; ExecuteSeedPlan
+relaxation gains the all-anchors-ready gate + multi-anchor SatisfyAll path).
+Remaining residue (rare): a column fanned by '=' / '<>' across several anchors, or mixed
+with a literal comparison on the SAME column, is not intersected (honest 50%). Bump to
+v0.15.2 when committing.
+
+================================================================================
+2026-06-14  -  v0.15.3  -  cross-column seeding: =/<> fans + column-vs-column AND a literal
+================================================================================
+Closes the last residual cross-column shapes from v0.15.2:
+  (A) equality fan      a.X = b.Y AND a.X = c.Z   (a.X must equal BOTH)
+  (A') inequality fan   a.X <> b.Y AND a.X <> c.Z (a.X must differ from BOTH)
+  (B) column + literal  a.X > b.Y AND a.X > 100   (a column compared to another column AND a literal)
+All now seed to 100% branch (were honest 50% residue).
+
+FIX (T-SQL only). Two parts:
+1. TestGen.SatisfyAll extended from bounds-only to a full single-variable solver: it now
+   handles '=' (one value, validated against the bounds and any '<>') and '<>' (numeric:
+   pick above all exclusions; string: a guaranteed-non-matching sentinel) in addition to
+   >,>=,<,<= - NUMERIC for numbers, equality/inequality for strings. Conflicting equalities
+   or an empty range still return NULL (honest residue).
+2. ExecuteSeedPlan now captures a column's {satisfy} literal/param comparisons (new @cc_cmp)
+   and FOLDS them into the same intersection as its {satisfyother} cross-column comparisons.
+   A column with >=2 hard constraints (multi-anchor, OR anchor+literal) is solved by
+   SatisfyAll over the full set; a single constraint keeps its original byte-for-byte path.
+
+VALIDATED on AdventureWorks2025. SatisfyAll unit tests: =42 AND =42 -> 42; =42 AND =43 -> NULL;
+<>42 AND <>42 -> 43; <>42 AND <>50 -> 51; =5 AND >1 -> 5; =5 AND >10 -> NULL; =N'abc' AND
+=N'abc' -> N'abc'; <>N'abc' -> sentinel. Integration: eq-fan 100% (a.X=42), neq-fan 100%
+(a.X=43), col+literal 100% (a.X=101 beats both); a.X=b.Y AND a.X<>b.Y stays honest 50%.
+REGRESSION: multi-anchor / transitive chain / single colcol still 100%; PredicateZoo green
+(CountEq/NonEquiJoin/ScalarCmp/ParamComparand 100%, Contradiction 50%; Exists/NotExists/
+SelfJoin/SharedTable/Or/CountBetween/CountIn all pass 0-fail). PARSEONLY: 0 errors. NO C#/CLR
+change (assembly hash unchanged).
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(byte-identical) + modules/32_Seeder_v1.sql (SatisfyAll extended; ExecuteSeedPlan gains @cc_cmp
++ folds literal comparisons into the intersection). Remaining residue is now only the truly
+exotic (e.g. a non-numeric inequality fan, or a satisfysample non-equi-join mixed with a
+literal on the same column). Bump to v0.15.3 when committing.
+
+================================================================================
+2026-06-14  -  v0.15.4  -  coverage for self-transaction + advanced-construct procs
+================================================================================
+Procedures that manage their OWN transactions and/or use advanced constructs (OPENJSON WITH,
+CTE-driven UPDATE/MERGE) previously reported a FALSE 0% coverage. They now measure. Surfaced
+on ComplexOrderTest.Sales.usp_ProcessComplexOrderExecution (JSON shred + window CTEs + MERGE +
+a transaction with multiple rejection paths): 0% -> 37% line / 50% branch, the remainder
+honestly attributed to the seeding ceiling (JSON-derived + @@ROWCOUNT/@@TRANCOUNT/local-var
+predicates that the data-seeder cannot reach), NOT an instrumentation failure.
+
+ROOT CAUSE (two independent defects, both pre-existing):
+1. The line-based coverage instrumenter (TestGen.InstrumentProcedure) mis-split statements when
+   building the measured "_cov" shadow, so the shadow FAILED TO COMPILE and there was nothing
+   to measure (hence 0%):
+     a. a leading ';' on ";WITH cte AS (" blanked first-word detection, losing the CTE's WITH
+        state and splitting the CTE+UPDATE into "UPDATE pi" + a stray "SET ...";
+     b. the OPENJSON/CHANGETABLE "WITH (" clause was treated as a new CTE opener and split off
+        from its SELECT ("Incorrect syntax near '('");
+     c. a CTE whose main statement is UPDATE/DELETE/MERGE/INSERT did not hand off to that verb's
+        continuation set, so the body's SET/VALUES fired a spurious mid-statement boundary.
+2. The proc's own BEGIN/COMMIT/ROLLBACK TRANSACTION + SET XACT_ABORT ON collapsed tSQLt's
+   per-test transaction ("Transaction count after EXECUTE indicates a mismatching number of
+   BEGIN and COMMIT" - every test that EXECs the proc errored) and rolled back the coverage
+   capture.
+
+FIX (T-SQL only, all in TestGen.InstrumentProcedure):
+- (1a) strip a leading ';' before first-word detection.
+- (1b) treat "WITH (" (paren straight after WITH) as a continuation, not a CTE opener.
+- (1c) when @OpenStmt='WITH' and the line's verb is UPDATE/DELETE/MERGE/INSERT, transition
+  @OpenStmt to that verb so its continuation set (SET, VALUES, ...) applies.
+- (2) NEUTRALIZE the proc's own transaction-control statements IN THE SHADOW ONLY: each
+  standalone BEGIN/COMMIT/ROLLBACK [TRAN[SACTION]] / SAVE TRAN / SET XACT_ABORT ON becomes a
+  no-op statement ("SET @__uag_noop = 0;", declared in the shadow preamble). A no-op STATEMENT
+  (not a comment) is required because the statement may be the only one in a BEGIN/END or IF
+  body (e.g. the CATCH's "IF @@TRANCOUNT>0 BEGIN ROLLBACK END") and an EMPTY BEGIN/END is
+  invalid T-SQL. Control flow + line mapping are unchanged; the proc runs inside tSQLt's single
+  transaction; and the real value/effect assertions still run against the UNCHANGED proc - the
+  shadow exists only to measure which lines run. Only whole-statement transaction lines are
+  touched (one-statement-per-line guard), so an inline "ROLLBACK; RETURN;" is left alone.
+
+VALIDATED: ComplexOrderTest proc shadow now COMPILES, 0 trancount errors, 13/35 lines (37.1%)
+/ 3/6 branches (50.0%). REGRESSION: PredicateZoo on AdventureWorks2025 green - 8 gates
+(CountEq/NonEquiJoin/Exists/ScalarCmp/OrComposition/CountOverJoin/SumOverJoin/SelfJoin) all
+100% with the new instrumenter (the new rules only fire on transactions/OPENJSON/CTE/leading-';',
+so normal procs are byte-for-byte unaffected). PARSEONLY over the installer: 0 errors. NO C#/CLR
+change.
+KNOWN RESIDUE (pre-existing, unchanged): the coverage hit injected between a statement and an
+immediately-following @@ROWCOUNT/@@ERROR check clobbers those (the affected branches are
+NOT_TESTABLE anyway); an inline "ROLLBACK; RETURN;" is not neutralized. The deeper, general fix
+remains the roadmapped ScriptDom-based instrumenter (this line-based walker has a ceiling).
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(byte-identical). modules/20_Coverage_Instrumenter_v5.sql is a STALE reference (already behind
+the installer's v5.2) and is intentionally not patched. Bump to v0.15.4 when committing.
+
+## 2026-06-14 -- v0.15.5 deep-gate deterministic witnesses: JSON/table-variable aggregates + key-lookup gates -> 100%
+
+CONTEXT: the v0.15.4 challenge proc (ComplexOrderTest.Sales.usp_ProcessComplexOrderExecution)
+measured a faithful 37% line / 50% branch but could not reach the deep half: the gates over a
+JSON-shredded table VARIABLE (@CalculatedTotalDue = SUM(...), @InventoryShortageCount = COUNT(...)
+over @ParsedItems), the key-lookup status scalar (@IsCustomerActive = 0), the @@ROWCOUNT
+"not found" check, and the NULL parameter guard. The iterative search cannot seed a table
+VARIABLE ("Must declare the table variable @ParsedItems") and the scalar/ROWCOUNT/NULL gates
+were left ENVIRONMENTAL/NOT_TESTABLE.
+
+ROOT INSIGHT: these are all DETERMINISTIC once you read the proc's structure - no search needed.
+JSON synthesis is trivial; the real work is (a) synthesising a valid JSON parameter from the
+OPENJSON WITH schema + seeding the catalog JOIN table to match, and (b) for an aggregate-over-
+table-variable gate, PIVOTING the seed to the OTHER comparand's REAL source column (e.g. a
+credit-limit column on the lookup table) instead of the un-seedable table variable.
+
+FIX (T-SQL only, NO C#/CLR change):
+- NEW TestGen.DeriveDeepGateWitnesses (+ helpers TestGen.BuildSeededRow, TestGen.PatchArgList).
+  Parses, from the proc's own body: the key-lookup SELECT (table, key col, key param, the
+  local->column map), and the OPENJSON(@param) WITH(...) shred (json props, the populated table
+  variable, the catalog JOIN table + key, the catalog WHERE filter). Synthesises a valid JSON
+  literal + coordinated real-table seeds, and upgrades each UNRECOGNISED gate to a verified
+  WITNESS with a per-witness ArgOverride:
+    * NULLPARAM    - @p IS NULL [OR ...]            -> pass NULL for the parameter
+    * ROWCOUNTCHK  - @@ROWCOUNT = 0 after lookup    -> fake the lookup table empty (0 rows)
+    * LOOKUPSCALAR - @statuslocal = <lit>           -> seed the lookup row with that col=<lit>
+    * JSONAGG-COL  - @agg <op> @lookupcol           -> JSON+catalog seed; comparand col set low
+    * JSONAGG-CNT  - @countlocal > 0 [AND @p = k]   -> JSON+catalog seed (no stock); arg k set
+    * HAPPYPATH    - falls through every gate        -> valid JSON, active row, high credit, bit=1
+- TestGen.SearchSeedResult gains an ArgOverride column. TestGen.EmitSearchSeedTests honours it:
+  uses it as the EXEC arg list, SKIPS the generic reach prefix (the witness is self-contained),
+  and suppresses ExpectException for self-contained witnesses (the proc catches its own RAISERROR
+  internally, so expecting a propagated error would false-fail).
+- TestGen.SearchSeedForProc now runs DeriveDeepGateWitnesses FIRST and the iterative search
+  SKIPS any gate already witnessed - so deep gates are covered deterministically and fast
+  (no per-candidate XEvent sweep; SearchSeedForProc on the challenge proc dropped to ~1s).
+
+RESULT: ComplexOrderTest.Sales.usp_ProcessComplexOrderExecution -> 100% line (35/35) + 100%
+branch (6/6) via GenerateAndRunCoverage end-to-end (~14s), all 6 generated deep-gate witness
+tests passing. (The proc's generic base/negative tests still fail on naive arguments - the
+pre-existing "valid-input synthesis for complex procs" + "error-expectation over-generation"
+limitations - this is separate from the coverage result and unchanged here.)
+REGRESSION: PredicateZoo on AdventureWorks2025 green - every gate at its expected coverage
+(ScalarNullGate/CountEqGate/ScalarCmpGate/ExistsGate/NonEquiJoinGate/OrCompositionGate/
+SumOverJoinGate 100%, ContradictionGate honest 50%), 0 failed / 0 errored. The derivation is a
+no-op on procedures without the lookup/OPENJSON shape, so normal procs are unaffected.
+
+CLEANUP (same v0.15.5, base-test false-fails on this proc shape): with the deep half now
+reachable, the proc's GENERIC base/negative tests were false-failing (6 of them). Three fixes,
+all gated to the relevant shape so pz/AW2025 base tests are unaffected:
+- VALID JSON for the smoke tests: GenerateTestsForProcedure now gives a parameter consumed by
+  OPENJSON(@param) an empty JSON array '[]' in the happy-path + boundary arg lists (was arbitrary
+  text -> JSON parse error -> uncommittable transaction under XACT_ABORT, failing "executes with
+  valid inputs"/"assigns OUTPUT"/"touches only mocked tables"). TestGen.PatchArgList made
+  space-tolerant so it patches both "@p = v" (happy lists) and "@p=v" (witness lists).
+- SUPPRESS error-expectation tests when the proc SWALLOWS its own errors: new @SwallowsErrors
+  (the body has a CATCH that neither THROWs nor RAISERRORs) gates @UseExpectExceptionForInvalid
+  and the "raises error path" block off, so ExpectException isn't asserted for a RAISERROR the
+  proc catches internally (was failing "Expected an error to be raised").
+- BuildLikeSkeleton overlap fix: a literal that is a SUBSTRING of a longer collected literal
+  (a standalone 'SUCCESS' audit-type inside the status 'FULL_SUCCESS') is dropped, so the OUTPUT
+  skeleton is '%FULL[_]SUCCESS%' not the un-matchable '%FULL[_]SUCCESS%SUCCESS%'.
+RESULT: ComplexOrderTest proc suite now 11 passed / 0 failed / 0 errored / 8 honest skips, still
+100% line + 100% branch. pz regression re-run green (0 failed/errored, same coverage). Whole
+installer PARSEONLY-clean (286 batches, 0 syntax errors).
+
+ADOPTION (same v0.15.5): turn the reverse-seedable SKIPPED predicate-branch tests into PASSING
+tests instead of leaving them skipped.  The static (table-column) seeder leaves predicates
+inside CASE expressions / over the JSON-shredded table variable as honest skips, but the
+reverse-seeding scenario can drive them.  DeriveDeepGateWitnesses now emits a CASEARM witness per
+such (not-yet-witnessed) predicate line - one scenario (HIGH json quantity + NO stock + partial
+fulfilment) makes the volume-discount arms (json.Quantity >= 100 / >= 50), the shortage flag
+((stock - qty) < 0) and the shortage-count CASE arms (@InventoryShortageCount > 0 at the
+OrderStatus + final-status CASEs) all TRUE.  Detection: a predicate that references a json-shred
+column, a COUNT-over-table-variable local, or an "X - Y < 0" stock/shortage shape.
+EmitSearchSeedTests dedup is now direction-aware: a CASEARM witness also replaces the line's
+"predicate TRUE" skip (the passing "predicate FALSE" arm is kept).
+RESULT: on ComplexOrderTest those 5 skips (L72 x2, L94, L129, L157) became passing CASEARM tests
+-> suite now 18 run / 15 passed / 0 failed / 0 errored / 3 skips; the 3 residual skips are
+genuinely non-data-seedable (two out-of-domain boundary probes + @@TRANCOUNT).  Coverage stays
+100% line / 100% branch.
+
+CROSS-COLLATION FIX (found during AW2025 regression): DeriveDeepGateWitnesses compared its
+SYSNAME temp columns (server collation) against PredicateInbox.PredicateText / @ptext (database
+collation), so on a DB whose collation <> server it raised "Cannot resolve the collation conflict
+... in the charindex operation" - caught by the outer TRY (reported "search-seeding skipped"),
+so the deep-gate witnesses silently did NOT generate on such DBs.  Fixed: #lkpmap/#json/#sg/
+#cntloc name columns declared COLLATE DATABASE_DEFAULT, and PredicateText coerced COLLATE
+DATABASE_DEFAULT in the CHARINDEX comparisons.  Verified on AW2025 (collation error gone,
+CountEqGate 100%/100%, 0 failed) and ComplexOrderTest (unchanged).
+
+OUTPUT-EFFECT ASSERTIONS (same v0.15.5): the search/derive witness tests were coverage-backed
+SMOKE (run the verified seed; rely on no-throw + the coverage instrumenter), with no per-test
+assertion of the business outcome.  EmitSearchSeedTests now MEASURES each witness's scalar OUTPUT
+parameters against the neutralised _cov shadow (which cannot collapse a transaction or touch real
+tables) and BAKES an assertion into the test body after the EXEC, so the test guards the outcome:
+a later logic change that alters the OUTPUT fails the test.
+- Measure once, in a rolled-back transaction; the OUTPUT @vars are captured AFTER the rollback
+  (they survive it; rows INSERTed into the capture temp inside the txn would be rolled back).
+- A numeric output, or a string output the proc assigns as a CONSTANT (the measured value appears
+  verbatim as a string literal in the source), is asserted EXACT (AssertEquals / AssertEqualsString).
+  A concatenated / runtime-varying string output gets a constant-skeleton LIKE (BuildLikeSkeleton).
+- Fully TRY/CATCH-guarded + collation-safe (#outp/#wmeas COLLATE DATABASE_DEFAULT): any measurement
+  failure falls back to the prior smoke witness, so emission never breaks.  Read procs with no
+  scalar OUTPUT get no assertion (unchanged).
+RESULT on ComplexOrderTest: every witness now asserts its status, e.g. ROWCOUNTCHK ->
+'CRITICAL: Customer record not found', LOOKUPSCALAR -> 'REJECTED: Customer account inactive',
+JSONAGG-COL -> 'REJECTED: Insufficient credit limit', JSONAGG-CNT -> 'REJECTED: Out of stock
+safety rules', CASEARM/HAPPYPATH -> 'PARTIAL_SUCCESS', NULLPARAM -> AssertEquals @ProcessedOrderID=0
++ AssertLike '%ERROR: %Missing required input boundaries.%'.  Suite 18 run / 15 pass / 0 fail /
+3 skip, still 100%/100%.  MUTATION-PROVEN: changing the proc's 'REJECTED: Customer account
+inactive' literal (without regenerating) makes the L58 witness FAIL ("Expected <...> but was
+<...(MUTATED)>") - the tests are now real keepers of the business logic.  pz regression green
+(LoopLocalGate search witnesses 100%, 0 failed; read-proc witnesses unchanged).
+
+FALSE-ARM ADOPTION (same v0.15.5): a CASE/count-local predicate that had a degenerate "predicate
+FALSE" smoke stub (the static seeder ran it with naive args that returned at customer-not-found,
+passed the OUTPUT params as literals, and asserted nothing) is now adopted in BOTH directions.
+DeriveDeepGateWitnesses emits a FALSE-arm CASEARM witness (Comparator='false') for any adoptable
+line whose inbox row has a FALSE seed plan, driving the NO-shortage success path (empty JSON ->
+shortage count 0) so the same lines run with the opposite outcome; EmitSearchSeedTests dedup is
+now direction-aware (a CASEARM 'true' witness drops the line's "predicate TRUE" / NOT_TESTABLE
+stub; a 'false' witness drops "predicate FALSE").  RESULT on ComplexOrderTest: L129/L157 now have
+BOTH arms asserted - true -> 'PARTIAL_SUCCESS', false -> 'FULL_SUCCESS' - replacing the degenerate
+FALSE smokes; suite 18 run / 15 pass / 0 fail / 3 skip, still 100%/100%; pz green (CountEqGate
+6/0/0/1, LoopLocalGate 2/0/0/2 - the FALSE-arm path is a no-op where no FALSE seed plan exists).
+
+BOUNDARY-PROBE TRANCOUNT TOLERANCE (same v0.15.5, user: "why are the high/low boundary tests
+skipped?"): the generic "accepts low/high boundary values" tests were honest-skipped on this proc
+shape because TestGen.ProbeHappyPath (the gen-time probe that runs the REAL proc in a rolled-back
+transaction to decide whether the boundary inputs are in-domain) saw error 266 "Transaction count
+after EXECUTE indicates a mismatching number of BEGIN and COMMIT statements" and treated it as an
+input rejection. That error is NOT a rejection: the boundary @CustomerID (max int) is not among the
+seeded customers, so the proc takes its own customer-not-found ROLLBACK path, which collapses the
+probe's wrapper transaction. FIX: ProbeHappyPath now ignores error 266 (IF ERROR_NUMBER() <> 266),
+since 266 means the procedure managed its OWN transaction, not that the inputs were rejected; a
+genuine rejection still surfaces as its own rethrown message. The boundary "accepts" tests are then
+emitted (not skipped) and pass against the neutralised _cov shadow during coverage (the same harness
+the witnesses already rely on). Also closed a latent gap: the OPENJSON-param valid-JSON patch
+reached @ArgListHappy + @ArgListBoundary but NOT @ArgListHighBnd (the high-boundary list still got
+'XXXX...'); now all three are patched. RESULT on ComplexOrderTest: skips 3 -> 1 (only the genuine
+@@TRANCOUNT branch-11/line-164 NOT_TESTABLE remains), suite 18 run / 17 pass / 0 fail / 0 err /
+1 skip, still 100% line (35/35) + 100% branch (6/6). Both changes are self-targeting no-ops
+elsewhere: ProbeHappyPath only sees 266 from a self-transaction proc, and the JSON patch only fires
+for OPENJSON procs (no pz gate is either). Regressed on AdventureWorks2025/pz: CountEqGate 100/100
+(6/0/0/1), LoopLocalGate 100/100 (2/0/0/2), ContradictionGate honest 50/50 (5/0/0/2), ScalarNullGate
+100/100 (8/0/0/1) - all 0 fail / 0 err. CAVEAT (pre-existing, not introduced here): a self-managed-
+transaction proc's rollback-path tests pass under the coverage harness (which runs the neutralised
+shadow); run directly via tSQLt.Run they would error on the proc's own ROLLBACK - the general fix is
+the deferred ScriptDom/tsqltu direction.  [ADDRESSED by the SHAPE-AWARE RUNNER below.]
+
+SHAPE-AWARE TEST RUNNER (same v0.15.5, user: "what is the solution for this issue in the current
+code base?" - make a self-transaction proc's generated tests runnable by a normal test run, not
+only under the coverage harness): NEW TestGen.RunTests @SchemaName, @ProcName. A naked tSQLt.Run of
+a self-managed-transaction proc's class ERRORS on the rollback-path tests, because the proc's bare
+ROLLBACK rolls back tSQLt's per-test transaction AND its FakeTable setup -> error 266 at teardown
+(a documented tSQLt limitation; you cannot stop a bare ROLLBACK reaching the root while the real
+statements run). RunTests detects the shape (source has BEGIN TRAN / COMMIT / ROLLBACK / SET
+XACT_ABORT ON) and, for such a proc, DELEGATES to RunCoverage with the report suppressed
+(@OutputMode='NONE') - reusing its object-loss-safe transient swap (rename real->_orig, synonym->
+neutralized _cov shadow, run, GUARANTEED restore + interrupted-run self-heal), whose XEvent step
+degrades gracefully (TRY/CATCH) when ALTER ANY EVENT SESSION is not granted, so the tests still run
++ restore even without coverage permissions. A plain proc is run directly via tSQLt.Run (no swap,
+no instrument), and RunTests also runs any developer-owned test_<proc>_custom% classes. Returns
+Run/Passed/Failed/Errored/Skipped via OUTPUT + a one-line summary. The neutralized shadow differs
+from the real proc ONLY in that transaction statements are no-ops, so every branch/status/OUTPUT/
+DML effect is exercised identically; the literal commit/rollback is the one thing not asserted
+(which tSQLt cannot test for such a proc regardless). Design choice: DELEGATE the swap to the proven
+RunCoverage rather than duplicate the dangerous rename/restore (object-loss history); NO edits to
+RunCoverage/InstrumentProcedure. VALIDATED: ComplexOrderTest self-tx proc via RunTests -> Run=18
+Passed=17 Failed=0 Errored=0 Skipped=1 (green where a naked tSQLt.Run errors), proc safely restored
+(base=proc, no synonym); pz.ScalarNullGate passthrough (non-self-tx) -> Run=9 Passed=8 Failed=0
+Errored=0 Skipped=1, no swap (syn=none). Installer redeploys clean on both DBs (289 batches, 0
+errors).
+
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(byte-identical). modules/* not patched (the new procs live only in the installer for now).
+dist/UnitAutogen-0.15.5-install.zip rebuilt. Bump to v0.15.5 when committing.
+
+================================================================================
+2026-06-15  v0.15.6  STATEMENT-AWARE INSTRUMENTER (dense one-liner branch coverage)
+================================================================================
+User finding (HighValueCustomer report): dbo.AssessCustomer showed 100% line but
+only 1 line measured and 0% branch - which contradicted the v0.12 record of it at
+100% branch. ROOT CAUSE: the proc is written with each IF, its THEN body, and its
+ELSE all on ONE physical line (e.g. "IF EXISTS(...) SET @r+='A'; ELSE SET @r+='B';"),
+and a 3rd IF buried after a DECLARE on a single line. The coverage instrumenter is
+LINE-based: it marks branch lines and infers "branch taken" from whether the NEXT
+executable line was hit. When the THEN/ELSE bodies share the predicate's line there
+is no separate executable line to attribute, so 0% branch; and a non-line-leading IF
+(after DECLARE;) isn't even detected as a branch. The 11 tests DO exercise every arm
+(they pass) - it was a FALSE-NEGATIVE measurement artifact, not honest residue.
+User's point (correct): the statements are explicitly ;-terminated, so a string
+parser should handle this without needing the ScriptDom rewrite.
+
+FIX: statement-aware LAYOUT NORMALIZATION run before instrumentation. New
+TestGen.NormLineStep (per-line lexer) + TestGen.NormalizeBranchLayout (driver)
+reformat dense one-liners onto canonical one-statement-per-line form - each
+;-terminated statement and each IF/ELSE/WHILE inline body on its own line - so the
+existing line-based walker marks + measures every arm. InstrumentProcedure calls it
+on @ProcSource right after CRLF normalization, behind an OBJECT_ID guard + TRY/CATCH
+(on any failure it keeps the original source - never worse than before).
+
+DO-NO-HARM design (key to zero regression):
+ - Threads lexical state (string / block-comment / [bracket] / paren / BEGIN-CASE
+   depth) ACROSS lines. A line is rewritten ONLY if it both starts and ends in a
+   clean state; any line that is part of a multi-line construct passes through
+   BYTE-IDENTICAL.
+ - CASE-aware: a CASE expression's WHEN/THEN/ELSE/END are never treated as control
+   flow (verified: "IF x SET y=CASE WHEN.. ELSE.. END; ELSE SET y=9;" splits the
+   IF's ELSE but NOT the CASE's ELSE).
+ - Idempotent; a no-op on already-well-formatted procedures (a 98-line proc stays
+   98 lines).
+
+VALIDATED:
+ - AssessCustomer (HighValueCustomer): 0% branch -> 100% (6/6), 1 line -> 7/7 line,
+   11/11 pass (7 hit-injections vs 1 before). The false-negative is gone.
+ - REGRESSION (all UNCHANGED): ComplexOrderTest usp_ProcessComplexOrderExecution
+   (CASE+OPENJSON+MERGE+txn) 6/6 branch, 17 pass/1 skip/0 fail/0 err; pz CountEqGate
+   100/100 (6p1s), ScalarNullGate 100/100 (8p1s), LoopLocalGate 100/100 (2p2s),
+   ContradictionGate honest 50/50 (5p2s); HighValueCustomer GetVIP unchanged
+   (0/1 honest error-path residue), usp_ReconcileTradedPositions unchanged
+   (10/16, 20t/13p/7s). Installer redeploys clean on all DBs (294 batches, 0 errors).
+
+NOTE: report line numbers for a rewritten proc are relative to the normalized layout
+(the % is correct; the uncovered-line list still shows the statement text). This is
+the in-engine, string-based answer to the dense-one-liner case; the AST/ScriptDom
+instrumenter (deferred tsqltu) would make it formatting-immune by construction.
+
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(byte-identical). dist/UnitAutogen-0.15.6-install.zip rebuilt.
+
+================================================================================
+2026-06-15  v0.15.7  ARITHMETIC-DERIVED PER-ROW SEEDING (PERROW-ARITH)
+================================================================================
+User issue: usp_ReconcileTradedPositions (HighValueCustomer) skipped its
+@AdjustedValue gates as "comparison does not involve an aggregate/scalar subquery".
+@AdjustedValue is a DERIVED LOCAL: line 99 "DECLARE @AdjustedValue = (@CurrentVolume
+* @CurrentPrice) * @RiskMultiplier", a product of per-row loop columns (Volume,
+ExecutionPrice from RawPositionIngest) and a non-row local (@RiskMultiplier from an
+AVG over MarketIndicators). The branch "@AdjustedValue > 50000" (line 109) and
+"> 250000" (line 116) are real, coverable arms (spike: Volume=600,Price=100 ->
+60000 -> MANUAL_REVIEW; Volume=100 -> 10000 -> APPROVED) but the static grammar
+can't invert a derived-local-vs-literal, and the per-row SEARCH archetype missed it
+for THREE reasons: (1) it followed only the FIRST factor (Volume) and left the
+co-factor ExecutionPrice at its default 0/NULL -> product 0 (or tripped the
+"Volume>0 AND Price>0" guard) so the knob could never cross the threshold; (2)
+@RiskMultiplier was never pinned; (3) the per-gate search runs the instrumented loop
+proc many times and TIMES OUT on this proc.
+
+FIX = a DETERMINISTIC arithmetic-derived per-row path in TestGen.SearchSeedForProc's
+PER-ROW numeric branch (archetype PERROW-ARITH):
+- Parse the operand's own assignment RHS; if it is a PRODUCT, resolve each @local
+  factor to its per-row source column and NEUTRALISE the co-factor columns (override
+  =1) so the product reduces to the driving knob.
+- Pin non-row factor locals for free: EmitSearchSeedTests already FakeTables EVERY
+  referenced user table, so MarketIndicators is faked empty -> AVG NULL -> the ELSE
+  branch -> @RiskMultiplier=1.00 (and WavePatternPhase='B'), a positive constant, so
+  the product is monotonic in the knob.
+- Set the driving knob deterministically just past the literal (>T -> T+1, <=T -> 1,
+  = -> T) and WRITE THE WITNESS DIRECTLY - no SearchSeedForGate call, which both fixes
+  the multi-factor product AND sidesteps the loop-proc search timeout.
+- RESTRICTED to a SIMPLE single-comparison predicate: a compound gate (e.g.
+  "@AdjustedValue > 100000 AND @WavePatternPhase='C'", line 105) has a conjunct this
+  path can't satisfy (phase='C' needs MarketIndicators seeded high, which the empty
+  fake prevents) - a deterministic witness there would hit a LOWER sibling arm and
+  wrongly drop the honest skip, so compound gates stay NOT_TESTABLE.
+- Additive + gated: the existing search runs unchanged when the deterministic path
+  doesn't apply (IF @resolved=0); non-product / categorical per-row gates are
+  untouched. SET-initialised @ad* locals (loop-DECLARE initialisers run once).
+
+VALIDATED on HighValueCustomer usp_ReconcileTradedPositions: L109 (@AdjustedValue >
+50000) and L116 (> 250000) go skip -> PERROW-ARITH WITNESS, emitted as run (not skip)
+tests that PASS (0 fail / 0 err), with the seeds verified to drive the arms
+(50001 -> MANUAL_REVIEW, 250001 -> FLAG_LARGE_CAP, row processed) and an OUTPUT-effect
+assertion on @TotalProcessedRecords. L105 (compound) correctly stays honest
+NOT_TESTABLE. REGRESSION all UNCHANGED: pz LoopLocalGate 3/3 (the loop gate that
+exercises this path), CountEqGate 2/2, ScalarNullGate 2/2, ContradictionGate honest
+1/2; ComplexOrderTest usp_ProcessComplexOrderExecution 6/6 (17p/1s); AssessCustomer
+6/6. Installer redeploys clean on all DBs (294 batches, 0 errors).
+
+NOTE: the full @Budget=24 aggregate for usp_ReconcileTradedPositions is not re-measured
+in-tool (its remaining search gates make the sweep slow); the change is purely additive
+(+2 branches: 62.5% -> ~75%). Derived-local arithmetic over MULTI-hop (temp-table) or
+non-product expressions, and compound conjuncts, remain future scope (the general
+value-dataflow / ancestor-chaining frontier).
+
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(byte-identical). dist/UnitAutogen-0.15.7-install.zip rebuilt.
+
+================================================================================
+2026-06-15  v0.15.8  ARITHMETIC-DERIVED SEEDING: COMPOUND CONJUNCTS + SUM + MULTI-HOP
+================================================================================
+Closes the two residuals noted at the end of v0.15.7 (the "general value-dataflow
+frontier"): COMPOUND conjuncts that need coordinated multi-source seeding, and
+derived locals over MULTI-HOP or NON-PRODUCT (sum) expressions. All in
+TestGen.SearchSeedForProc (the PERROW-ARITH path + the @recPfx coupled-conjunct
+prefix); additive + gated + fail-safe; no C#/CLR change.
+
+(1) COMPOUND CONJUNCTS - coordinated multi-source seed.  L105 of
+    usp_ReconcileTradedPositions is "@AdjustedValue > 100000 AND @WavePatternPhase
+    = 'C'": the arith conjunct AND a flag conjunct, where the flag is set by
+    "IF @MFI_Score > 80" and @MFI_Score = AVG(MFI_Value) FROM MarketIndicators
+    WHERE MetricDate >= DATEADD(day,-14,@CutoffDate).  When the flag-setting IF is
+    not (yet) witnessed, @recPfx now SYNTHESISES its seed directly: parse the IF's
+    aggregate-band condition, seed the source table ONE row with the aggregated
+    column at K+/-1 (so AVG/MIN/MAX/SUM crosses K) and any DATE filter column
+    far-future ('99991231') to satisfy a ">=" window.  The PERROW-ARITH guard is
+    relaxed to allow a compound predicate when @recPfx satisfies the extra conjunct
+    (OR still blocked; an AND we cannot satisfy still stays NOT_TESTABLE).  L105 ->
+    skip -> covered: the coordinated seed makes phase='C' (MFI=81), risk=1.5, and
+    @AdjustedValue = 100001*1*1.5 = 150001 > 100000 -> HOLD_RISK_LIMIT.  Fail-safe:
+    the whole synthesis is TRY/CATCH'd -> empty -> the gate just stays NOT_TESTABLE,
+    never a wrong witness.
+
+(2) SUM (+) and MULTI-HOP derived locals.  The PERROW-ARITH operand parse is now
+    operator-aware: a PURE product (*) neutralises co-factors to 1; a PURE sum (+)
+    neutralises co-addends to 0; the knob's small value (for </<= arms) follows the
+    neutral.  Co-factor resolution is now MULTI-HOP (@factor = @intermediate = ... =
+    Col, bounded 4 hops) like the driving-column lineage already was.  Mixed */+ or
+    subtraction is left to the search (one operator class only).
+
+VALIDATED:
+ - L105 (compound) -> covered (PERROW-ARITH witness; the coordinated MarketIndicators
+   seed appears in its arrange; not in the uncovered list; suite green 0 fail/0 err).
+ - Synthetic loop proc t_ArithKinds (created + dropped): "@sumv > 1000" (sum:
+   co-addend ExecutionPrice=0, knob 1001) and "@prodv > 5000" where @prodv =
+   @mid * @price, @mid = @vol = Volume (MULTI-HOP: knob resolved to Volume, 5001) ->
+   BRANCH 4/4 = 100%, both gates covered.
+ - REGRESSION all UNCHANGED: pz LoopLocalGate 3/3 (the loop gate exercising this
+   path), CountEqGate 2/2, ScalarNullGate 2/2, ContradictionGate honest 1/2;
+   ComplexOrderTest 6/6 (17p/1s); AssessCustomer 6/6.  294 batches / 0 errors on all DBs.
+
+RESIDUAL (still future scope): general WHERE-filter satisfaction beyond a single
+date ">=" window (arbitrary multi-predicate filters), mixed */+ arithmetic, and
+OR-disjunction in the gate predicate.
+
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(byte-identical). dist/UnitAutogen-0.15.8-install.zip rebuilt.
+
+================================================================================
+2026-06-15  v0.15.9  COVERAGE TRUTH FIX (placeholder dilution) + AGG/OR/temp bug fixes
+================================================================================
+Headline: the v0.15.7/v0.15.8 arithmetic + compound witnesses were PASSING but NOT
+COVERING their arm - a real bug I had missed because my earlier "covered" checks
+grepped SOURCE line numbers while the v0.15.6 normalizer RENUMBERS lines (false
+negative). Investigating usp_ReconcileTradedPositions honestly: 62.5% -> 93.8% branch.
+
+ROOT CAUSE (placeholder dilution): EmitSearchSeedTests' reach prefix seeds ONE
+placeholder row into every faked dependency. For an AGGREGATE SOURCE that feeds a
+derived local that is NOT the witness's own table (e.g. @MFI_Score = AVG(MFI_Value)
+FROM MarketIndicators, feeding @RiskMultiplier, which multiplies the per-row
+@AdjustedValue), the placeholder (MFI_Value=1) makes AVG=1 -> @RiskMultiplier=0.75,
+NOT the declared default 1.00 that PERROW-ARITH's knob assumed. So @AdjustedValue =
+50001*1*0.75 = 37500 < 50000 -> L109's arm never runs. The witness still PASSED
+because its OUTPUT assertion is on @TotalProcessedRecords (a COUNT), which is the
+same on any status arm.
+
+FIX (the genuine residual): EmitSearchSeedTests now computes the proc's
+aggregate-source tables (AVG/SUM/MIN/MAX/COUNT(...) FROM tbl) and emits "DELETE FROM
+<tbl>" AFTER the reach prefix and BEFORE the witness arrange, in BOTH the OUTPUT
+measurement batch and the emitted test. The diluting placeholder is cleared, so the
+witness's own seed controls the aggregate: a per-row-arith gate leaves it EMPTY ->
+AVG NULL -> the local's DECLARE default (1.00); a compound gate's @recPfx seed
+(MFI=81) is then undiluted -> AVG=81>80 -> phase='C'; an AGG gate's own seed is
+exact. #temp sources are skipped (the reach never seeds them).
+
+ALSO (search-harness bug fixes that newly WITNESS L44/L49/L88/L103):
+- AGG date-EXEC-arg: the WHERE-keycol coordination passed a date param as
+  CAST(GETDATE() AS DATE) - an EXPRESSION in an EXEC arg, which is illegal
+  ("Incorrect syntax near 'GETDATE'"). Now a literal ('19000101' far-past for the
+  param; '99991231' far-future for a seeded date column) so a "col >= <lookback>"
+  filter is satisfied.
+- Temp-source routing: an operand assigned FROM a #temp (the loop source) has no
+  OBJECT_ID here, so the AGG/SCALAR arrange built an empty "INSERT #t () VALUES ()"
+  ("Incorrect syntax near ')'"). Such gates now route to the PER-ROW archetype.
+- Deterministic single-row AGG witness (AVG/MIN/MAX/SUM): seed @col to a value that
+  crosses the literal (no search -> robust, no timeout, no "@Budget too small" miss).
+  COUNT keeps the search (its knob is the row count).
+- Deterministic OR per-row: seed the driving column so the FIRST disjunct is true
+  (covers "@CurrentVolume <= 0 OR @CurrentPrice <= 0" at L88).
+
+VALIDATED: usp_ReconcileTradedPositions 62.5% -> 93.8% branch (15/16; the 1 residual
+is the environmental OBJECT_ID('tempdb..#PendingTrades') guard), 17 pass/0 fail/0 err.
+REGRESSION all UNCHANGED: pz CountEqGate 2/2 (the COUNT case - its source is cleared
+then re-seeded by the witness), LoopLocalGate 3/3, ScalarNullGate 2/2, ContradictionGate
+honest 1/2; ComplexOrderTest 6/6 (17p/1s; its aggregates are over table VARIABLES, no
+OBJECT_ID, so unaffected); AssessCustomer 6/6 (11p; covered via predicate-branch tests,
+which the DELETE does not touch). 294 batches / 0 errors on all DBs.
+
+LESSON: validate coverage from the report's authoritative BRANCH COVERAGE line, not a
+grep of source line numbers, now that the instrumenter renumbers lines; and prefer an
+OUTPUT/effect assertion that distinguishes the ARM (status), not just a row count.
+
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(byte-identical). dist/UnitAutogen-0.15.9-install.zip rebuilt.
+
+================================================================================
+2026-06-15  v0.16.0  MIXED ARITHMETIC (*/+) + NON-DATE AGGREGATE FILTERS
+================================================================================
+Closes the two residuals left open in v0.15.9 (the general value-dataflow frontier).
+
+1) MIXED */+ IN ONE DERIVED LOCAL. PERROW-ARITH previously handled a PURE product
+   (co-factors neutral 1) or PURE sum (co-addends neutral 0); a mixed expression like
+   "@MixedValue = @vol * @price + @fee" was left to the (slow, often unsuccessful)
+   search. It now splits the operand's RHS into ADDITIVE TERMS (top-level '+'); the
+   term that contains the DRIVING leaf keeps its product co-factors at 1, and EVERY
+   OTHER term's leaves are set to 0, so the whole expression reduces to the driving
+   leaf and the knob crosses the literal exactly (knob = T+1 for >, etc.; for a '<='
+   arm the driving leaf's neutral follows its own term: 1 if multiplied, 0 if added).
+   Pure product (one term) and pure sum (single-variable terms) are special cases of
+   this, so existing product/sum witnesses are byte-for-byte unchanged.
+
+2) NON-DATE AGGREGATE FILTERS. The aggregate-gate seed builder filled every non-key
+   string column with the placeholder N'x'. When the aggregate had a filter such as
+   "AVG(Score) FROM Metrics WHERE Status='ACTIVE'", the seeded row's Status='x' failed
+   the filter -> the row was excluded -> AVG NULL -> the gate (and any compound gate
+   that reuses this witness via @recPfx) never crossed. The builder now walks the
+   target columns and, for any column with a "col = <literal>" predicate in the
+   aggregate's WHERE, seeds that exact literal (read from the ORIGINAL-case WHERE so
+   mixed-case values survive). Date columns keep the far-future '99991231' default;
+   '>'/'>='/'<'/'<='/'<>'/IN predicates are left as-is (only simple equality is
+   asserted). The @recPfx synthesis path got the same equality-filter handling for
+   the case where the flag-setting IF has no prior witness.
+
+DECLARE-in-loop safety: the new per-gate state (@adFirstVar, @adDrvNeutral, @adFv) is
+reset with explicit SET (loop-DECLARE initialisers evaluate once); the seed-builder
+and @recPfx cursors carry a CURSOR_STATUS guard so an exception in one gate can't
+break the next gate's DECLARE.
+
+VALIDATED on a synthetic loop proc (usp_V16Synthetic: mixed "@vol*@price+@fee > 5000"
++ compound ">8000 AND @QualityFlag='H'" whose flag is AVG(Score) WHERE Status='ACTIVE')
+-> 100% line (12/12) + 100% branch (6/6), created and dropped.
+REGRESSION all UNCHANGED: HighValueCustomer usp_ReconcileTradedPositions 93.8% (15/16),
+AssessCustomer 100% (6/6); ComplexOrderTest 100% (6/6); AdventureWorks2025 pz - all 12
+aggregate/scalar gates (Avg/Count*/Sum*/Max/Min/Scalar*) 100% (2/2), LoopLocalGate 3/3,
+ContradictionGate honest 1/2; 0 fail / 0 err across the suite. 294 batches / 0 errors
+on all three DBs.
+
+STILL OPEN (narrower frontier): a derived local mixing '*' and '+' AND subtraction;
+non-equality aggregate filters that need a satisfying value computed (range/IN).
+
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(byte-identical). dist/UnitAutogen-0.16.0-install.zip rebuilt.
+
+================================================================================
+2026-06-15  v0.16.1  SUBTRACTION IN MIXED ARITH + NON-EQUALITY AGGREGATE FILTERS
+================================================================================
+Closes the two narrower residuals left open by v0.16.0.
+
+1) SUBTRACTION in a derived local. PERROW-ARITH split into additive terms on '+'
+   only and bailed on any '-'. It now treats '-' as a term boundary too (an internal
+   '~' marker flags a negative term). Two kinds of subtracted term:
+   - a COLUMN term (e.g. ... - @fee) neutralises to 0 exactly like an added column
+     term (its sign is irrelevant once it is zero), so the expression still reduces
+     to the driving leaf;
+   - a standalone numeric CONSTANT term (e.g. ... - 100) folds, with its sign, into a
+     new @adConstSum, which is subtracted back out of the knob so the driving term
+     still crosses the literal exactly: for "@v*@p - 100 > 8000" the knob becomes
+     8000 - (-100) + 1 = 8101, giving 8101*1 - 100 = 8001 > 8000. The witness guard
+     was relaxed to also fire when there is only a constant offset (no co-factor cols).
+
+2) NON-EQUALITY aggregate filters. The v0.16.0 seed builder satisfied only "col =
+   <literal>" filters. It now also satisfies, for a seeded aggregate-source row:
+   - numeric ">"/">="/"<"/"<=" -> a value just inside the bound (>:n+1, <:n-1,
+     >=/<=:n); a non-numeric RHS (e.g. a date expression) is left to the type default,
+     so a date ">= <lookback>" still uses the far-future '99991231';
+   - "col IN (a, b, ...)" -> the first list element;
+   - "col BETWEEN a AND b" -> the low bound a.
+   "<>" is left to the default (which already differs from the comparand).
+
+VALIDATED on a synthetic loop proc (usp_V161Synthetic) exercising column subtraction
+"@v*@p - @fee > 5000", constant subtraction "@v*@p - 100 > 8000", and two compound
+gates whose flags are AVG(Score) WHERE Region >= 5 (numeric range) and AVG(Score)
+WHERE Tier IN ('A','B') (IN list) -> 100% line (17/17) + 100% branch (10/10), created
+and dropped. REGRESSION all UNCHANGED: HighValueCustomer Reconcile 93.8% (15/16),
+AssessCustomer 100% (6/6); ComplexOrderTest 100% (6/6); AdventureWorks2025 pz -
+Avg/Count*/Sum*/Max/Min/Scalar* gates 100% (2/2), LoopLocalGate 3/3, ContradictionGate
+honest 1/2; 0 fail / 0 err. 294 batches / 0 errors on all three DBs.
+
+STILL OPEN (deferred to v0.16.2 - build cleanly in a new session):
+  (a) parenthesised sub-expressions in a derived local are still flattened (paren stripping
+      predates this work) -> "@a*(@b-@c)" mis-read; needs a paren/precedence-aware term walk.
+  (b) a date "<= <bound>" aggregate filter (the date column default is far-future '99991231',
+      suited to ">="); add date-operator dispatch ('<='->'19000101', '>='->'99991231').
+  (c) temp-table tracing: a WHILE over "SELECT ... INTO #temp FROM <base>" (Reconcile's
+      #PendingTrades loop at line 77) skips its DEDICATED predicate-branch tests ("tree target
+      table not found: dbo.#PendingTrades") because a #temp is not a fakeable catalog table;
+      tracing the temp back to <base> and seeding it would upgrade those skips to real tests.
+      NOTE: the loop arms are already covered INCIDENTALLY by the arithmetic witnesses (which
+      seed RawPositionIngest), so coverage is unaffected (15/16); the sibling
+      OBJECT_ID('tempdb..#PendingTrades') IS NOT NULL guard (line 62) stays an honest
+      environmental skip (temp existence is session state, not data-drivable).
+  (a)+(b) do not occur in the reference procedures; (c) does (the visible Reconcile line-77 skips).
+
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(byte-identical). dist/UnitAutogen-0.16.1-install.zip rebuilt.

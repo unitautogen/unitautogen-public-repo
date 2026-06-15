@@ -35,8 +35,11 @@ if (-not $ScriptDomPath) {
     }
 }
 if (-not $ScriptDomPath -or -not (Test-Path $ScriptDomPath)) { throw "ScriptDom DLL not found; pass -ScriptDomPath." }
-# Keep a copy in lib so the bundle is self-contained.
-Copy-Item $ScriptDomPath (Join-Path $lib 'Microsoft.SqlServer.TransactSql.ScriptDom.dll') -Force
+# Keep a copy in lib so the bundle is self-contained (skip if it already IS the lib copy).
+$libSd  = Join-Path $lib 'Microsoft.SqlServer.TransactSql.ScriptDom.dll'
+$srcFull = (Resolve-Path $ScriptDomPath).Path
+$dstFull = if (Test-Path $libSd) { (Resolve-Path $libSd).Path } else { $libSd }
+if ($srcFull -ne $dstFull) { Copy-Item $ScriptDomPath $libSd -Force }
 
 $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 if (-not (Test-Path $csc)) { throw "csc.exe not found at $csc" }
@@ -44,11 +47,10 @@ $cs  = Join-Path $here 'UnitAutogenClr.cs'
 $out = Join-Path $lib 'UnitAutogenClr.dll'
 $sdRef = Join-Path $lib 'Microsoft.SqlServer.TransactSql.ScriptDom.dll'
 
-$args = @('/nologo','/target:library',"/out:$out","/reference:$sdRef",'/reference:System.Data.dll',$cs)
-$tmpOut = [IO.Path]::GetTempFileName(); $tmpErr = [IO.Path]::GetTempFileName()
-$p = Start-Process -FilePath $csc -ArgumentList $args -NoNewWindow -Wait -PassThru -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
-Get-Content $tmpOut, $tmpErr -ErrorAction SilentlyContinue
-if ($p.ExitCode -ne 0) { throw "csc failed (exit $($p.ExitCode))." }
+# Invoke via the call operator so paths containing spaces are quoted correctly.
+$cscOutput = & $csc /nologo /target:library "/out:$out" "/reference:$sdRef" /reference:System.Data.dll "$cs" 2>&1
+$cscOutput | ForEach-Object { Write-Host $_ }
+if ($LASTEXITCODE -ne 0) { throw "csc failed (exit $LASTEXITCODE)." }
 Write-Host "Built $out ($((Get-Item $out).Length) bytes)."
 
 if ($Emit) {

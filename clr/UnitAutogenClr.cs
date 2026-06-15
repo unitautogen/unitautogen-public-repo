@@ -440,14 +440,16 @@ public static class UnitAutogenClr
         if (!CmpOps.TryGetValue(bc.ComparisonType.ToString(), out op))
             return new LeafR { ok = false, reason = "WHERE comparator " + bc.ComparisonType + " not supported" };
         string col = null, val = null, valKind = null, colTbl = null;
+        string col2 = null, col2Tbl = null;   // v0.14.2: second column for column-to-column
         foreach (var side in new SD.ScalarExpression[] { bc.FirstExpression, bc.SecondExpression })
         {
             var cr = side as SD.ColumnReferenceExpression;
             if (cr != null)
             {
                 var cids = cr.MultiPartIdentifier.Identifiers;
-                col = cids[cids.Count - 1].Value;
-                if (cids.Count >= 2) colTbl = cids[cids.Count - 2].Value;
+                string cn = cids[cids.Count - 1].Value;
+                string ct = cids.Count >= 2 ? cids[cids.Count - 2].Value : null;
+                if (col == null) { col = cn; colTbl = ct; } else { col2 = cn; col2Tbl = ct; }
                 continue;
             }
             var vr = side as SD.VariableReference;
@@ -455,8 +457,12 @@ public static class UnitAutogenClr
             string maybe = LiteralText(side);
             if (maybe != null) { val = maybe; valKind = "literal"; }
         }
+        // v0.14.2: column-to-column comparison (a.x <op> b.y), same- or cross-table.
+        // FirstExpression is the left column, so the op direction is preserved.
+        if (col != null && col2 != null)
+            return new LeafR { conj = M("kind", "colcol", "lCol", col, "lTbl", colTbl, "op", op, "rCol", col2, "rTbl", col2Tbl) };
         if (col == null || val == null)
-            return new LeafR { ok = false, reason = "WHERE conjunct is not <column> <op> <literal|@param> (column-to-column or expression)" };
+            return new LeafR { ok = false, reason = "WHERE conjunct is not <column> <op> <literal|@param|column> (an expression)" };
         return new LeafR { conj = M("col", col, "op", op, "val", val, "valKind", valKind, "tbl", colTbl) };
     }
 
@@ -493,6 +499,8 @@ public static class UnitAutogenClr
         var leaf = WhereLeaf(n);
         if (!leaf.ok) return TFail(leaf.reason);
         var cj = leaf.conj;
+        if (cj.ContainsKey("kind") && (string)cj["kind"] == "colcol")
+            return TOk(M("k", "colcol", "lTbl", cj["lTbl"], "lCol", cj["lCol"], "op", cj["op"], "rTbl", cj["rTbl"], "rCol", cj["rCol"]));
         return TOk(M("k", "colpred", "tbl", cj["tbl"], "col", cj["col"], "op", cj["op"], "val", cj["val"], "valKind", cj["valKind"]));
     }
 
@@ -638,6 +646,12 @@ public static class UnitAutogenClr
         if (k == "and") return "(" + string.Join(" AND ", ((List<object>)node["items"]).Select(x => RenderWhereNode((Dictionary<string, object>)x))) + ")";
         if (k == "or") return "(" + string.Join(" OR ", ((List<object>)node["items"]).Select(x => RenderWhereNode((Dictionary<string, object>)x))) + ")";
         if (k == "not") return "NOT (" + RenderWhereNode((Dictionary<string, object>)node["item"]) + ")";
+        if (k == "colcol")
+        {
+            string lc2 = node["lTbl"] != null ? QuoteIdent((string)node["lTbl"]) + "." + QuoteIdent((string)node["lCol"]) : QuoteIdent((string)node["lCol"]);
+            string rc2 = node["rTbl"] != null ? QuoteIdent((string)node["rTbl"]) + "." + QuoteIdent((string)node["rCol"]) : QuoteIdent((string)node["rCol"]);
+            return lc2 + " " + node["op"] + " " + rc2;
+        }
         string c = node["tbl"] != null ? QuoteIdent((string)node["tbl"]) + "." + QuoteIdent((string)node["col"]) : QuoteIdent((string)node["col"]);
         return c + " " + node["op"] + " " + node["val"];
     }
@@ -708,7 +722,7 @@ public static class UnitAutogenClr
         return M("alias", alias, "col", s);
     }
 
-    private static OvR DriveWhere(Dictionary<string, object> node, bool want)
+    private static OvR DriveWhere(Dictionary<string, object> node, bool want, Dictionary<string, string[]> aliasMap)
     {
         var res = new OvR();
         if (node == null) return res;
@@ -719,25 +733,40 @@ public static class UnitAutogenClr
             res.overrides.Add(M("tbl", node["tbl"], "col", node["col"], "vspec", vs));
             return res;
         }
-        if (k == "not") return DriveWhere((Dictionary<string, object>)node["item"], !want);
+        if (k == "colcol")
+        {
+            // v0.14.2 column-to-column (a.x <op> b.y), same- or cross-table. The right
+            // column gets a typed sample S; the left column gets a value satisfying (or,
+            // for want=0, violating) <op> against S. Both anchor on S, so the relation
+            // holds regardless of the two columns' types.
+            string rAlias = (string)node["rTbl"];
+            string[] rt = (rAlias != null && aliasMap.ContainsKey(rAlias)) ? aliasMap[rAlias]
+                        : (aliasMap.Count == 1 ? aliasMap.Values.First() : null);
+            if (rt == null) return new OvR { ok = false, reason = "column-to-column WHERE: cannot resolve the right-hand column's table" };
+            res.overrides.Add(M("tbl", node["rTbl"], "col", node["rCol"], "vspec", M("sample", true)));
+            res.overrides.Add(M("tbl", node["lTbl"], "col", node["lCol"], "vspec",
+                M("satisfyother", M("op", node["op"], "want", want ? 1 : 0, "oschema", rt[0], "otable", rt[1], "ocol", node["rCol"]))));
+            return res;
+        }
+        if (k == "not") return DriveWhere((Dictionary<string, object>)node["item"], !want, aliasMap);
         if (k == "and")
         {
             if (want)
             {
-                foreach (var c in (List<object>)node["items"]) { var r = DriveWhere((Dictionary<string, object>)c, true); if (!r.ok) return r; res.overrides.AddRange(r.overrides); }
+                foreach (var c in (List<object>)node["items"]) { var r = DriveWhere((Dictionary<string, object>)c, true, aliasMap); if (!r.ok) return r; res.overrides.AddRange(r.overrides); }
                 return res;
             }
-            foreach (var c in (List<object>)node["items"]) { var r = DriveWhere((Dictionary<string, object>)c, false); if (r.ok) return r; }
+            foreach (var c in (List<object>)node["items"]) { var r = DriveWhere((Dictionary<string, object>)c, false, aliasMap); if (r.ok) return r; }
             return new OvR { ok = false, reason = "cannot violate AND in WHERE" };
         }
         if (k == "or")
         {
             if (want)
             {
-                foreach (var c in (List<object>)node["items"]) { var r = DriveWhere((Dictionary<string, object>)c, true); if (r.ok) return r; }
+                foreach (var c in (List<object>)node["items"]) { var r = DriveWhere((Dictionary<string, object>)c, true, aliasMap); if (r.ok) return r; }
                 return new OvR { ok = false, reason = "no WHERE OR disjunct is seedable" };
             }
-            foreach (var c in (List<object>)node["items"]) { var r = DriveWhere((Dictionary<string, object>)c, false); if (!r.ok) return r; res.overrides.AddRange(r.overrides); }
+            foreach (var c in (List<object>)node["items"]) { var r = DriveWhere((Dictionary<string, object>)c, false, aliasMap); if (!r.ok) return r; res.overrides.AddRange(r.overrides); }
             return res;
         }
         return new OvR { ok = false, reason = "unexpected WHERE node '" + k + "'" };
@@ -800,13 +829,15 @@ public static class UnitAutogenClr
         var src = (Dictionary<string, object>)atom["source"];
         var tables = (List<object>)src["tables"];
         var aliasIdx = new Dictionary<string, int>();
+        var aliasMap = new Dictionary<string, string[]>();
         for (int i = 0; i < tables.Count; i++)
         {
             var t = (Dictionary<string, object>)tables[i];
             string a = t["alias"] != null ? (string)t["alias"] : (string)t["table"];
             aliasIdx[a] = i;
+            aliasMap[a] = new string[] { (string)t["schema"], (string)t["table"] };
         }
-        var wd = DriveWhere((Dictionary<string, object>)src["where"], true); if (!wd.ok) return new DemR { ok = false, reason = wd.reason };
+        var wd = DriveWhere((Dictionary<string, object>)src["where"], true, aliasMap); if (!wd.ok) return new DemR { ok = false, reason = wd.reason };
         var jc = CoordinateJoins(src); if (!jc.ok) return new DemR { ok = false, reason = jc.reason };
         var allOv = new List<object>();
         allOv.AddRange(wd.overrides); allOv.AddRange(jc.overrides);

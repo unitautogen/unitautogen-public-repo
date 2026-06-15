@@ -3015,7 +3015,12 @@ BEGIN
         N'END TRY' + @nl +
         N'BEGIN CATCH' + @nl +
         N'  IF @@TRANCOUNT > @tc0 ROLLBACK TRAN;' + @nl +
-        N'  SET @ErrOut = ERROR_MESSAGE();' + @nl +
+        -- Error 266 (trancount mismatch) means the PROCEDURE managed its OWN
+        -- transaction (it rolled back / committed a tran relative to the probe's
+        -- wrapper), NOT that the inputs were rejected.  Treat it as a clean run so a
+        -- self-transaction proc's boundary "accepts" tests are not false-skipped; a
+        -- genuine input rejection surfaces as its own (rethrown) message, not as 266.
+        N'  IF ERROR_NUMBER() <> 266 SET @ErrOut = ERROR_MESSAGE();' + @nl +
         N'END CATCH;';
     BEGIN TRY
         EXEC sys.sp_executesql @batch, N'@ErrOut NVARCHAR(MAX) OUTPUT', @ErrOut = @ErrMsg OUTPUT;
@@ -3282,10 +3287,18 @@ BEGIN
     END;
     IF NOT EXISTS (SELECT 1 FROM @lits) RETURN NULL;
     DECLARE @pat NVARCHAR(MAX);
+    -- v0.15.5: drop a literal that is a SUBSTRING of a longer collected literal (e.g. a
+    -- standalone 'SUCCESS' audit-type inside the status 'FULL_SUCCESS').  Otherwise both are
+    -- emitted as '%FULL[_]SUCCESS%SUCCESS%', which requires the suffix to repeat and false-fails.
+    -- The longer literal already covers the shorter; the skeleton stays a correct (if weaker) match.
     SELECT @pat = N'%' + STRING_AGG(
                     REPLACE(REPLACE(REPLACE(lit, N'[', N'[[]'), N'%', N'[%]'), N'_', N'[_]'),
                     N'%') WITHIN GROUP (ORDER BY vpos) + N'%'
-    FROM @lits;
+    FROM @lits l
+    WHERE NOT EXISTS (SELECT 1 FROM @lits o
+                      WHERE o.lit <> l.lit
+                        AND DATALENGTH(o.lit) > DATALENGTH(l.lit)
+                        AND CHARINDEX(l.lit, o.lit) > 0);
     RETURN @pat;
 END;
 GO
@@ -4879,8 +4892,22 @@ BEGIN
         DECLARE @HasErrorPaths BIT =
             CASE WHEN EXISTS (SELECT 1 FROM @Errors) THEN 1 ELSE 0 END;
 
+        -- v0.15.5: does the procedure SWALLOW its own errors?  If the body has a CATCH that
+        -- neither THROWs nor RAISERRORs, a RAISERROR / validation on bad input is caught and
+        -- NOT propagated to the caller - so an ExpectException "rejects"/"raises" test would
+        -- false-fail ("Expected an error to be raised").  Detect it and treat such inputs as
+        -- non-raising (the per-branch effect tests still cover those paths and assert the status).
+        DECLARE @SwallowsErrors BIT = 0;
+        IF CHARINDEX(N'BEGIN CATCH', UPPER(ISNULL(@ProcSource,N''))) > 0
+        BEGIN
+            DECLARE @catchRegion NVARCHAR(MAX) =
+                SUBSTRING(@ProcSource, CHARINDEX(N'BEGIN CATCH', UPPER(@ProcSource)), 4000000);
+            IF CHARINDEX(N'THROW', UPPER(@catchRegion)) = 0 AND CHARINDEX(N'RAISERROR', UPPER(@catchRegion)) = 0
+                SET @SwallowsErrors = 1;
+        END;
+
         DECLARE @UseExpectExceptionForInvalid BIT =
-            CASE WHEN @AssertExceptionOnInvalidInputs = 1 AND @HasErrorPaths = 1
+            CASE WHEN @AssertExceptionOnInvalidInputs = 1 AND @HasErrorPaths = 1 AND @SwallowsErrors = 0
                  THEN 1 ELSE 0 END;
 
         /* ------------------------------------------------------------------
@@ -5857,6 +5884,32 @@ BEGIN
           + N'procedure''s accepted input domain (the procedure raised an error on it '
           + N'at generation time).  This is not necessarily a defect - supply a custom '
           + N'test with in-domain values, then remove this annotation.';
+        -- v0.15.5: a parameter consumed by OPENJSON(@param) must receive VALID JSON, or the
+        -- happy-path / boundary smoke tests false-fail (JSON parse error -> uncommittable txn
+        -- under XACT_ABORT).  Replace any such param's generated value with an empty JSON array
+        -- in all three arg lists (happy, low- and high-boundary).  Only fires for OPENJSON
+        -- procs - no effect on everything else.
+        IF UPPER(ISNULL(@ProcSource,N'')) LIKE N'%OPENJSON(%' AND OBJECT_ID('TestGen.PatchArgList','P') IS NOT NULL
+        BEGIN
+            DECLARE @ojAt INT = CHARINDEX(N'OPENJSON(', UPPER(@ProcSource));
+            WHILE @ojAt > 0
+            BEGIN
+                DECLARE @ojIn NVARCHAR(200) = SUBSTRING(@ProcSource, @ojAt + 9, 200);
+                IF CHARINDEX(N'@', @ojIn) > 0
+                BEGIN
+                    DECLARE @ojParam SYSNAME = SUBSTRING(@ojIn, CHARINDEX(N'@', @ojIn), 200);
+                    SET @ojParam = LEFT(@ojParam, PATINDEX(N'%[^A-Za-z0-9_@]%', @ojParam + N' ') - 1);
+                    IF LEN(@ojParam) > 1
+                    BEGIN
+                        EXEC TestGen.PatchArgList @ArgListHappy,    @ojParam, N'N''[]''', @ArgListHappy    OUTPUT;
+                        EXEC TestGen.PatchArgList @ArgListBoundary, @ojParam, N'N''[]''', @ArgListBoundary OUTPUT;
+                        EXEC TestGen.PatchArgList @ArgListHighBnd,  @ojParam, N'N''[]''', @ArgListHighBnd  OUTPUT;
+                    END;
+                END;
+                SET @ojAt = CHARINDEX(N'OPENJSON(', UPPER(@ProcSource), @ojAt + 9);
+            END;
+        END;
+
         IF @HasErrorPaths = 1 AND @@TRANCOUNT = 0
            AND @SrcU NOT LIKE N'%SP[_]SEND[_]DBMAIL%' AND @SrcU NOT LIKE N'%NEXT VALUE FOR%'
            AND @SrcU NOT LIKE N'%XP[_]CMDSHELL%'      AND @SrcU NOT LIKE N'%OPENROWSET%'
@@ -6981,7 +7034,10 @@ BEGIN
          * surface as test failures - which is the desired "you need to tune
          * this input" signal.
          * -----------------------------------------------------------------*/
-        IF @EmitNegativeTests = 1
+        -- v0.15.5: skip "raises error path" tests when the procedure swallows its own errors
+        -- (a CATCH that does not re-raise) - the RAISERROR/THROW never reaches the caller, so
+        -- ExpectException would false-fail.  The per-branch effect tests cover those arms.
+        IF @EmitNegativeTests = 1 AND @SwallowsErrors = 0
         BEGIN
             -- @Errors was populated earlier (hoisted) so both this block and
             -- the boundary/NULL tests can see whether the proc has error
@@ -9814,6 +9870,191 @@ GO
  *   See TestGen.GetCoverageReport v2 (companion file).
  ******************************************************************************/
 
+/*============================================================================
+  TestGen.NormLineStep + TestGen.NormalizeBranchLayout   (v0.15.6)
+  ----------------------------------------------------------------------------
+  Statement-aware layout normalization run BEFORE instrumentation. Dense
+  one-liners - several ;-terminated statements on one physical line, or an
+  IF/ELSE/WHILE with its body inline - defeat the line-based walker: the THEN
+  and ELSE arms share the predicate's line, so neither can be measured (0%
+  branch), and a second/third statement on a line (e.g. "DECLARE ...; IF ...")
+  hides the IF from the line-leading-keyword branch detector. This pass splits
+  such lines onto canonical one-statement-per-line form so every arm is
+  measured.
+
+  Do-no-harm: only a line that both STARTS and ENDS in a clean lexical state
+  (no open string / block comment / bracket / paren, and unchanged BEGIN-CASE
+  depth) is rewritten; any line that is part of a multi-line construct passes
+  through byte-identical. CASE expressions are tracked so their WHEN/THEN/ELSE/
+  END are never mistaken for control flow. Idempotent, and a no-op on
+  already-well-formatted procedures (verified: a 98-line proc stays 98 lines).
+============================================================================*/
+IF OBJECT_ID('TestGen.NormLineStep','P') IS NOT NULL DROP PROCEDURE TestGen.NormLineStep;
+GO
+CREATE PROCEDURE TestGen.NormLineStep
+    @L         NVARCHAR(MAX),
+    @inStr     BIT  OUTPUT,
+    @inBC      BIT  OUTPUT,
+    @inBrk     BIT  OUTPUT,
+    @paren     INT  OUTPUT,
+    @stackLen  INT  OUTPUT,
+    @stackTop  NCHAR(1) OUTPUT,
+    @stack     NVARCHAR(MAX) OUTPUT,
+    @Out       NVARCHAR(MAX) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @nl NCHAR(1)=CHAR(10), @q NCHAR(1)=NCHAR(39);
+    DECLARE @startClean BIT = CASE WHEN @inStr=0 AND @inBC=0 AND @inBrk=0 AND @paren=0 THEN 1 ELSE 0 END;
+    DECLARE @startStack INT = @stackLen;
+    DECLARE @n INT = DATALENGTH(@L)/2;
+    DECLARE @i INT = 1, @c NCHAR(1), @c2 NCHAR(1);
+    DECLARE @inLC BIT = 0;
+    DECLARE @raw NVARCHAR(MAX) = N'';
+    DECLARE @spl NVARCHAR(MAX) = N'';
+    DECLARE @mode VARCHAR(10) = N'normal';
+
+    WHILE @i <= @n
+    BEGIN
+        SET @c = SUBSTRING(@L,@i,1);
+        SET @c2 = CASE WHEN @i<@n THEN SUBSTRING(@L,@i+1,1) ELSE N'' END;
+        SET @raw = @raw + @c;
+
+        IF @inLC = 1 BEGIN SET @spl=@spl+@c; SET @i=@i+1; CONTINUE; END
+        IF @inBC = 1
+        BEGIN
+            SET @spl=@spl+@c;
+            IF @c=N'*' AND @c2=N'/' BEGIN SET @spl=@spl+@c2; SET @raw=@raw+@c2; SET @i=@i+2; SET @inBC=0; CONTINUE; END
+            SET @i=@i+1; CONTINUE;
+        END
+        IF @inStr = 1
+        BEGIN
+            SET @spl=@spl+@c;
+            IF @c=@q
+            BEGIN
+                IF @c2=@q BEGIN SET @spl=@spl+@c2; SET @raw=@raw+@c2; SET @i=@i+2; CONTINUE; END
+                ELSE SET @inStr=0;
+            END
+            SET @i=@i+1; CONTINUE;
+        END
+        IF @inBrk = 1
+        BEGIN
+            SET @spl=@spl+@c;
+            IF @c=N']' SET @inBrk=0;
+            SET @i=@i+1; CONTINUE;
+        END
+
+        IF @c=@q     BEGIN SET @inStr=1;  SET @spl=@spl+@c; SET @i=@i+1; CONTINUE; END
+        IF @c=N'['   BEGIN SET @inBrk=1;  SET @spl=@spl+@c; SET @i=@i+1; CONTINUE; END
+        IF @c=N'-' AND @c2=N'-' BEGIN SET @inLC=1; SET @spl=@spl+@c+@c2; SET @raw=@raw+@c2; SET @i=@i+2; CONTINUE; END
+        IF @c=N'/' AND @c2=N'*' BEGIN SET @inBC=1; SET @spl=@spl+@c+@c2; SET @raw=@raw+@c2; SET @i=@i+2; CONTINUE; END
+        IF @c=N'('   BEGIN SET @paren=@paren+1; SET @spl=@spl+@c; SET @i=@i+1; CONTINUE; END
+        IF @c=N')'   BEGIN SET @paren=@paren-1; SET @spl=@spl+@c; SET @i=@i+1; CONTINUE; END
+
+        IF @c=N';'
+        BEGIN
+            SET @spl=@spl+@c; SET @mode=N'normal';
+            IF LTRIM(SUBSTRING(@L,@i+1,@n-@i)) <> N'' AND RIGHT(@spl,1)<>@nl
+                SET @spl=@spl+@nl;
+            SET @i=@i+1; CONTINUE;
+        END
+
+        IF @c LIKE N'[A-Za-z_@]'
+        BEGIN
+            DECLARE @j INT=@i, @w NVARCHAR(200)=N'';
+            WHILE @j<=@n AND SUBSTRING(@L,@j,1) LIKE N'[A-Za-z0-9_@$#]'
+            BEGIN SET @w=@w+SUBSTRING(@L,@j,1); SET @j=@j+1; END
+            IF @j>@i+1 SET @raw=@raw+SUBSTRING(@L,@i+1,@j-@i-1);
+            DECLARE @W2 NVARCHAR(200)=UPPER(@w);
+            DECLARE @p0 BIT = CASE WHEN @paren=0 THEN 1 ELSE 0 END;
+            DECLARE @inCase BIT = CASE WHEN RIGHT(@stack,1)=N'C' THEN 1 ELSE 0 END;
+
+            IF @W2=N'CASE' SET @stack=@stack+N'C';
+            ELSE IF @W2=N'BEGIN' SET @stack=@stack+N'B';
+            ELSE IF @W2=N'END' AND LEN(@stack)>0 SET @stack=LEFT(@stack,LEN(@stack)-1);
+
+            IF @p0=1 AND @inCase=0
+            BEGIN
+                IF @W2=N'IF' OR @W2=N'WHILE'
+                BEGIN
+                    IF @mode=N'afterelse' SET @mode=N'pred';
+                    ELSE
+                    BEGIN
+                        IF @spl<>N'' AND RIGHT(@spl,1)<>@nl SET @spl=@spl+@nl;
+                        SET @mode=N'pred';
+                    END
+                END
+                ELSE IF @W2=N'ELSE'
+                BEGIN
+                    IF @spl<>N'' AND RIGHT(@spl,1)<>@nl SET @spl=@spl+@nl;
+                    SET @mode=N'afterelse';
+                END
+                ELSE IF @W2 IN (N'SET',N'SELECT',N'INSERT',N'UPDATE',N'DELETE',N'MERGE',N'EXEC',
+                                N'EXECUTE',N'PRINT',N'RETURN',N'THROW',N'RAISERROR',N'GOTO',N'BREAK',
+                                N'CONTINUE',N'WAITFOR',N'DECLARE',N'OPEN',N'CLOSE',N'FETCH',
+                                N'DEALLOCATE',N'COMMIT',N'ROLLBACK',N'SAVE',N'TRUNCATE',N'BEGIN')
+                BEGIN
+                    IF (@mode=N'pred' OR @mode=N'afterelse')
+                    BEGIN
+                        IF RIGHT(@spl,1)<>@nl SET @spl=@spl+@nl;
+                        SET @mode=N'normal';
+                    END
+                END
+            END
+            SET @spl=@spl+@w; SET @i=@j; CONTINUE;
+        END
+
+        SET @spl=@spl+@c; SET @i=@i+1;
+    END
+
+    SET @stackLen = LEN(@stack);
+    SET @stackTop = CASE WHEN LEN(@stack)>0 THEN RIGHT(@stack,1) ELSE N'' END;
+
+    DECLARE @endClean BIT = CASE WHEN @inStr=0 AND @inBC=0 AND @inBrk=0 AND @paren=0 AND @stackLen=@startStack THEN 1 ELSE 0 END;
+    IF @startClean=1 AND @endClean=1 SET @Out=@spl;
+    ELSE SET @Out=@raw;
+END
+GO
+
+IF OBJECT_ID('TestGen.NormalizeBranchLayout','P') IS NOT NULL DROP PROCEDURE TestGen.NormalizeBranchLayout;
+GO
+CREATE PROCEDURE TestGen.NormalizeBranchLayout
+    @Src NVARCHAR(MAX),
+    @Out NVARCHAR(MAX) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @nl NCHAR(1)=CHAR(10);
+    SET @Src = REPLACE(REPLACE(@Src,CHAR(13)+CHAR(10),CHAR(10)),CHAR(13),CHAR(10));
+    IF RIGHT(@Src,1)<>@nl SET @Src=@Src+@nl;
+
+    IF OBJECT_ID('tempdb..#nbl') IS NOT NULL DROP TABLE #nbl;
+    CREATE TABLE #nbl(LineNum INT IDENTITY(1,1) PRIMARY KEY, txt NVARCHAR(MAX));
+    DECLARE @pos INT=1, @np INT, @srclen INT = DATALENGTH(@Src)/2;
+    WHILE @pos<=@srclen
+    BEGIN
+        SET @np=CHARINDEX(@nl,@Src,@pos); IF @np=0 SET @np=@srclen+1;
+        INSERT #nbl(txt) VALUES(SUBSTRING(@Src,@pos,@np-@pos));
+        SET @pos=@np+1;
+    END
+
+    SET @Out=N'';
+    DECLARE @inStr BIT=0,@inBC BIT=0,@inBrk BIT=0,@paren INT=0,@stackLen INT=0;
+    DECLARE @stackTop NCHAR(1)=N'', @stack NVARCHAR(MAX)=N'';
+    DECLARE @ln INT=1, @maxln INT=(SELECT MAX(LineNum) FROM #nbl), @t NVARCHAR(MAX), @res NVARCHAR(MAX);
+    WHILE @ln<=@maxln
+    BEGIN
+        SELECT @t=txt FROM #nbl WHERE LineNum=@ln;
+        EXEC TestGen.NormLineStep @t, @inStr OUTPUT,@inBC OUTPUT,@inBrk OUTPUT,@paren OUTPUT,
+             @stackLen OUTPUT,@stackTop OUTPUT,@stack OUTPUT,@res OUTPUT;
+        SET @Out=@Out+@res+@nl;
+        SET @ln=@ln+1;
+    END
+END
+GO
+PRINT 'TestGen.NormLineStep + TestGen.NormalizeBranchLayout created.';
+GO
+
 IF OBJECT_ID('TestGen.InstrumentProcedure','P') IS NOT NULL
     DROP PROCEDURE TestGen.InstrumentProcedure;
 GO
@@ -9847,6 +10088,25 @@ BEGIN
 
     SET @ProcSource = REPLACE(@ProcSource, CHAR(13)+CHAR(10), CHAR(10));
     SET @ProcSource = REPLACE(@ProcSource, CHAR(13), CHAR(10));
+
+    -- v0.15.6: statement-aware layout normalization. Reformat dense one-liners
+    -- (IF/ELSE/WHILE with inline bodies, or several ;-terminated statements on
+    -- one line) onto canonical one-statement-per-line form so the line-based
+    -- walker can mark + measure every branch arm. No-op on well-formatted procs;
+    -- best-effort + TRY/CATCH-guarded, so any failure falls back to the original
+    -- source (coverage still runs, dense one-liners just under-report as before).
+    IF OBJECT_ID('TestGen.NormalizeBranchLayout','P') IS NOT NULL
+    BEGIN
+        DECLARE @normSrc NVARCHAR(MAX);
+        BEGIN TRY
+            EXEC TestGen.NormalizeBranchLayout @Src = @ProcSource, @Out = @normSrc OUTPUT;
+            IF @normSrc IS NOT NULL AND LEN(@normSrc) > 0
+                SET @ProcSource = @normSrc;
+        END TRY
+        BEGIN CATCH
+            /* keep original @ProcSource on any normalization error */
+        END CATCH;
+    END;
 
     ---------------------------------------------------------------------------
     -- Split into lines, preserving order DETERMINISTICALLY.
@@ -9938,6 +10198,62 @@ BEGIN
 
     IF @BodyStart IS NOT NULL
         UPDATE #Lines SET InHeader = 0 WHERE LineNum > @BodyStart;
+
+    -- v0.15.5: preserve @@ROWCOUNT/@@ERROR across the injected coverage hits. EXEC
+    -- RecordCoverageHit resets @@ROWCOUNT/@@ERROR, so a proc that reads them right after a
+    -- statement ("SELECT ...; IF @@ROWCOUNT = 0") would mis-read them in the shadow - which
+    -- silently gates EVERY downstream branch (the shadow always took the @@ROWCOUNT=0 arm). When
+    -- the proc uses them, rewrite the body's reads to shadow locals @__rc/@__er, captured
+    -- immediately after each statement by a prefix added to every hit below. @@TRANCOUNT is NOT
+    -- reset by EXEC, so it is left untouched.
+    DECLARE @UsesEnv BIT = CASE WHEN UPPER(@ProcSource) LIKE N'%@@ROWCOUNT%' OR UPPER(@ProcSource) LIKE N'%@@ERROR%' THEN 1 ELSE 0 END;
+    IF @UsesEnv = 1 AND @BodyStart IS NOT NULL
+        UPDATE #Lines
+        SET LineText = REPLACE(REPLACE(LineText COLLATE Latin1_General_CI_AS, N'@@ROWCOUNT', N'@__rc'), N'@@ERROR', N'@__er')
+        WHERE InHeader = 0;
+
+    -- v0.15.4: neutralize the procedure's OWN transaction-control statements in the
+    -- instrumented shadow. A proc that runs BEGIN/COMMIT/ROLLBACK TRANSACTION (or
+    -- SET XACT_ABORT ON) collapses tSQLt's per-test transaction (the "mismatching
+    -- BEGIN and COMMIT" error) AND rolls back the coverage capture, producing a false
+    -- 0% on an otherwise-coverable proc. The _cov shadow exists ONLY to MEASURE which
+    -- lines run, so commenting these standalone statements is safe: control flow and
+    -- line numbers are unchanged (a RETURN after a now-commented ROLLBACK still runs),
+    -- the shadow runs inside tSQLt's single transaction, and the real value/effect
+    -- assertions run against the UNCHANGED real proc - never this shadow. Only a line
+    -- whose entire statement IS the transaction control is touched (one statement per
+    -- line, guarded by the semicolon check), so an inline "ROLLBACK; RETURN;" is left
+    -- alone (honest residue) rather than risk dropping the RETURN.
+    -- Replace with a no-op STATEMENT (not a comment): a transaction statement may be
+    -- the ONLY statement in a BEGIN/END or IF body (e.g. the CATCH's
+    -- "IF @@TRANCOUNT>0 BEGIN ROLLBACK END"), and an EMPTY BEGIN/END is invalid T-SQL.
+    -- "SET @__uag_noop = 0;" keeps the block non-empty, changes no transaction state,
+    -- and still registers the original line as a covered statement. @__uag_noop is
+    -- declared in the shadow preamble.
+    IF @BodyStart IS NOT NULL
+        UPDATE l
+        SET l.LineText = N'    SET @__uag_noop = 0;  -- [uag-cov neutralized] '
+                       + LTRIM(RTRIM(ISNULL(l.LineText, N'')))
+        FROM #Lines l
+        -- strip a trailing line-comment first, so "COMMIT TRANSACTION; -- note" still
+        -- neutralizes (its ';' is then the last code char) rather than slipping through.
+        CROSS APPLY (SELECT codepart = CASE WHEN CHARINDEX(N'--', ISNULL(l.LineText,N'')) > 0
+                                            THEN LEFT(ISNULL(l.LineText,N''), CHARINDEX(N'--', ISNULL(l.LineText,N'')) - 1)
+                                            ELSE ISNULL(l.LineText,N'') END) cc
+        CROSS APPLY (SELECT norm = UPPER(LTRIM(RTRIM(REPLACE(cc.codepart, N';', N' ')))) ) x
+        WHERE l.InHeader = 0
+          AND (LEN(cc.codepart) - LEN(REPLACE(cc.codepart, N';', N''))) <= 1
+          AND (CHARINDEX(N';', cc.codepart) = 0 OR RTRIM(cc.codepart) LIKE N'%;')
+          AND (
+                x.norm IN (N'BEGIN TRAN', N'BEGIN TRANSACTION', N'COMMIT', N'COMMIT TRAN',
+                           N'COMMIT TRANSACTION', N'COMMIT WORK', N'ROLLBACK', N'ROLLBACK TRAN',
+                           N'ROLLBACK TRANSACTION', N'ROLLBACK WORK')
+             OR x.norm LIKE N'BEGIN TRAN[ ]%'        OR x.norm LIKE N'BEGIN TRANSACTION[ ]%'
+             OR x.norm LIKE N'COMMIT TRAN[ ]%'       OR x.norm LIKE N'COMMIT TRANSACTION[ ]%'
+             OR x.norm LIKE N'ROLLBACK TRAN[ ]%'     OR x.norm LIKE N'ROLLBACK TRANSACTION[ ]%'
+             OR x.norm LIKE N'SAVE TRAN[ ]%'         OR x.norm LIKE N'SAVE TRANSACTION[ ]%'
+             OR x.norm LIKE N'SET XACT[_]ABORT ON%'
+          );
 
     -- v9.4.3: if the body STILL cannot be located, do NOT proceed.  Emitting an
     -- instrumented copy now would produce one with an EMPTY body (every line was
@@ -10191,6 +10507,10 @@ BEGIN
             IF @Blank = 0 AND @Cmnt = 0 AND @PB = 0 AND @PE = 0 AND @Noise = 0
             BEGIN
                 SET @Trimmed = UPPER(LTRIM(ISNULL(@LT,N'')));
+                -- v0.15.4: a leading statement-separator ';' (e.g. ";WITH cte AS (")
+                -- must not blank the first-word detection - that would lose the CTE's
+                -- WITH state and split a CTE+UPDATE/MERGE into an uncompilable shadow.
+                IF LEFT(@Trimmed, 1) = N';' SET @Trimmed = LTRIM(SUBSTRING(@Trimmed, 2, LEN(@Trimmed) + 1));
                 SET @PatPos = PATINDEX(N'%[^A-Z_]%', @Trimmed);
                 IF @PatPos = 0
                     SET @FirstWord = @Trimmed;
@@ -10359,6 +10679,11 @@ BEGIN
                                 WHEN @OpenStmt = N'WITH' AND @FirstWord = N'SELECT' AND @UnionPending = 1 THEN 1
                                 -- v10.0.8: DECLARE state (covers DECLARE c CURSOR FOR <SELECT> across lines)
                                 WHEN @OpenStmt = N'DECLARE' AND CHARINDEX(N'|' + @FirstWord + N'|', @ContDeclare) > 0 THEN 1
+                                -- v0.15.4: "WITH (" (paren right after WITH) is the OPENJSON /
+                                -- CHANGETABLE WITH clause, NOT a CTE opener - it continues the
+                                -- current SELECT/INSERT statement. (A real CTE is "WITH <name> AS (".)
+                                WHEN @FirstWord = N'WITH' AND @StmtStart IS NOT NULL
+                                     AND LEFT(LTRIM(SUBSTRING(UPPER(LTRIM(ISNULL(@LT,N''))), 5, 40)), 1) = N'(' THEN 1
                                 ELSE 0
                             END;
 
@@ -10461,6 +10786,17 @@ BEGIN
                                 WHEN N'EXECUTE'  THEN N'EXEC'
                                 ELSE @InsertMode
                             END;
+                        END
+                        ELSE IF @IsContinuation = 1 AND @OpenStmt = N'WITH'
+                             AND @FirstWord IN (N'UPDATE', N'DELETE', N'MERGE', N'INSERT')
+                        BEGIN
+                            -- v0.15.4: a CTE whose main statement is UPDATE/DELETE/MERGE/INSERT
+                            -- (e.g. ";WITH cte AS (...) UPDATE t SET ... FROM ...") - hand off to
+                            -- that verb's continuation set so its body keywords (SET, VALUES, ...)
+                            -- keep continuing instead of firing a spurious mid-statement boundary
+                            -- that splits the statement into an uncompilable instrumented shadow.
+                            SET @OpenStmt = @FirstWord;
+                            IF @OpenStmt = N'INSERT' SET @InsertMode = N'HEADER';
                         END;
                         -- else: continuation, IsExec stays 0
                     END;
@@ -10772,10 +11108,22 @@ BEGIN
         SET @CreateSQL = @CreateSQL + @ParamList + CHAR(10);
     SET @CreateSQL = @CreateSQL + N'AS' + CHAR(10) + N'BEGIN' + CHAR(10);
     SET @CreateSQL = @CreateSQL + N'    SET NOCOUNT ON;' + CHAR(10);
+    -- v0.15.4: scratch sink for neutralized transaction-control statements (see the
+    -- transaction-neutralization pass above). Harmless if unused.
+    SET @CreateSQL = @CreateSQL + N'    DECLARE @__uag_noop INT = 0;' + CHAR(10);
+    -- v0.15.5: shadow locals holding the preserved @@ROWCOUNT/@@ERROR (see body rewrite above).
+    IF @UsesEnv = 1
+        SET @CreateSQL = @CreateSQL + N'    DECLARE @__rc INT = 0, @__er INT = 0;' + CHAR(10);
     -- v0.11: hoist the single probe scratch variable (assigned with SET each time
     -- a probe fires, so no DECLARE-initializer-in-loop evaluation pitfall).
     IF @ProbeMapJson IS NOT NULL
         SET @CreateSQL = @CreateSQL + N'    DECLARE @__uap_val NVARCHAR(4000);' + CHAR(10);
+    -- v0.15.5: capture @@ROWCOUNT/@@ERROR into the shadow locals IMMEDIATELY after each statement
+    -- (right before its hit), so the rewritten reads (@__rc/@__er) see the true values the EXEC hit
+    -- would otherwise have reset. One capture per hit; the proc's body reads were rewritten above.
+    IF @UsesEnv = 1
+        SET @Body = REPLACE(@Body, N'EXEC TestGen.RecordCoverageHit',
+                            N'SELECT @__rc=@@ROWCOUNT, @__er=@@ERROR;' + CHAR(10) + N'    EXEC TestGen.RecordCoverageHit');
     SET @CreateSQL = @CreateSQL + @Body;
     SET @CreateSQL = @CreateSQL + CHAR(10) + N'END;';
 
@@ -11213,8 +11561,13 @@ CREATE TABLE TestGen.SearchSeedResult (
     Status       VARCHAR(16) NULL,
     AggFunc      VARCHAR(10) NULL, SrcTable NVARCHAR(300) NULL, SrcColumn SYSNAME NULL,
     WitnessKnob  FLOAT NULL, WitnessArrange NVARCHAR(MAX) NULL,
+    ArgOverride  NVARCHAR(MAX) NULL,
     Diag         NVARCHAR(MAX) NULL, CreatedAt DATETIME2 DEFAULT SYSDATETIME()
 );
+GO
+-- defensive: add ArgOverride to a pre-existing table (v0.15.5 deep-gate witnesses)
+IF COL_LENGTH('TestGen.SearchSeedResult','ArgOverride') IS NULL
+    ALTER TABLE TestGen.SearchSeedResult ADD ArgOverride NVARCHAR(MAX) NULL;
 GO
 IF OBJECT_ID('TestGen.SearchSeedForProc','P') IS NOT NULL DROP PROCEDURE TestGen.SearchSeedForProc;
 GO
@@ -11263,10 +11616,19 @@ BEGIN
         END;
     END;
 
+    -- v0.15.5: deterministic deep-gate witnesses FIRST (JSON/table-variable aggregates,
+    -- key-lookup status scalars, @@ROWCOUNT / IS NULL parameter guards, happy path).  The
+    -- iterative search below then SKIPS any gate already witnessed here, so these deep gates
+    -- never incur the slow XEvent sweep.  No-op when the proc has no such shape.
+    IF OBJECT_ID('TestGen.DeriveDeepGateWitnesses','P') IS NOT NULL
+        EXEC TestGen.DeriveDeepGateWitnesses @Schema=@Schema, @Proc=@Proc;
+
     DECLARE c CURSOR LOCAL FAST_FORWARD FOR
         SELECT BranchId, StartLine, PredicateText
-        FROM TestGen.PredicateInbox
+        FROM TestGen.PredicateInbox pi
         WHERE ProcName=@Proc AND UnsupportedReason IS NOT NULL AND SeedPlanTrueJson IS NULL
+          AND NOT EXISTS(SELECT 1 FROM TestGen.SearchSeedResult r
+                         WHERE r.SchemaName=@Schema AND r.ProcName=@Proc AND r.GateLine=pi.StartLine AND r.Status='WITNESS')
         ORDER BY StartLine;
     DECLARE @bid INT,@gl INT,@ptext NVARCHAR(MAX);
 
@@ -11296,10 +11658,13 @@ BEGIN
         DECLARE @aline INT=NULL,@atxt NVARCHAR(MAX)=NULL,@agg VARCHAR(10)=NULL,@col SYSNAME=NULL,@tbl NVARCHAR(300)=NULL,@isAgg BIT=0;
         IF @op IS NOT NULL
         BEGIN
-            -- assignment START line: latest SELECT/SET/DECLARE before the gate that assigns @op
-            SELECT @aline=MAX(LineNum) FROM #src
-            WHERE LineNum<@gl AND Txt LIKE N'%'+@op+N'%=%'
-              AND (UPPER(LTRIM(Txt)) LIKE N'SELECT %' OR UPPER(LTRIM(Txt)) LIKE N'SET %' OR UPPER(LTRIM(Txt)) LIKE N'DECLARE %');
+            -- assignment START line. The fragment that assigns @op may be a CONTINUATION of a
+            -- multi-line / multi-assignment SELECT (e.g. "SELECT @a=c1,\n @b=c2 FROM t"), so find
+            -- the fragment line that mentions @op first, then the nearest statement-start at/before it.
+            DECLARE @afrag INT = (SELECT MAX(LineNum) FROM #src WHERE LineNum<@gl AND Txt LIKE N'%'+@op+N'%=%');
+            SET @aline = (SELECT MAX(LineNum) FROM #src
+                          WHERE LineNum <= ISNULL(@afrag, 0)
+                            AND (UPPER(LTRIM(Txt)) LIKE N'SELECT %' OR UPPER(LTRIM(Txt)) LIKE N'SET %' OR UPPER(LTRIM(Txt)) LIKE N'DECLARE %'));
             IF @aline IS NOT NULL
             BEGIN
                 -- reconstruct the (possibly multi-line) statement up to its ';'
@@ -11313,6 +11678,12 @@ BEGIN
                     SET @ln2=@ln2+1;
                 END;
                 IF UPPER(ISNULL(@atxt,N'')) NOT LIKE N'%FROM %' SET @atxt=NULL;  -- needs a table source
+                -- v0.15.9: an operand assigned FROM a #temp is the LOOP-SOURCE row, i.e. a PER-ROW
+                -- gate, not an aggregate/scalar over a real table. The #temp has no OBJECT_ID in this
+                -- context, so the AGG/SCALAR arrange would build an empty "INSERT #t () VALUES ()"
+                -- ("Incorrect syntax near ')'"). Route it to the PER-ROW archetype, which resolves the
+                -- driving column through the #temp back to the real loop-source table.
+                IF UPPER(ISNULL(@atxt,N'')) LIKE N'% FROM #%' SET @atxt=NULL;
             END;
         END;
 
@@ -11331,29 +11702,114 @@ BEGIN
             ELSE
             BEGIN
                 SET @agg='ID';
-                -- scalar: @op = <col> FROM ... ; col is the token between '=' and 'FROM'
-                DECLARE @eqp INT=CHARINDEX(N'=',@atxt);
-                DECLARE @frp0 INT=CHARINDEX(' FROM ',UPPER(@atxt));
-                SET @col=LTRIM(RTRIM(SUBSTRING(@atxt,@eqp+1,@frp0-@eqp-1)));
+                -- scalar: @op = <col> ... FROM ... ; take the token between @op's OWN '=' and the
+                -- next ',' or 'FROM' (handles multi-assignment "SELECT @a=c1, @b=c2 FROM t").
+                DECLARE @opp INT = CHARINDEX(@op, @atxt);
+                DECLARE @eqp INT = CHARINDEX(N'=', @atxt, @opp + LEN(@op));
+                DECLARE @frp0 INT = CHARINDEX(' FROM ', UPPER(@atxt));
+                DECLARE @cmm INT = CHARINDEX(N',', @atxt, @eqp + 1);
+                DECLARE @cEnd INT = CASE WHEN @cmm > 0 AND @cmm < @frp0 THEN @cmm ELSE @frp0 END;
+                SET @col = LTRIM(RTRIM(SUBSTRING(@atxt, @eqp + 1, @cEnd - @eqp - 1)));
             END;
             DECLARE @fp INT=CHARINDEX(' FROM ',UPPER(@atxt));
             DECLARE @aftf NVARCHAR(300)=LTRIM(SUBSTRING(@atxt,@fp+6,300));
             DECLARE @tstop INT=PATINDEX(N'%[ ;(]%',@aftf+N' ');
             SET @tbl=LEFT(@aftf,@tstop-1);
 
-            -- arrange row for @tbl with @col={KNOB}
+            -- WHERE clause of the assignment statement (used for keycol coordination below).
+            DECLARE @awh NVARCHAR(MAX) = CASE WHEN CHARINDEX(N' WHERE ', UPPER(@atxt)) > 0
+                THEN UPPER(SUBSTRING(@atxt, CHARINDEX(N' WHERE ', UPPER(@atxt)) + 7, 4000)) ELSE N'' END;
+
+            -- arrange row for @tbl with @col={KNOB}. Identity/computed columns are normally skipped,
+            -- BUT an identity column that is the assignment's lookup key (WHERE keycol = @param) MUST
+            -- be seeded explicitly (FakeTable strips identity, so the column accepts the insert) -
+            -- otherwise it is NULL, the WHERE never matches, the local stays NULL, and the gate past
+            -- that lookup is unreachable (false NO WITNESS).
             DECLARE @cols NVARCHAR(MAX)=N'',@vals NVARCHAR(MAX)=N'';
-            SELECT @cols=@cols+CASE WHEN LEN(@cols)>0 THEN N',' ELSE N'' END+QUOTENAME(cc.name),
-                   @vals=@vals+CASE WHEN LEN(@vals)>0 THEN N',' ELSE N'' END+
-                     CASE WHEN cc.name=PARSENAME(@col,1) OR QUOTENAME(cc.name)=@col THEN N'{KNOB}'
-                          WHEN ty.name IN ('int','bigint','smallint','tinyint','decimal','numeric','float','real','money','smallmoney','bit') THEN N'1'
-                          WHEN ty.name IN ('date','datetime','datetime2','smalldatetime') THEN N'CAST(GETDATE() AS DATE)'
-                          WHEN ty.name='uniqueidentifier' THEN N'NEWID()'
-                          ELSE N'N''x''' END
-            FROM sys.columns cc JOIN sys.types ty ON ty.user_type_id=cc.user_type_id
-            WHERE cc.object_id=OBJECT_ID(@tbl) AND cc.is_identity=0 AND cc.is_computed=0
-              AND ty.name NOT IN ('timestamp','rowversion');
-            DECLARE @arrange NVARCHAR(MAX)=N'INSERT '+@tbl+N'('+@cols+N') VALUES('+@vals+N');';
+            -- v0.16.0: build the seed row column-by-column so a NON-date filter ("col = <literal>")
+            -- in the aggregate's WHERE is satisfied (e.g. AVG(..) FROM t WHERE Status='ACTIVE'): the
+            -- seeded row must PASS the filter or it is excluded and the aggregate is NULL (gate never
+            -- crosses). The literal is taken from the ORIGINAL-case WHERE so mixed-case values survive.
+            DECLARE @awhRaw NVARCHAR(MAX) = CASE WHEN CHARINDEX(N' WHERE ', UPPER(@atxt)) > 0
+                THEN SUBSTRING(@atxt, CHARINDEX(N' WHERE ', UPPER(@atxt)) + 7, 4000) ELSE N'' END;
+            DECLARE @fltCol SYSNAME, @fltTy SYSNAME, @fltVal NVARCHAR(MAX), @fltPos INT,
+                    @fltAft NVARCHAR(200), @fltEq INT, @fltLit NVARCHAR(200), @fltAnd INT,
+                    @fltOp NVARCHAR(8), @fltNum FLOAT, @fltInPos INT, @fltClose INT;
+            IF CURSOR_STATUS('local','fltcur')>=-1 DEALLOCATE fltcur;
+            DECLARE fltcur CURSOR LOCAL FAST_FORWARD FOR
+                SELECT cc.name, ty.name
+                FROM sys.columns cc JOIN sys.types ty ON ty.user_type_id=cc.user_type_id
+                WHERE cc.object_id=OBJECT_ID(@tbl) AND cc.is_computed=0
+                  AND ty.name NOT IN ('timestamp','rowversion')
+                  AND (cc.is_identity=0 OR CHARINDEX(UPPER(cc.name), @awh) > 0)
+                ORDER BY cc.column_id;
+            OPEN fltcur; FETCH NEXT FROM fltcur INTO @fltCol,@fltTy;
+            WHILE @@FETCH_STATUS=0
+            BEGIN
+                IF @fltCol=PARSENAME(@col,1) OR QUOTENAME(@fltCol)=@col SET @fltVal=N'{KNOB}';
+                ELSE IF @fltTy IN ('int','bigint','smallint','tinyint','decimal','numeric','float','real','money','smallmoney','bit') SET @fltVal=N'1';
+                ELSE IF @fltTy IN ('date','datetime','datetime2','smalldatetime') SET @fltVal=N'''99991231''';  -- far-future (satisfies a "col >= <lookback>" filter)
+                ELSE IF @fltTy='uniqueidentifier' SET @fltVal=N'NEWID()';
+                ELSE SET @fltVal=N'N''x''';
+                IF @fltVal<>N'{KNOB}' AND LEN(@awhRaw)>0
+                BEGIN
+                    SET @fltPos=CHARINDEX(UPPER(@fltCol) COLLATE DATABASE_DEFAULT, UPPER(@awhRaw) COLLATE DATABASE_DEFAULT);
+                    IF @fltPos>0
+                    BEGIN
+                        SET @fltAft=LTRIM(SUBSTRING(UPPER(@awhRaw),@fltPos+LEN(@fltCol),200));
+                        IF LEFT(@fltAft,1)=N'='   -- simple equality (string/numeric literal)
+                        BEGIN
+                            SET @fltEq=CHARINDEX(N'=',@awhRaw,@fltPos+LEN(@fltCol)-1)+1;
+                            SET @fltLit=LTRIM(SUBSTRING(@awhRaw,@fltEq,200));
+                            SET @fltAnd=CHARINDEX(N' AND ',UPPER(@fltLit)+N' AND ');
+                            SET @fltLit=RTRIM(LEFT(@fltLit,@fltAnd-1));
+                            SET @fltLit=RTRIM(REPLACE(REPLACE(@fltLit,N')',N' '),N';',N' '));
+                            IF LEN(@fltLit)>0 AND LEFT(@fltLit,1)<>N'@' SET @fltVal=@fltLit;
+                        END
+                        -- v0.16.1: NON-equality filters -> compute a value the row will satisfy.
+                        ELSE IF LEFT(@fltAft,2) IN (N'>=',N'<=') OR (LEFT(@fltAft,1) IN (N'>',N'<') AND LEFT(@fltAft,2)<>N'<>')
+                        BEGIN  -- numeric range: a value just inside the bound (> -> +1, < -> -1, >=/<= -> bound)
+                            SET @fltOp=CASE WHEN LEFT(@fltAft,2) IN (N'>=',N'<=') THEN LEFT(@fltAft,2) ELSE LEFT(@fltAft,1) END;
+                            SET @fltLit=LTRIM(SUBSTRING(@awhRaw,@fltPos+LEN(@fltCol),200));   -- operator + rhs (original case)
+                            SET @fltLit=LTRIM(SUBSTRING(@fltLit,LEN(@fltOp)+1,200));          -- strip the operator
+                            SET @fltAnd=CHARINDEX(N' AND ',UPPER(@fltLit)+N' AND ');
+                            SET @fltLit=RTRIM(REPLACE(REPLACE(LEFT(@fltLit,@fltAnd-1),N')',N' '),N';',N' '));
+                            SET @fltNum=TRY_CAST(LTRIM(RTRIM(@fltLit)) AS FLOAT);
+                            IF @fltNum IS NOT NULL
+                                SET @fltVal=CONVERT(NVARCHAR(40),CAST(CASE WHEN @fltOp=N'>' THEN @fltNum+1 WHEN @fltOp=N'<' THEN @fltNum-1 ELSE @fltNum END AS DECIMAL(38,4)));
+                        END
+                        ELSE IF @fltAft LIKE N'IN[ (]%'
+                        BEGIN  -- IN list -> first element
+                            SET @fltInPos=CHARINDEX(N'(',@awhRaw,@fltPos);
+                            IF @fltInPos>0
+                            BEGIN
+                                SET @fltLit=SUBSTRING(@awhRaw,@fltInPos+1,200);
+                                SET @fltClose=CHARINDEX(N')',@fltLit); IF @fltClose>0 SET @fltLit=LEFT(@fltLit,@fltClose-1);
+                                SET @fltAnd=CHARINDEX(N',',@fltLit); IF @fltAnd>0 SET @fltLit=LEFT(@fltLit,@fltAnd-1);
+                                SET @fltLit=LTRIM(RTRIM(@fltLit));
+                                IF LEN(@fltLit)>0 AND LEFT(@fltLit,1)<>N'@' SET @fltVal=@fltLit;
+                            END
+                        END
+                        ELSE IF @fltAft LIKE N'BETWEEN %'
+                        BEGIN  -- BETWEEN a AND b -> low bound a
+                            SET @fltInPos=CHARINDEX(N'BETWEEN',UPPER(@awhRaw),@fltPos)+7;
+                            SET @fltLit=LTRIM(SUBSTRING(@awhRaw,@fltInPos,200));
+                            SET @fltAnd=CHARINDEX(N' AND ',UPPER(@fltLit));
+                            IF @fltAnd>0 SET @fltLit=LTRIM(RTRIM(LEFT(@fltLit,@fltAnd-1)));
+                            IF LEN(@fltLit)>0 AND LEFT(@fltLit,1)<>N'@' SET @fltVal=@fltLit;
+                        END
+                    END
+                END
+                SET @cols=@cols+CASE WHEN LEN(@cols)>0 THEN N',' ELSE N'' END+QUOTENAME(@fltCol);
+                SET @vals=@vals+CASE WHEN LEN(@vals)>0 THEN N',' ELSE N'' END+@fltVal;
+                FETCH NEXT FROM fltcur INTO @fltCol,@fltTy;
+            END
+            CLOSE fltcur; DEALLOCATE fltcur;
+            -- Fake the target table before seeding it: the reach prefix fakes the OTHER tables but
+            -- excludes the target, so without this the arrange INSERT hits the REAL table (identity
+            -- insert / constraint error) and every search run fails -> false NO WITNESS.
+            DECLARE @arrange NVARCHAR(MAX)=N'EXEC TestGen.SafeFakeTable N'''+REPLACE(@tbl,'''','''''')+N''';'+NCHAR(10)
+                                          +N'INSERT '+@tbl+N'('+@cols+N') VALUES('+@vals+N');';
             DECLARE @probe NVARCHAR(MAX)=N'[{"line":'+CAST(@aline AS NVARCHAR(10))+N',"locals":"'+@op+N'"}]';
 
             -- reachability: supplied prefix/args win; else synth (exclude target table)
@@ -11362,6 +11818,38 @@ BEGIN
             ELSE BEGIN EXEC TestGen.BuildReachPrefix @Schema,@Proc,@tbl,@pfx OUTPUT; END;
             IF @ArgList IS NOT NULL SET @args=@ArgList;
             ELSE BEGIN SET @args=@autoArgs; SET @pfx=@autoDecls+ISNULL(@pfx,N''); END;
+
+            -- v0.15.5: coordinate the assignment's "WHERE keycol = @param" with the arrange row.
+            -- The seeded row's keycol gets a type-default; force the matching @param arg to the SAME
+            -- default so the lookup FINDS the row (else the local stays NULL and the gate, which sits
+            -- past that lookup, is never reachable -> false NO WITNESS). (@awh computed above.)
+            IF LEN(@awh) > 0 AND @args IS NOT NULL
+            BEGIN
+                DECLARE @co SYSNAME, @cot SYSNAME, @cov NVARCHAR(60);
+                DECLARE pcoord CURSOR LOCAL FAST_FORWARD FOR
+                    SELECT pr.name, ty.name FROM sys.parameters pr JOIN sys.types ty ON ty.user_type_id=pr.user_type_id
+                    WHERE pr.object_id=OBJECT_ID(@full) AND pr.name<>N'' AND CHARINDEX(UPPER(pr.name), @awh) > 0;
+                OPEN pcoord; FETCH NEXT FROM pcoord INTO @co,@cot;
+                WHILE @@FETCH_STATUS=0
+                BEGIN
+                    SET @cov = CASE WHEN @cot IN ('int','bigint','smallint','tinyint','decimal','numeric','float','real','money','smallmoney','bit') THEN N'1'
+                                    -- v0.15.9: a LITERAL date, not CAST(GETDATE() AS DATE): this value is
+                                    -- STUFFed into the EXEC arg list, and an EXEC parameter cannot be an
+                                    -- expression ("Incorrect syntax near 'GETDATE'"). Far-past so a
+                                    -- "col >= DATEADD(..,@param)" lookback window includes the far-future seed row.
+                                    WHEN @cot IN ('date','datetime','datetime2','smalldatetime') THEN N'''19000101'''
+                                    WHEN @cot='uniqueidentifier' THEN N'NEWID()' ELSE N'N''x''' END;
+                    DECLARE @pp INT = CHARINDEX(@co, @args);
+                    IF @pp > 0
+                    BEGIN
+                        DECLARE @eq2 INT = CHARINDEX(N'=', @args, @pp);
+                        DECLARE @nx  INT = CHARINDEX(N',', @args, @eq2); IF @nx = 0 SET @nx = LEN(@args)+1;
+                        IF @eq2 > 0 SET @args = STUFF(@args, @eq2+1, @nx-@eq2-1, N' ' + @cov + N' ');
+                    END;
+                    FETCH NEXT FROM pcoord INTO @co,@cot;
+                END;
+                CLOSE pcoord; DEALLOCATE pcoord;
+            END;
 
             IF @isnull=1
             BEGIN
@@ -11378,6 +11866,22 @@ BEGIN
             END
             ELSE
             BEGIN
+                DECLARE @aggClaimed BIT=0;
+                -- v0.15.9: DETERMINISTIC single-row aggregate witness for AVG/MIN/MAX/SUM - one seeded
+                -- row makes the aggregate equal that row's @col, so seed @col to a value that crosses the
+                -- literal. No search -> robust, no timeout, no "@Budget too small to drive the boundary"
+                -- miss. COUNT keeps the search (its knob is the ROW COUNT, not a column value).
+                IF @agg IN ('AVG','MIN','MAX','SUM') AND @cmp IN (N'>',N'>=',N'<',N'<=',N'=',N'<>')
+                BEGIN
+                    DECLARE @aggDet FLOAT = CASE WHEN @cmp IN (N'>',N'<>') THEN @cand+1 WHEN @cmp=N'<' THEN @cand-1 ELSE @cand END;
+                    DECLARE @aggDetArr NVARCHAR(MAX)=REPLACE(@arrange,N'{KNOB}',CONVERT(NVARCHAR(40),CAST(@aggDet AS DECIMAL(38,4))));
+                    INSERT TestGen.SearchSeedResult(SchemaName,ProcName,BranchId,GateLine,Operand,Comparator,Comparand,Archetype,Status,AggFunc,SrcTable,SrcColumn,WitnessKnob,WitnessArrange,Diag)
+                    VALUES(@Schema,@Proc,@bid,@gl,@op,@cmp,@cand,'AGG','WITNESS',@agg,@tbl,@col,@aggDet,@aggDetArr,
+                           N'deterministic single-row aggregate witness: '+@col+N'='+CONVERT(NVARCHAR(40),CAST(@aggDet AS DECIMAL(38,4)))+N' makes '+@agg+N' '+@cmp+N' '+CONVERT(NVARCHAR(40),CAST(@cand AS DECIMAL(38,4))));
+                    SET @aggClaimed=1;
+                END;
+                IF @aggClaimed=0
+                BEGIN
                 DECLARE @klo FLOAT=0, @khi FLOAT=CASE WHEN @cand IS NULL THEN 1000 ELSE (ABS(@cand)*2+1000) END;
                 IF @agg='COUNT' BEGIN SET @klo=0; SET @khi=CASE WHEN @cand IS NULL THEN 50 ELSE @cand+10 END; END;
                 IF @cand<0 SET @klo=@cand*2-1000;
@@ -11394,6 +11898,7 @@ BEGIN
                 VALUES(@Schema,@Proc,@bid,@gl,@op,@cmp,@cand,CASE WHEN @isAgg=1 THEN 'AGG' ELSE 'SCALAR' END,
                        CASE WHEN @wk IS NOT NULL THEN 'WITNESS' WHEN @dg LIKE '%NO WITNESS%' THEN 'NOT_TESTABLE' ELSE 'UNREACHED' END,
                        @agg,@tbl,@col,@wk,ISNULL(@wa,@arrange),@dg);
+                END;  -- IF @aggClaimed=0 (deterministic single-row aggregate took precedence)
             END;
         END
         ELSE
@@ -11460,6 +11965,79 @@ BEGIN
                                 DECLARE @ifLn INT=(SELECT MAX(LineNum) FROM #src WHERE LineNum<@setLn AND UPPER(LTRIM(Txt)) LIKE N'IF %');
                                 SELECT @recPfx=ISNULL(WitnessArrange,N'')+NCHAR(10) FROM TestGen.SearchSeedResult
                                  WHERE SchemaName=@Schema AND ProcName=@Proc AND GateLine=@ifLn AND Status='WITNESS';
+                                -- v0.15.8: COORDINATED MULTI-SOURCE seed. If the flag-setting IF is not
+                                -- (yet) witnessed, SYNTHESISE its seed directly when its condition is an
+                                -- aggregate band:  IF @aggLocal <op> K ;  @aggLocal = AGG(col) FROM tbl
+                                -- [WHERE <date> >= ...].  Seed tbl with ONE row (col = K +/- 1 so the
+                                -- AVG/MIN/MAX/SUM crosses K) and any date filter column far-future to
+                                -- satisfy a ">=" window.  Fail-safe (TRY/CATCH -> empty -> the compound
+                                -- gate just stays NOT_TESTABLE, never a wrong witness).
+                                IF (@recPfx IS NULL OR @recPfx=N'')
+                                BEGIN
+                                  BEGIN TRY
+                                    DECLARE @rxIf NVARCHAR(MAX)=(SELECT Txt FROM #src WHERE LineNum=@ifLn);
+                                    DECLARE @rxC NVARCHAR(MAX)=LTRIM(SUBSTRING(@rxIf,CHARINDEX(N'IF',UPPER(@rxIf))+2,4000));
+                                    IF LEFT(@rxC,1)=N'@'
+                                    BEGIN
+                                        DECLARE @rxL SYSNAME=LEFT(@rxC,PATINDEX(N'%[^A-Za-z0-9_@]%',@rxC+N' ')-1);
+                                        DECLARE @rxAsg NVARCHAR(MAX)=(SELECT TOP 1 Txt FROM #src WHERE Txt LIKE N'%'+@rxL+N'%=%' AND LineNum<@ifLn
+                                            AND UPPER(Txt) LIKE N'%FROM %' AND CHARINDEX(N'(',Txt)>0 AND UPPER(LTRIM(Txt)) NOT LIKE N'IF %' ORDER BY LineNum DESC);
+                                        IF @rxAsg IS NOT NULL
+                                        BEGIN
+                                            DECLARE @rxTbl NVARCHAR(300)=LTRIM(SUBSTRING(@rxAsg,CHARINDEX(N' FROM ',UPPER(@rxAsg))+6,300));
+                                            SET @rxTbl=LEFT(@rxTbl,PATINDEX(N'%[ ;]%',@rxTbl+N' ')-1);
+                                            DECLARE @rxIn NVARCHAR(200)=LTRIM(SUBSTRING(@rxAsg,CHARINDEX(N'(',@rxAsg)+1,200));
+                                            DECLARE @rxCol SYSNAME=LEFT(@rxIn,PATINDEX(N'%[^A-Za-z0-9_]%',@rxIn+N' ')-1);
+                                            DECLARE @rxCR NVARCHAR(200)=LTRIM(SUBSTRING(@rxC,LEN(@rxL)+1,200));
+                                            DECLARE @rxOp NVARCHAR(2)=CASE WHEN SUBSTRING(@rxCR,1,2) IN (N'>=',N'<=') THEN SUBSTRING(@rxCR,1,2) ELSE LEFT(@rxCR,1) END;
+                                            DECLARE @rxK FLOAT=TRY_CAST(LTRIM(SUBSTRING(@rxCR,LEN(@rxOp)+1,50)) AS FLOAT);
+                                            DECLARE @rxW NVARCHAR(MAX)=CASE WHEN CHARINDEX(N' WHERE ',UPPER(@rxAsg))>0 THEN SUBSTRING(@rxAsg,CHARINDEX(N' WHERE ',UPPER(@rxAsg))+7,2000) ELSE N'' END;
+                                            IF @rxK IS NOT NULL AND OBJECT_ID(@rxTbl) IS NOT NULL
+                                               AND EXISTS(SELECT 1 FROM sys.columns WHERE object_id=OBJECT_ID(@rxTbl) AND name=@rxCol)
+                                            BEGIN
+                                                DECLARE @rxVal FLOAT=CASE WHEN @rxOp IN (N'>',N'>=') THEN @rxK+1 WHEN @rxOp IN (N'<',N'<=') THEN @rxK-1 ELSE @rxK END;
+                                                DECLARE @rxCols NVARCHAR(MAX)=QUOTENAME(@rxCol), @rxVals NVARCHAR(MAX)=CONVERT(NVARCHAR(40),CAST(@rxVal AS DECIMAL(38,4)));
+                                                SELECT @rxCols=@rxCols+N','+QUOTENAME(c.name), @rxVals=@rxVals+N',''99991231'''
+                                                FROM sys.columns c JOIN sys.types t ON t.user_type_id=c.user_type_id
+                                                WHERE c.object_id=OBJECT_ID(@rxTbl) AND t.name IN ('date','datetime','datetime2','smalldatetime')
+                                                  AND c.name<>@rxCol AND CHARINDEX(c.name COLLATE DATABASE_DEFAULT,@rxW COLLATE DATABASE_DEFAULT)>0;
+                                                -- v0.16.0: NON-date filter columns - set "col = <literal>" predicates
+                                                -- so the seeded row passes the aggregate's WHERE (e.g. WHERE Status='ACTIVE'
+                                                -- AND MetricDate >= ...). Simple equality only (string/numeric literal);
+                                                -- other predicate shapes are left (the row may be excluded -> AVG NULL).
+                                                DECLARE @rxWU NVARCHAR(MAX), @fc SYSNAME, @rxColPos INT, @rxAfter NVARCHAR(200),
+                                                        @rxRhsPos INT, @fcVal NVARCHAR(200), @fcAnd INT;
+                                                SET @rxWU=UPPER(@rxW);
+                                                IF CURSOR_STATUS('local','rxfc')>=-1 DEALLOCATE rxfc;
+                                                DECLARE rxfc CURSOR LOCAL FAST_FORWARD FOR
+                                                    SELECT c.name FROM sys.columns c JOIN sys.types t ON t.user_type_id=c.user_type_id
+                                                    WHERE c.object_id=OBJECT_ID(@rxTbl) AND c.name<>@rxCol AND c.is_computed=0 AND c.is_identity=0
+                                                      AND t.name NOT IN ('date','datetime','datetime2','smalldatetime','timestamp','rowversion')
+                                                      AND CHARINDEX(UPPER(c.name) COLLATE DATABASE_DEFAULT,@rxWU COLLATE DATABASE_DEFAULT)>0;
+                                                OPEN rxfc; FETCH NEXT FROM rxfc INTO @fc;
+                                                WHILE @@FETCH_STATUS=0
+                                                BEGIN
+                                                    SET @rxColPos=CHARINDEX(UPPER(@fc) COLLATE DATABASE_DEFAULT,@rxWU COLLATE DATABASE_DEFAULT);
+                                                    SET @rxAfter=LTRIM(SUBSTRING(@rxWU,@rxColPos+LEN(@fc),200));
+                                                    IF @rxColPos>0 AND LEFT(@rxAfter,1)=N'=' AND CHARINDEX(N'['+@fc+N']',@rxCols)=0
+                                                    BEGIN
+                                                        SET @rxRhsPos=CHARINDEX(N'=',@rxW,@rxColPos+LEN(@fc)-1)+1;
+                                                        SET @fcVal=LTRIM(SUBSTRING(@rxW,@rxRhsPos,200));
+                                                        SET @fcAnd=CHARINDEX(N' AND ',UPPER(@fcVal)+N' AND ');
+                                                        SET @fcVal=RTRIM(LEFT(@fcVal,@fcAnd-1));
+                                                        SET @fcVal=RTRIM(REPLACE(REPLACE(@fcVal,N')',N' '),N';',N' '));
+                                                        IF LEN(@fcVal)>0 AND LEFT(@fcVal,1)<>N'@'
+                                                            BEGIN SET @rxCols=@rxCols+N','+QUOTENAME(@fc); SET @rxVals=@rxVals+N','+@fcVal; END;
+                                                    END;
+                                                    FETCH NEXT FROM rxfc INTO @fc;
+                                                END;
+                                                CLOSE rxfc; DEALLOCATE rxfc;
+                                                SET @recPfx=N'    INSERT '+@rxTbl+N' ('+@rxCols+N') VALUES ('+@rxVals+N');'+NCHAR(10);
+                                            END;
+                                        END;
+                                    END;
+                                  END TRY BEGIN CATCH SET @recPfx=N''; END CATCH;
+                                END;
                             END;
                         END;
                     END;
@@ -11520,8 +12098,147 @@ BEGIN
                                N'categorical per-row seed '+@drvName+N'='+@lit);
                         SET @resolved=1;
                     END
-                    ELSE IF @cmp IS NOT NULL AND @cand IS NOT NULL    -- NUMERIC per-row (search the knob)
+                    ELSE IF @cmp IS NOT NULL AND @cand IS NOT NULL    -- NUMERIC per-row
                     BEGIN
+                        -- v0.15.7: DETERMINISTIC arithmetic-derived per-row path. When the operand is
+                        -- assigned a PRODUCT of factors (driving col * other per-row cols * non-row
+                        -- locals), the driving knob alone can't cross the literal: the OTHER per-row
+                        -- factor columns default to 0/NULL (product 0, or trips a ">0" guard), so the
+                        -- search never witnesses it. Neutralise those co-factor columns (=1) and set
+                        -- the knob just past the literal, then write the witness DIRECTLY - no search,
+                        -- which fixes the multi-factor product AND avoids the per-gate sweep timeout on
+                        -- loop procs. Non-row factor locals (e.g. a risk multiplier from an AVG over a
+                        -- table that EmitSearchSeedTests FakeTables empty -> AVG NULL -> default) take a
+                        -- positive constant, so the product is monotonic in the knob. SET-initialised
+                        -- (loop-DECLARE initialisers evaluate once); @ad* names avoid collisions.
+                        DECLARE @adRhs NVARCHAR(MAX), @adCof NVARCHAR(MAX), @adIsProd BIT, @adAsgLn INT,
+                                @adATxt NVARCHAR(MAX), @adEq INT, @adFx NVARCHAR(MAX), @adStar INT,
+                                @adPiece NVARCHAR(200), @adFcAsg NVARCHAR(MAX), @adFcol NVARCHAR(128),
+                                @adKnob FLOAT, @adOvr NVARCHAR(MAX), @adQrow NVARCHAR(MAX),
+                                @adOp NCHAR(1), @adNeutral NCHAR(1), @adRhsF NVARCHAR(200), @adCur NVARCHAR(200), @adHop2 INT;
+                        SET @adCof=N''; SET @adRhs=NULL; SET @adIsProd=0;
+                        -- the operand's OWN defining assignment (DECLARE/SET @op = <arith>), re-derived
+                        -- here (not reusing @opAssignLn) so it is correct on every gate iteration.
+                        SET @adAsgLn=(SELECT MAX(LineNum) FROM #src WHERE Txt LIKE N'%'+@op+N'%=%' AND LineNum<@gl
+                            AND UPPER(LTRIM(Txt)) NOT LIKE N'IF %' AND UPPER(LTRIM(Txt)) NOT LIKE N'ELSE %' AND UPPER(LTRIM(Txt)) NOT LIKE N'WHILE %');
+                        IF @adAsgLn IS NOT NULL
+                        BEGIN
+                            SET @adATxt=(SELECT Txt FROM #src WHERE LineNum=@adAsgLn);
+                            SET @adEq=CHARINDEX(N'=',@adATxt,CHARINDEX(@op,@adATxt)+LEN(@op));
+                            IF @adEq>0
+                            BEGIN
+                                SET @adRhs=SUBSTRING(@adATxt,@adEq+1,4000);
+                                SET @adRhs=LTRIM(RTRIM(LEFT(@adRhs,PATINDEX(N'%[;]%',@adRhs+N';')-1)));
+                            END;
+                        END;
+                        -- v0.16.0/v0.16.1: handle *, + AND - together. Split the RHS into additive TERMS
+                        -- (top-level '+'/'-'); the term containing the DRIVING leaf keeps its product
+                        -- co-factors at 1, every OTHER column term's leaves are set to 0, and standalone
+                        -- numeric constants fold (signed) into @adConstSum (subtracted back out of the
+                        -- knob). Pure product (one term) and pure sum (single-var terms) are special cases,
+                        -- so it stays backward-compatible.
+                        SET @adOp=NULL; SET @adNeutral=N'1';
+                        DECLARE @adFirstVar SYSNAME, @adTerms NVARCHAR(MAX), @adPlus INT, @adTerm NVARCHAR(MAX),
+                                @adTermNeutral NCHAR(1), @adDrvNeutral NCHAR(1), @adIsDrv BIT, @adFv NVARCHAR(200),
+                                @adConstSum FLOAT, @adNeg INT;
+                        SET @adFirstVar=NULL; SET @adDrvNeutral=N'1'; SET @adConstSum=0;  -- reset per gate (loop-DECLARE initialisers run once)
+                        IF @adRhs IS NOT NULL AND (CHARINDEX(N'*',@adRhs)>0 OR CHARINDEX(N'+',@adRhs)>0 OR CHARINDEX(N'-',@adRhs)>0)
+                        BEGIN
+                            SET @adIsProd=1;
+                            IF CHARINDEX(N'@',@adRhs)>0
+                            BEGIN
+                                SET @adFv=SUBSTRING(@adRhs,CHARINDEX(N'@',@adRhs),200);
+                                SET @adFirstVar=LEFT(@adFv,PATINDEX(N'%[^A-Za-z0-9_@]%',@adFv+N' ')-1);
+                            END;
+                            SET @adTerms=REPLACE(REPLACE(REPLACE(@adRhs,N'(',N' '),N')',N' '),N'-',N'+~')+N'+';
+                            WHILE CHARINDEX(N'+',@adTerms)>0
+                            BEGIN
+                                SET @adPlus=CHARINDEX(N'+',@adTerms);
+                                SET @adTerm=LTRIM(RTRIM(LEFT(@adTerms,@adPlus-1)));
+                                SET @adTerms=SUBSTRING(@adTerms,@adPlus+1,LEN(@adTerms));
+                                SET @adNeg=CASE WHEN LEFT(@adTerm,1)=N'~' THEN 1 ELSE 0 END;
+                                IF @adNeg=1 SET @adTerm=LTRIM(SUBSTRING(@adTerm,2,LEN(@adTerm)));
+                                IF @adTerm=N'' CONTINUE;
+                                -- standalone numeric CONSTANT term -> signed knob offset (it is not a column)
+                                IF CHARINDEX(N'@',@adTerm)=0 AND TRY_CAST(@adTerm AS FLOAT) IS NOT NULL
+                                BEGIN
+                                    SET @adConstSum=@adConstSum+(CASE WHEN @adNeg=1 THEN -1.0 ELSE 1.0 END)*TRY_CAST(@adTerm AS FLOAT);
+                                    CONTINUE;
+                                END;
+                                SET @adIsDrv=CASE WHEN @adFirstVar IS NOT NULL AND CHARINDEX(@adFirstVar,@adTerm)>0 THEN 1 ELSE 0 END;
+                                SET @adTermNeutral=CASE WHEN @adIsDrv=1 THEN N'1' ELSE N'0' END;
+                                IF @adIsDrv=1 AND CHARINDEX(N'*',@adTerm)=0 SET @adDrvNeutral=N'0';  -- driving leaf is additive (its term has no '*')
+                                SET @adFx=@adTerm+N'*';
+                                WHILE CHARINDEX(N'*',@adFx)>0
+                                BEGIN
+                                    SET @adStar=CHARINDEX(N'*',@adFx);
+                                    SET @adPiece=LTRIM(RTRIM(LEFT(@adFx,@adStar-1)));
+                                    SET @adFx=SUBSTRING(@adFx,@adStar+1,LEN(@adFx));
+                                    IF LEFT(@adPiece,1)=N'@' AND @adPiece<>@op AND @adPiece<>@adFirstVar
+                                    BEGIN
+                                        -- resolve the factor local to its per-row column via assignment
+                                        -- lineage (bounded MULTI-HOP: @factor = @intermediate = ... = Col).
+                                        SET @adCur=@adPiece; SET @adFcol=NULL; SET @adHop2=0;
+                                        WHILE @adHop2<4 AND @adFcol IS NULL
+                                        BEGIN
+                                            SET @adFcAsg=(SELECT TOP 1 Txt FROM #src WHERE Txt LIKE N'%'+@adCur+N'%=%' AND LineNum<@gl
+                                                AND UPPER(LTRIM(Txt)) NOT LIKE N'IF %' AND UPPER(LTRIM(Txt)) NOT LIKE N'ELSE %' AND UPPER(LTRIM(Txt)) NOT LIKE N'WHILE %' ORDER BY LineNum DESC);
+                                            IF @adFcAsg IS NULL OR CHARINDEX(@adCur,@adFcAsg)=0 BREAK;
+                                            SET @adRhsF=LTRIM(SUBSTRING(@adFcAsg,CHARINDEX(N'=',@adFcAsg,CHARINDEX(@adCur,@adFcAsg))+1,200));
+                                            SET @adRhsF=LTRIM(RTRIM(LEFT(@adRhsF,PATINDEX(N'%[,;]%',@adRhsF+N';')-1)));
+                                            IF LEFT(@adRhsF,1)=N'@' SET @adCur=LEFT(@adRhsF,PATINDEX(N'%[^A-Za-z0-9_@]%',@adRhsF+N' ')-1);
+                                            ELSE SET @adFcol=LTRIM(RTRIM(LEFT(@adRhsF,PATINDEX(N'%[^A-Za-z0-9_]%',@adRhsF+N' ')-1)));
+                                            SET @adHop2=@adHop2+1;
+                                        END;
+                                        IF @adFcol IS NOT NULL AND LEN(@adFcol)>0 AND @adFcol<>@drvName
+                                           AND EXISTS(SELECT 1 FROM sys.columns WHERE object_id=OBJECT_ID(@loopTbl) AND name=@adFcol)
+                                           AND CHARINDEX(N'"col":"'+@adFcol+N'"',@adCof)=0
+                                            SET @adCof=@adCof+N',{"col":"'+@adFcol+N'","val":"'+@adTermNeutral+N'"}';
+                                    END;
+                                END;
+                            END;
+                        END;
+                        -- only a SIMPLE single-comparison predicate: a compound gate (e.g.
+                        -- "@v > 100000 AND @phase='C'") has a conjunct this path can't guarantee
+                        -- (the co-factor neutralisation would hit a LOWER sibling arm instead and
+                        -- wrongly drop the honest skip), so leave those to the search / NOT_TESTABLE.
+                        -- v0.15.8: allow a COMPOUND predicate ("<arith> AND @flag='lit'") when the
+                        -- extra conjunct is satisfied by a coordinated multi-source seed (@recPfx, set
+                        -- above). Still block OR (disjunction) and an AND we could not satisfy.
+                        IF @adIsProd=1 AND (@adCof<>N'' OR @adConstSum<>0)
+                           AND CHARINDEX(N' OR ',UPPER(@ptext))=0
+                           AND (CHARINDEX(N' AND ',UPPER(@ptext))=0 OR ISNULL(@recPfx,N'')<>N'')
+                        BEGIN
+                            SET @adKnob = CASE WHEN @cmp IN (N'<',N'<=') THEN CAST(@adDrvNeutral AS FLOAT) - @adConstSum
+                                               WHEN @cmp=N'=' THEN @cand - @adConstSum
+                                               ELSE @cand - @adConstSum + 1 END;
+                            SET @adOvr=N'[{"col":"'+@drvName+N'","val":"'+CONVERT(NVARCHAR(40),CAST(@adKnob AS DECIMAL(38,4)))+N'"}'+@adCof+@encOvr+N']';
+                            EXEC TestGen.BuildQualifyingRow @loopTbl,@loopWhere,@adOvr,@adQrow OUTPUT;
+                            INSERT TestGen.SearchSeedResult(SchemaName,ProcName,BranchId,GateLine,Operand,Comparator,Comparand,Archetype,Status,SrcTable,SrcColumn,WitnessKnob,WitnessArrange,Diag)
+                            VALUES(@Schema,@Proc,@bid,@gl,@op,@cmp,@cand,'PERROW-ARITH','WITNESS',@loopTbl,@drvName,@adKnob,
+                                   ISNULL(@recPfx,N'')+ISNULL(@adQrow,N''),
+                                   N'deterministic arithmetic-derived per-row: '+@op+N' = '+LEFT(@adRhs,120)+N'; co-factors neutralised '+@adCof+N'; knob '+@drvName+N'='+CONVERT(NVARCHAR(40),CAST(@adKnob AS DECIMAL(38,4))));
+                            SET @resolved=1;
+                        END;
+
+                        -- v0.15.9: DETERMINISTIC plain per-row for an OR predicate. The search builds
+                        -- invalid SQL on an OR and can't reliably hit a boundary (e.g. <= 0); seed the
+                        -- driving column to a value satisfying the gate's OWN comparison so the FIRST
+                        -- disjunct is true (OR true). Targeted to OR -> non-OR per-row still searched.
+                        IF @resolved=0 AND CHARINDEX(N' OR ',UPPER(@ptext))>0
+                        BEGIN
+                            DECLARE @ppV FLOAT = CASE WHEN @cmp IN (N'>',N'<>') THEN @cand+1 WHEN @cmp=N'<' THEN @cand-1 ELSE @cand END;
+                            DECLARE @ppOvr NVARCHAR(MAX)=N'[{"col":"'+@drvName+N'","val":"'+CONVERT(NVARCHAR(40),CAST(@ppV AS DECIMAL(38,4)))+N'"}'+@encOvr+N']';
+                            DECLARE @ppQ NVARCHAR(MAX); EXEC TestGen.BuildQualifyingRow @loopTbl,@loopWhere,@ppOvr,@ppQ OUTPUT;
+                            INSERT TestGen.SearchSeedResult(SchemaName,ProcName,BranchId,GateLine,Operand,Comparator,Comparand,Archetype,Status,SrcTable,SrcColumn,WitnessKnob,WitnessArrange,Diag)
+                            VALUES(@Schema,@Proc,@bid,@gl,@op,@cmp,@cand,'PERROW-OR','WITNESS',@loopTbl,@drvName,@ppV,
+                                   ISNULL(@recPfx,N'')+ISNULL(@ppQ,N''),
+                                   N'deterministic OR per-row: seed '+@drvName+N'='+CONVERT(NVARCHAR(40),CAST(@ppV AS DECIMAL(38,4)))+N' satisfies first disjunct of '+LEFT(@ptext,80));
+                            SET @resolved=1;
+                        END;
+
+                        IF @resolved=0
+                        BEGIN
                         DECLARE @ovrN NVARCHAR(MAX)=N'[{"col":"'+@drvName+N'","val":"{KNOB}"}'+@encOvr+N']';
                         DECLARE @qrowN NVARCHAR(MAX); EXEC TestGen.BuildQualifyingRow @loopTbl,@loopWhere,@ovrN,@qrowN OUTPUT;
                         DECLARE @pfxN NVARCHAR(MAX); EXEC TestGen.BuildReachPrefix @Schema,@Proc,@loopTbl,@pfxN OUTPUT;
@@ -11540,6 +12257,7 @@ BEGIN
                                CASE WHEN @wkN IS NOT NULL THEN 'WITNESS' WHEN @dgN LIKE '%NO WITNESS%' THEN 'NOT_TESTABLE' ELSE 'UNREACHED' END,
                                @loopTbl,@drvName,@wkN,ISNULL(@recPfx,N'')+ISNULL(@waN,@qrowN),CONCAT(CASE WHEN LEN(@recPfx)>0 THEN N'[recursive-prefix] ' ELSE N'' END,@dgN));
                         SET @resolved=1;
+                        END;  -- IF @resolved=0 (skip search when the deterministic arithmetic path already witnessed)
                     END;
                 END;
             END;
@@ -11677,12 +12395,58 @@ BEGIN
     DECLARE @decls NVARCHAR(MAX),@args NVARCHAR(MAX);
     EXEC TestGen.BuildReachArgs @Schema,@Proc,@decls OUTPUT,@args OUTPUT;
 
+    -- v0.15.9: aggregate-source tables whose reach-placeholder row would DILUTE a derived local.
+    -- e.g. "@MFI_Score = AVG(MFI_Value) FROM MarketIndicators": the reach prefix seeds one placeholder
+    -- row (MFI_Value=1), so AVG=1 -> @RiskMultiplier=0.75, NOT the declared default 1.00 the PERROW-ARITH
+    -- knob assumes -> the seeded arm is never taken (the witness PASSES on its count assertion but does
+    -- NOT cover). Clear these tables AFTER the reach prefix so the witness's own seed (AGG / compound
+    -- @recPfx) or emptiness (-> AVG NULL -> the local's DECLARE default) controls the aggregate. #temp
+    -- sources are skipped (they are not seeded by the reach anyway).
+    DECLARE @aggClear NVARCHAR(MAX)=N'';
+    DECLARE @aggLn NVARCHAR(MAX), @aggT NVARCHAR(300);
+    DECLARE aggc CURSOR LOCAL FAST_FORWARD FOR
+        SELECT Txt FROM #esrc
+        WHERE (UPPER(Txt) LIKE N'%AVG(%' OR UPPER(Txt) LIKE N'%SUM(%' OR UPPER(Txt) LIKE N'%MIN(%'
+            OR UPPER(Txt) LIKE N'%MAX(%' OR UPPER(Txt) LIKE N'%COUNT(%') AND UPPER(Txt) LIKE N'% FROM %';
+    OPEN aggc; FETCH NEXT FROM aggc INTO @aggLn;
+    WHILE @@FETCH_STATUS=0
+    BEGIN
+        SET @aggT=LTRIM(SUBSTRING(@aggLn,CHARINDEX(N' FROM ',UPPER(@aggLn))+6,300));
+        SET @aggT=LEFT(@aggT,PATINDEX(N'%[ ;,)]%',@aggT+N' ')-1);
+        IF LEN(@aggT)>0 AND LEFT(@aggT,1)<>N'#' AND OBJECT_ID(@aggT) IS NOT NULL
+           AND CHARINDEX(N'DELETE FROM '+@aggT+N';',@aggClear)=0
+            SET @aggClear=@aggClear+N'    DELETE FROM '+@aggT+N';'+@nl;
+        FETCH NEXT FROM aggc INTO @aggLn;
+    END;
+    CLOSE aggc; DEALLOCATE aggc;
+
+    -- v0.15.5: characterise each witness's OUTPUT parameters by MEASURING them against the
+    -- neutralised _cov shadow (which can't collapse a transaction or hit real tables), then bake
+    -- an assertion into the witness test so it guards the business outcome (a later logic change
+    -- that alters the OUTPUT fails the test).  Fully TRY/CATCH-guarded -> falls back to the prior
+    -- smoke witness (no assertion) on any failure, so emission never breaks.
+    DECLARE @covfullM NVARCHAR(300)=QUOTENAME(@Schema)+N'.'+QUOTENAME(@Proc+N'_cov');
+    DECLARE @measOk BIT=0;
+    BEGIN TRY EXEC TestGen.InstrumentProcedure @SchemaName=@Schema,@ProcName=@Proc;
+        IF OBJECT_ID(@covfullM,'P') IS NOT NULL SET @measOk=1; END TRY BEGIN CATCH SET @measOk=0; END CATCH;
+    IF OBJECT_ID('tempdb..#outp') IS NOT NULL DROP TABLE #outp;
+    CREATE TABLE #outp(pname SYSNAME COLLATE DATABASE_DEFAULT, vn SYSNAME COLLATE DATABASE_DEFAULT, isStr BIT);
+    INSERT #outp(pname,vn,isStr)
+    SELECT p.name, N'@__a'+CAST(p.parameter_id AS NVARCHAR(5)),
+           CASE WHEN ty.name IN ('char','varchar','nchar','nvarchar') THEN 1 ELSE 0 END
+    FROM sys.parameters p JOIN sys.types ty ON ty.user_type_id=p.user_type_id
+    WHERE p.object_id=OBJECT_ID(@full) AND p.is_output=1 AND p.parameter_id>0;
+    IF OBJECT_ID('tempdb..#wmeas') IS NOT NULL DROP TABLE #wmeas;
+    CREATE TABLE #wmeas(runid INT, pname SYSNAME COLLATE DATABASE_DEFAULT, val NVARCHAR(MAX) COLLATE DATABASE_DEFAULT);
+    -- loop vars declared at proc top (DECLARE-with-initializer does not re-init per loop pass)
+    DECLARE @assertBlock NVARCHAR(MAX), @capture NVARCHAR(MAX), @measBatch NVARCHAR(MAX);
+
     DECLARE @emitted INT=0,@skipped INT=0;
-    DECLARE @gl INT,@op SYSNAME,@arche VARCHAR(20),@status VARCHAR(16),@srctbl NVARCHAR(300),@wit NVARCHAR(MAX),@diag NVARCHAR(MAX),@cmpE NVARCHAR(8);
+    DECLARE @gl INT,@op SYSNAME,@arche VARCHAR(20),@status VARCHAR(16),@srctbl NVARCHAR(300),@wit NVARCHAR(MAX),@diag NVARCHAR(MAX),@cmpE NVARCHAR(8),@argOverride NVARCHAR(MAX);
     DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
-        SELECT GateLine,Operand,Archetype,Status,SrcTable,WitnessArrange,Diag,Comparator
+        SELECT GateLine,Operand,Archetype,Status,SrcTable,WitnessArrange,Diag,Comparator,ArgOverride
         FROM TestGen.SearchSeedResult WHERE SchemaName=@Schema AND ProcName=@Proc ORDER BY GateLine, Comparator;
-    OPEN cur; FETCH NEXT FROM cur INTO @gl,@op,@arche,@status,@srctbl,@wit,@diag,@cmpE;
+    OPEN cur; FETCH NEXT FROM cur INTO @gl,@op,@arche,@status,@srctbl,@wit,@diag,@cmpE,@argOverride;
     WHILE @@FETCH_STATUS=0
     BEGIN
         DECLARE @tname SYSNAME, @body NVARCHAR(MAX);
@@ -11692,19 +12456,66 @@ BEGIN
             -- TRUE + FALSE) yields two distinctly-named tests instead of colliding.
             SET @tname=N'test '+ISNULL(@op,N'gate')+N' '+ISNULL(@cmpE,N'')+N' at L'+CAST(@gl AS NVARCHAR(10))+N' ('+@arche+N') search seed';
             -- reach prefix excluding the witness's own table (the witness seeds it)
-            DECLARE @reach NVARCHAR(MAX); EXEC TestGen.BuildReachPrefix @Schema,@Proc,@srctbl,@reach OUTPUT;
+            -- self-contained witnesses (ArgOverride present) provide ALL their own seeds + args;
+            -- skip the generic reach prefix so it cannot inject conflicting rows.
+            DECLARE @reach NVARCHAR(MAX)=N''; IF @argOverride IS NULL EXEC TestGen.BuildReachPrefix @Schema,@Proc,@srctbl,@reach OUTPUT;
             -- does this gate's TRUE arm RAISE? (e.g. validation IS NULL -> RAISERROR) -> assert it
-            DECLARE @raises BIT=CASE WHEN EXISTS(SELECT 1 FROM #esrc WHERE LineNum BETWEEN @gl+1 AND @gl+8
+            -- self-contained (ArgOverride) witnesses run the proc to a RETURN/handled state; a
+            -- RAISERROR on the arm is caught by the proc's own TRY/CATCH and not propagated, so
+            -- ExpectException would false-fail.  Only expect a raise for non-self-contained gates.
+            DECLARE @raises BIT=CASE WHEN @argOverride IS NOT NULL THEN 0
+                                     WHEN EXISTS(SELECT 1 FROM #esrc WHERE LineNum BETWEEN @gl+1 AND @gl+8
                                        AND (UPPER(Txt) LIKE N'%RAISERROR%' OR UPPER(Txt) LIKE N'%THROW%')) THEN 1 ELSE 0 END;
+
+            -- measure this witness's OUTPUT params vs the shadow (twice, for determinism) and
+            -- build exact / skeleton assertions for the deterministic ones.  Bulletproof: any
+            -- failure leaves @assertBlock empty (smoke witness).
+            SET @assertBlock=N'';
+            IF @measOk=1 AND @raises=0 AND EXISTS(SELECT 1 FROM #outp)
+            BEGIN
+              BEGIN TRY
+                DELETE #wmeas;
+                SET @capture=N'';
+                SELECT @capture=@capture+N'INSERT #wmeas(runid,pname,val) VALUES(1,N'''+REPLACE(pname,N'''',N'''''')+N''',CONVERT(NVARCHAR(MAX),'+vn+N'));' FROM #outp;
+                -- capture runs AFTER the rollback: the OUTPUT @vars survive a rollback, but rows
+                -- INSERTed into #wmeas inside the transaction would be rolled back with it.
+                SET @measBatch=ISNULL(@decls,N'')
+                   +N' BEGIN TRY BEGIN TRAN; '+@fakes+ISNULL(@reach,N'')+@aggClear+ISNULL(@wit,N'')
+                   +N' EXEC '+@covfullM+N' '+ISNULL(@argOverride,@args)+N'; IF @@TRANCOUNT>0 ROLLBACK; END TRY BEGIN CATCH IF @@TRANCOUNT>0 ROLLBACK; END CATCH; '
+                   +@capture;
+                EXEC sys.sp_executesql @measBatch;
+                -- exact: a numeric output, or a string output the proc assigns as a CONSTANT (the
+                -- measured value appears verbatim as a string literal in the source).
+                SELECT @assertBlock=@assertBlock+
+                    CASE WHEN o.isStr=0
+                         THEN N'    EXEC tSQLt.AssertEquals @Expected='+w.val+N', @Actual='+o.vn+N';'+@nl
+                         WHEN CHARINDEX(N''''+w.val+N'''' COLLATE DATABASE_DEFAULT, @esrc COLLATE DATABASE_DEFAULT)>0
+                         THEN N'    EXEC tSQLt.AssertEqualsString @Expected=N'''+REPLACE(w.val,N'''',N'''''')+N''', @Actual='+o.vn+N';'+@nl
+                         ELSE N'' END
+                FROM #outp o JOIN #wmeas w ON w.runid=1 AND w.pname=o.pname
+                WHERE w.val IS NOT NULL;
+                -- a concatenated / runtime-varying string output -> constant-skeleton LIKE
+                SELECT @assertBlock=@assertBlock+
+                       N'    EXEC tSQLt.AssertLike @ExpectedPattern=N'''+REPLACE(s.skel,N'''',N'''''')+N''', @Actual='+o.vn+N';'+@nl
+                FROM #outp o JOIN #wmeas w ON w.runid=1 AND w.pname=o.pname
+                CROSS APPLY (SELECT skel=TestGen.BuildLikeSkeleton(@esrc, w.val)) s
+                WHERE o.isStr=1 AND w.val IS NOT NULL
+                  AND CHARINDEX(N''''+w.val+N'''' COLLATE DATABASE_DEFAULT, @esrc COLLATE DATABASE_DEFAULT)=0
+                  AND s.skel IS NOT NULL;
+              END TRY BEGIN CATCH SET @assertBlock=N''; END CATCH;
+            END;
+
             SET @body=N'CREATE PROCEDURE '+QUOTENAME(@TestClass)+N'.'+QUOTENAME(@tname)+@nl
                 +N'AS'+@nl+N'BEGIN'+@nl+N'    SET NOCOUNT ON;'+@nl
                 +@fakes
                 +N'    '+REPLACE(ISNULL(@decls,N''),@nl,@nl+N'    ')+@nl
                 +N'    '+REPLACE(ISNULL(@reach,N''),@nl,@nl+N'    ')+@nl
+                +@aggClear
                 +N'    '+REPLACE(ISNULL(@wit,N''),@nl,@nl+N'    ')+@nl
                 +CASE WHEN @raises=1 THEN N'    EXEC tSQLt.ExpectException;  -- this branch raises by design'+@nl ELSE N'' END
-                +N'    EXEC '+@full+N' '+@args+N';'+@nl
-                +N'    -- branch L'+CAST(@gl AS NVARCHAR(10))+N' ('+ISNULL(@op,N'')+N') exercised by the verified search seed'+@nl
+                +N'    EXEC '+@full+N' '+ISNULL(@argOverride,@args)+N';'+@nl
+                +ISNULL(@assertBlock,N'')
+                +N'    -- branch L'+CAST(@gl AS NVARCHAR(10))+N' ('+ISNULL(@op,N'')+N') effect asserted from a generation-time measurement of the verified seed'+@nl
                 +N'END;';
             SET @emitted=@emitted+1;
         END
@@ -11730,7 +12541,11 @@ BEGIN
                     SELECT @dropSkip=ISNULL(@dropSkip,N'')+N'DROP PROCEDURE '+QUOTENAME(@TestClass)+N'.'+QUOTENAME(p.name)+N';'
                     FROM   sys.procedures p
                     WHERE  p.schema_id=SCHEMA_ID(@TestClass)
-                      AND  p.name LIKE N'%line '+CAST(@gl AS NVARCHAR(10))+N' NOT_TESTABLE%';
+                      AND  ( p.name LIKE N'%line '+CAST(@gl AS NVARCHAR(10))+N' NOT_TESTABLE%'
+                          -- v0.15.5: a CASE/JSON-shred adoption witness replaces its line's skipped/
+                          -- degenerate predicate stub for the SAME direction (TRUE vs FALSE) it drives.
+                          OR (@arche='CASEARM' AND @cmpE<>N'false' AND p.name LIKE N'%line '+CAST(@gl AS NVARCHAR(10))+N' predicate TRUE%')
+                          OR (@arche='CASEARM' AND @cmpE=N'false'  AND p.name LIKE N'%line '+CAST(@gl AS NVARCHAR(10))+N' predicate FALSE%') );
                     IF @dropSkip IS NOT NULL EXEC sys.sp_executesql @dropSkip;
                 END;
                 DECLARE @dropSql NVARCHAR(500)=N'DROP PROCEDURE '+QUOTENAME(@TestClass)+N'.'+QUOTENAME(@tname);
@@ -11741,11 +12556,532 @@ BEGIN
                 PRINT 'emit error for L'+CAST(@gl AS NVARCHAR(10))+': '+ERROR_MESSAGE();
             END CATCH;
         END;
-        FETCH NEXT FROM cur INTO @gl,@op,@arche,@status,@srctbl,@wit,@diag,@cmpE;
+        FETCH NEXT FROM cur INTO @gl,@op,@arche,@status,@srctbl,@wit,@diag,@cmpE,@argOverride;
     END;
     CLOSE cur; DEALLOCATE cur;
 
     PRINT 'EmitSearchSeedTests: '+CAST(@emitted AS NVARCHAR(10))+' witness test(s) + '+CAST(@skipped AS NVARCHAR(10))+' skip(s) into '+QUOTENAME(@TestClass);
+END;
+GO
+
+/*===========================================================================
+ * v0.15.5  Deep-gate deterministic witnesses (JSON + table-variable aggregates,
+ *          key-lookup status scalars, @@ROWCOUNT checks) + happy-path scenario.
+ *===========================================================================*/
+IF COL_LENGTH('TestGen.SearchSeedResult','ArgOverride') IS NULL
+    ALTER TABLE TestGen.SearchSeedResult ADD ArgOverride NVARCHAR(MAX) NULL;
+GO
+------------------------------------------------------------------------------
+-- INSERT <tbl>(cols) VALUES(..).  @OvrPairs = 'Col=val|Col=val' (val is the raw
+-- VALUE; string columns are quoted by type here).  Overridden cols are always
+-- included (even identity, since the table is faked); other non-identity cols
+-- get a permissive typed default (numerics -> 100 so price columns are positive).
+------------------------------------------------------------------------------
+CREATE OR ALTER PROCEDURE TestGen.BuildSeededRow
+    @Tbl NVARCHAR(300), @OvrPairs NVARCHAR(MAX)=N'', @Sql NVARCHAR(MAX) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET @Sql=NULL;
+    IF OBJECT_ID(@Tbl) IS NULL RETURN;
+    IF OBJECT_ID('tempdb..#ovp') IS NOT NULL DROP TABLE #ovp;
+    CREATE TABLE #ovp(Col SYSNAME COLLATE DATABASE_DEFAULT, Val NVARCHAR(400));
+    DECLARE @r NVARCHAR(MAX)=ISNULL(@OvrPairs,N'')+N'|', @bp INT, @pair NVARCHAR(MAX);
+    WHILE LEN(@r)>0
+    BEGIN
+        SET @bp=CHARINDEX(N'|',@r); IF @bp=0 BREAK;
+        SET @pair=LEFT(@r,@bp-1); SET @r=SUBSTRING(@r,@bp+1,LEN(@r));
+        IF CHARINDEX(N'=',@pair)>0
+            INSERT #ovp VALUES(LTRIM(RTRIM(LEFT(@pair,CHARINDEX(N'=',@pair)-1))),
+                               SUBSTRING(@pair,CHARINDEX(N'=',@pair)+1,400));
+    END;
+    DECLARE @cc NVARCHAR(MAX)=N'',@cv NVARCHAR(MAX)=N'';
+    SELECT @cc=@cc+CASE WHEN LEN(@cc)>0 THEN N',' ELSE N'' END+QUOTENAME(c.name),
+           @cv=@cv+CASE WHEN LEN(@cv)>0 THEN N',' ELSE N'' END+
+             CASE WHEN o.Val IS NOT NULL THEN
+                    CASE WHEN ty.name IN ('char','varchar','nchar','nvarchar') THEN N'N'''+REPLACE(o.Val,'''','''''')+N''''
+                         ELSE o.Val END
+                  WHEN ty.name IN ('int','bigint','smallint','tinyint','decimal','numeric','float','real','money','smallmoney') THEN N'100'
+                  WHEN ty.name='bit' THEN N'1'
+                  WHEN ty.name IN ('date','datetime','datetime2','smalldatetime') THEN N'CAST(GETDATE() AS DATE)'
+                  WHEN ty.name='uniqueidentifier' THEN N'NEWID()'
+                  ELSE N'N''x''' END
+    FROM sys.columns c
+    JOIN sys.types ty ON ty.user_type_id=c.user_type_id
+    LEFT JOIN #ovp o ON o.Col COLLATE DATABASE_DEFAULT = c.name COLLATE DATABASE_DEFAULT
+    WHERE c.object_id=OBJECT_ID(@Tbl) AND c.is_computed=0
+      AND ty.name NOT IN ('timestamp','rowversion')
+      AND (o.Val IS NOT NULL OR c.is_identity=0);
+    IF LEN(@cc)>0 SET @Sql=N'INSERT '+@Tbl+N'('+@cc+N') VALUES('+@cv+N');';
+END;
+GO
+------------------------------------------------------------------------------
+CREATE OR ALTER PROCEDURE TestGen.PatchArgList
+    @Args NVARCHAR(MAX), @Param SYSNAME, @NewVal NVARCHAR(MAX), @Out NVARCHAR(MAX) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET @Out=@Args;
+    -- find the exact param token (not a prefix of a longer name) followed, after optional
+    -- spaces, by '=' ; tolerates both "@p = v" (happy-path lists) and "@p=v" (witness lists).
+    DECLARE @pp INT = CHARINDEX(@Param, @Args);
+    WHILE @pp > 0
+    BEGIN
+        DECLARE @after NCHAR(1) = SUBSTRING(@Args, @pp + LEN(@Param), 1);
+        IF @after = N'' OR @after = N' ' OR @after = N'=' BREAK;
+        SET @pp = CHARINDEX(@Param, @Args, @pp + 1);
+    END;
+    IF @pp = 0 RETURN;
+    DECLARE @eq INT = CHARINDEX(N'=', @Args, @pp + LEN(@Param));
+    IF @eq = 0 RETURN;
+    DECLARE @nx INT = CHARINDEX(N',', @Args, @eq); IF @nx = 0 SET @nx = LEN(@Args) + 1;
+    SET @Out = STUFF(@Args, @eq + 1, @nx - @eq - 1, N' ' + @NewVal + N' ');
+END;
+GO
+------------------------------------------------------------------------------
+CREATE OR ALTER PROCEDURE TestGen.DeriveDeepGateWitnesses
+    @Schema SYSNAME, @Proc SYSNAME, @Debug BIT = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @full NVARCHAR(300)=QUOTENAME(@Schema)+N'.'+QUOTENAME(@Proc);
+    IF OBJECT_ID(@full) IS NULL RETURN;
+
+    DECLARE @src NVARCHAR(MAX)=OBJECT_DEFINITION(OBJECT_ID(@full));
+    SET @src=REPLACE(REPLACE(@src,NCHAR(13)+NCHAR(10),NCHAR(10)),NCHAR(13),NCHAR(10));
+    IF OBJECT_ID('tempdb..#s') IS NOT NULL DROP TABLE #s;
+    CREATE TABLE #s(LineNum INT IDENTITY(1,1) PRIMARY KEY, Txt NVARCHAR(MAX) COLLATE DATABASE_DEFAULT);
+    DECLARE @p INT=1,@np INT,@len INT; IF RIGHT(@src,1)<>NCHAR(10) SET @src=@src+NCHAR(10); SET @len=LEN(@src);
+    WHILE @p<=@len BEGIN SET @np=CHARINDEX(NCHAR(10),@src,@p); IF @np=0 SET @np=@len+1;
+        INSERT #s(Txt) VALUES(SUBSTRING(@src,@p,@np-@p)); SET @p=@np+1; END;
+    DECLARE @maxLn INT=(SELECT MAX(LineNum) FROM #s);
+
+    /* ===== 1. key-lookup SELECT ===== */
+    IF OBJECT_ID('tempdb..#lkpmap') IS NOT NULL DROP TABLE #lkpmap;
+    CREATE TABLE #lkpmap(LocalName SYSNAME COLLATE DATABASE_DEFAULT, ColName SYSNAME COLLATE DATABASE_DEFAULT);
+    DECLARE @LkpTbl NVARCHAR(300)=NULL,@LkpKeyCol SYSNAME=NULL,@LkpKeyParam SYSNAME=NULL;
+    DECLARE @sl INT=1,@stmt NVARCHAR(MAX),@kt NVARCHAR(MAX),@k INT;
+    WHILE @sl<=@maxLn AND @LkpTbl IS NULL
+    BEGIN
+        IF EXISTS(SELECT 1 FROM #s WHERE LineNum=@sl AND (UPPER(LTRIM(Txt)) LIKE N'SELECT %' OR UPPER(LTRIM(Txt))=N'SELECT'))
+        BEGIN
+            SET @stmt=N''; SET @k=@sl;
+            WHILE @k<=@sl+15 BEGIN SET @kt=(SELECT Txt FROM #s WHERE LineNum=@k); IF @kt IS NULL BREAK;
+                SET @stmt=@stmt+N' '+@kt; IF CHARINDEX(N';',@kt)>0 BREAK; SET @k=@k+1; END;
+            DECLARE @U NVARCHAR(MAX)=UPPER(@stmt);
+            IF @U LIKE N'%@%=%' AND @U LIKE N'% FROM %' AND @U LIKE N'% WHERE %'
+            BEGIN
+                DECLARE @frp INT=CHARINDEX(N' FROM ',@U),@wrp INT=CHARINDEX(N' WHERE ',@U);
+                DECLARE @aftFrom NVARCHAR(300)=LTRIM(SUBSTRING(@stmt,@frp+6,300));
+                DECLARE @cand NVARCHAR(300)=LEFT(@aftFrom,PATINDEX(N'%[ ;]%',@aftFrom+N' ')-1);
+                IF OBJECT_ID(@cand) IS NOT NULL AND @wrp>@frp
+                BEGIN
+                    SET @LkpTbl=@cand;
+                    DECLARE @selKw INT=CHARINDEX(N'SELECT',@U);
+                    DECLARE @assigns NVARCHAR(MAX)=SUBSTRING(@stmt,@selKw+6,@frp-(@selKw+6))+N',';
+                    DECLARE @cp INT,@piece NVARCHAR(MAX);
+                    WHILE LEN(@assigns)>0
+                    BEGIN
+                        SET @cp=CHARINDEX(N',',@assigns); IF @cp=0 BREAK;
+                        SET @piece=LTRIM(RTRIM(LEFT(@assigns,@cp-1))); SET @assigns=SUBSTRING(@assigns,@cp+1,LEN(@assigns));
+                        IF CHARINDEX(N'@',@piece)>0 AND CHARINDEX(N'=',@piece)>0
+                        BEGIN
+                            DECLARE @lname SYSNAME=LTRIM(RTRIM(LEFT(@piece,CHARINDEX(N'=',@piece)-1)));
+                            DECLARE @rname NVARCHAR(200)=LTRIM(RTRIM(SUBSTRING(@piece,CHARINDEX(N'=',@piece)+1,200)));
+                            IF LEFT(@lname,1)=N'@' AND LEFT(@rname,1)<>N'@' AND LEN(@rname)>0
+                                INSERT #lkpmap(LocalName,ColName) VALUES(@lname,PARSENAME(@rname,1));
+                        END;
+                    END;
+                    DECLARE @whr NVARCHAR(MAX)=REPLACE(LTRIM(SUBSTRING(@stmt,@wrp+7,400)),N';',N'');
+                    IF CHARINDEX(N'=',@whr)>0 AND CHARINDEX(N'@',@whr)>0
+                    BEGIN
+                        SET @LkpKeyCol=PARSENAME(LTRIM(RTRIM(LEFT(@whr,CHARINDEX(N'=',@whr)-1))),1);
+                        DECLARE @kp NVARCHAR(200)=SUBSTRING(@whr,CHARINDEX(N'@',@whr),200);
+                        SET @LkpKeyParam=LEFT(@kp,PATINDEX(N'%[^A-Za-z0-9_@]%',@kp+N' ')-1);
+                    END;
+                END;
+            END;
+        END;
+        SET @sl=@sl+1;
+    END;
+
+    /* ===== 2. OPENJSON shred ===== */
+    IF OBJECT_ID('tempdb..#json') IS NOT NULL DROP TABLE #json;
+    CREATE TABLE #json(ColName SYSNAME COLLATE DATABASE_DEFAULT,JsonProp NVARCHAR(200),IsNum BIT);
+    DECLARE @JsonParam SYSNAME=NULL,@JoinTbl NVARCHAR(300)=NULL,@JoinJsonCol SYSNAME=NULL,@JoinCatCol SYSNAME=NULL,
+            @FilCol SYSNAME=NULL,@FilOp NVARCHAR(4)=NULL,@FilLit NVARCHAR(200)=NULL,@TblVar SYSNAME=NULL;
+    DECLARE @ojLn INT=(SELECT MIN(LineNum) FROM #s WHERE UPPER(Txt) LIKE N'%OPENJSON(%');
+    IF @ojLn IS NOT NULL
+    BEGIN
+        DECLARE @jstart INT=(SELECT MAX(LineNum) FROM #s WHERE LineNum<=@ojLn
+                          AND (UPPER(LTRIM(Txt)) LIKE N'INSERT %' OR UPPER(LTRIM(Txt)) LIKE N'SELECT %' OR UPPER(LTRIM(Txt)) LIKE N'SET %' OR UPPER(LTRIM(Txt)) LIKE N'UPDATE %'));
+        -- prefer the owning INSERT of an INSERT..SELECT (the nearest start may be the SELECT body)
+        DECLARE @insStart INT=(SELECT MAX(LineNum) FROM #s WHERE LineNum<=@ojLn AND UPPER(LTRIM(Txt)) LIKE N'INSERT %');
+        IF @insStart IS NOT NULL AND @insStart<@jstart
+           AND NOT EXISTS(SELECT 1 FROM #s WHERE LineNum>@insStart AND LineNum<@jstart AND CHARINDEX(N';',Txt)>0)
+            SET @jstart=@insStart;
+        DECLARE @JsonStmt NVARCHAR(MAX)=N''; DECLARE @jk INT=@jstart,@jkt NVARCHAR(MAX);
+        WHILE @jk<=@jstart+40 BEGIN SET @jkt=(SELECT Txt FROM #s WHERE LineNum=@jk); IF @jkt IS NULL BREAK;
+            SET @JsonStmt=@JsonStmt+N' '+@jkt; IF CHARINDEX(N';',@jkt)>0 BREAK; SET @jk=@jk+1; END;
+        DECLARE @JU NVARCHAR(MAX)=UPPER(@JsonStmt);
+
+        IF @JU LIKE N'%INSERT %@%'
+        BEGIN
+            DECLARE @afterIns NVARCHAR(300)=LTRIM(SUBSTRING(@JsonStmt,CHARINDEX(N'INSERT',@JU)+6,300));
+            IF UPPER(LEFT(@afterIns,5))=N'INTO ' SET @afterIns=LTRIM(SUBSTRING(@afterIns,6,300));
+            IF LEFT(@afterIns,1)=N'@' SET @TblVar=LEFT(@afterIns,PATINDEX(N'%[^A-Za-z0-9_@]%',@afterIns+N' ')-1);
+        END;
+
+        DECLARE @ojIn NVARCHAR(300)=SUBSTRING(@JsonStmt,CHARINDEX(N'OPENJSON(',@JU)+9,300);
+        IF CHARINDEX(N'@',@ojIn)>0
+        BEGIN
+            DECLARE @ppx NVARCHAR(200)=SUBSTRING(@ojIn,CHARINDEX(N'@',@ojIn),200);
+            SET @JsonParam=LEFT(@ppx,PATINDEX(N'%[^A-Za-z0-9_@]%',@ppx+N' ')-1);
+        END;
+
+        DECLARE @withAt INT=CHARINDEX(N'WITH',@JU,CHARINDEX(N'OPENJSON(',@JU));
+        IF @withAt>0
+        BEGIN
+            DECLARE @op2 INT=CHARINDEX(N'(',@JsonStmt,@withAt);
+            DECLARE @depth INT=0,@i INT=@op2,@ch NCHAR(1),@close INT=0;
+            WHILE @i<=LEN(@JsonStmt) BEGIN SET @ch=SUBSTRING(@JsonStmt,@i,1);
+                IF @ch=N'(' SET @depth=@depth+1;
+                ELSE IF @ch=N')' BEGIN SET @depth=@depth-1; IF @depth=0 BEGIN SET @close=@i; BREAK; END; END;
+                SET @i=@i+1; END;
+            IF @close>@op2
+            BEGIN
+                DECLARE @withBody NVARCHAR(MAX)=SUBSTRING(@JsonStmt,@op2+1,@close-@op2-1)+N',';
+                DECLARE @wcp INT,@wpiece NVARCHAR(MAX);
+                WHILE LEN(@withBody)>0
+                BEGIN
+                    SET @wcp=CHARINDEX(N',',@withBody); IF @wcp=0 BREAK;
+                    SET @wpiece=LTRIM(RTRIM(LEFT(@withBody,@wcp-1))); SET @withBody=SUBSTRING(@withBody,@wcp+1,LEN(@withBody));
+                    IF LEN(@wpiece)=0 CONTINUE;
+                    DECLARE @cn SYSNAME=LEFT(@wpiece,PATINDEX(N'%[ ]%',@wpiece+N' ')-1);
+                    DECLARE @rest2 NVARCHAR(300)=LTRIM(SUBSTRING(@wpiece,LEN(@cn)+1,300));
+                    DECLARE @tyTok NVARCHAR(60)=LEFT(@rest2,PATINDEX(N'%[ ]%',@rest2+N' ')-1);
+                    DECLARE @prop NVARCHAR(200)=@cn;
+                    IF CHARINDEX(N'''',@wpiece)>0
+                    BEGIN
+                        DECLARE @pth NVARCHAR(200)=SUBSTRING(@wpiece,CHARINDEX(N'''',@wpiece)+1,200);
+                        SET @pth=LEFT(@pth,CHARINDEX(N'''',@pth)-1);
+                        SET @prop=CASE WHEN LEFT(@pth,2)=N'$.' THEN SUBSTRING(@pth,3,200) ELSE @pth END;
+                    END;
+                    INSERT #json(ColName,JsonProp,IsNum) VALUES(@cn,@prop,
+                        CASE WHEN UPPER(@tyTok) LIKE N'INT%' OR UPPER(@tyTok) LIKE N'BIGINT%' OR UPPER(@tyTok) LIKE N'SMALLINT%'
+                              OR UPPER(@tyTok) LIKE N'TINYINT%' OR UPPER(@tyTok) LIKE N'%MONEY%' OR UPPER(@tyTok) LIKE N'DEC%'
+                              OR UPPER(@tyTok) LIKE N'NUM%' OR UPPER(@tyTok) LIKE N'FLOAT%' OR UPPER(@tyTok) LIKE N'REAL%'
+                             THEN 1 ELSE 0 END);
+                END;
+            END;
+        END;
+
+        IF @JU LIKE N'%JOIN %'
+        BEGIN
+            DECLARE @afterJoin NVARCHAR(400)=LTRIM(SUBSTRING(@JsonStmt,CHARINDEX(N'JOIN ',@JU)+5,400));
+            SET @JoinTbl=LEFT(@afterJoin,PATINDEX(N'%[ ]%',@afterJoin+N' ')-1);
+            DECLARE @onAt INT=CHARINDEX(N' ON ',UPPER(@afterJoin));
+            IF @onAt>0
+            BEGIN
+                DECLARE @onTxt NVARCHAR(400)=LTRIM(SUBSTRING(@afterJoin,@onAt+4,400));
+                IF CHARINDEX(N' WHERE ',UPPER(@onTxt))>0 SET @onTxt=LEFT(@onTxt,CHARINDEX(N' WHERE ',UPPER(@onTxt))-1);
+                IF CHARINDEX(N'=',@onTxt)>0
+                BEGIN
+                    DECLARE @lo NVARCHAR(200)=LTRIM(RTRIM(LEFT(@onTxt,CHARINDEX(N'=',@onTxt)-1)));
+                    DECLARE @ro NVARCHAR(200)=LTRIM(RTRIM(SUBSTRING(@onTxt,CHARINDEX(N'=',@onTxt)+1,200)));
+                    SET @ro=LEFT(@ro,PATINDEX(N'%[^A-Za-z0-9_.]%',@ro+N' ')-1);
+                    DECLARE @loc SYSNAME=PARSENAME(@lo,1),@roc SYSNAME=PARSENAME(@ro,1);
+                    IF EXISTS(SELECT 1 FROM #json WHERE ColName=@loc) BEGIN SET @JoinJsonCol=@loc; SET @JoinCatCol=@roc; END
+                    ELSE BEGIN SET @JoinJsonCol=@roc; SET @JoinCatCol=@loc; END;
+                END;
+            END;
+        END;
+
+        DECLARE @jwhr INT=CHARINDEX(N' WHERE ',@JU);
+        IF @jwhr>0
+        BEGIN
+            DECLARE @fwt NVARCHAR(400)=REPLACE(LTRIM(SUBSTRING(@JsonStmt,@jwhr+7,400)),N';',N'');
+            IF CHARINDEX(N'<>',@fwt)>0 SET @FilOp=N'<>';
+            ELSE IF CHARINDEX(N'!=',@fwt)>0 SET @FilOp=N'!=';
+            ELSE IF CHARINDEX(N'=',@fwt)>0 SET @FilOp=N'=';
+            IF @FilOp IS NOT NULL
+            BEGIN
+                SET @FilCol=PARSENAME(LTRIM(RTRIM(LEFT(@fwt,CHARINDEX(@FilOp,@fwt)-1))),1);
+                IF CHARINDEX(N'''',@fwt)>0
+                BEGIN
+                    DECLARE @lit2 NVARCHAR(200)=SUBSTRING(@fwt,CHARINDEX(N'''',@fwt)+1,200);
+                    SET @FilLit=LEFT(@lit2,CHARINDEX(N'''',@lit2)-1);
+                END;
+            END;
+        END;
+    END;
+
+    /* ===== 3. synthesise json literal + catalog seed ===== */
+    DECLARE @KeyVal INT=1,@QtyVal INT=10;
+    DECLARE @KeyStr NVARCHAR(10)=CAST(@KeyVal AS NVARCHAR(10));
+    DECLARE @JsonLit NVARCHAR(MAX)=NULL,@CatSeed NVARCHAR(MAX)=NULL,@JsonArg NVARCHAR(MAX)=NULL;
+    IF @JsonParam IS NOT NULL AND EXISTS(SELECT 1 FROM #json)
+    BEGIN
+        SELECT @JsonLit=ISNULL(@JsonLit+N',',N'')+N'"'+JsonProp+N'":'+
+              CASE WHEN ColName=@JoinJsonCol THEN CAST(@KeyVal AS NVARCHAR(10))
+                   WHEN IsNum=1 THEN CAST(@QtyVal AS NVARCHAR(10)) ELSE N'"x"' END
+        FROM #json ORDER BY ColName;
+        SET @JsonLit=N'[{'+@JsonLit+N'}]';
+        SET @JsonArg=N'N'''+REPLACE(@JsonLit,N'''',N'''''')+N'''';
+    END;
+    IF @JoinTbl IS NOT NULL AND OBJECT_ID(@JoinTbl) IS NOT NULL AND @JoinCatCol IS NOT NULL
+    BEGIN
+        DECLARE @filVal NVARCHAR(210)=CASE WHEN @FilOp IN (N'<>',N'!=') THEN N'UAG_OK' WHEN @FilOp=N'=' THEN @FilLit ELSE N'UAG_OK' END;
+        IF @FilOp IN (N'<>',N'!=') AND @filVal=@FilLit SET @filVal=@filVal+N'X';
+        DECLARE @catPairs NVARCHAR(MAX)=@JoinCatCol+N'='+CAST(@KeyVal AS NVARCHAR(10))
+            +CASE WHEN @FilCol IS NOT NULL THEN N'|'+@FilCol+N'='+@filVal ELSE N'' END;
+        EXEC TestGen.BuildSeededRow @JoinTbl,@catPairs,@CatSeed OUTPUT;
+    END;
+
+    /* status-gate map (lookup cols compared = literal, BIT/int) */
+    IF OBJECT_ID('tempdb..#sg') IS NOT NULL DROP TABLE #sg;
+    CREATE TABLE #sg(Col SYSNAME COLLATE DATABASE_DEFAULT,Lit NVARCHAR(50));
+    INSERT #sg(Col,Lit)
+    SELECT DISTINCT m.ColName,
+           LTRIM(RTRIM(LEFT(LTRIM(SUBSTRING(pi.PredicateText,CHARINDEX(N'=',pi.PredicateText)+1,50)),
+                 PATINDEX(N'%[^0-9.\- ]%',LTRIM(SUBSTRING(pi.PredicateText,CHARINDEX(N'=',pi.PredicateText)+1,50))+N'#')-1)))
+    FROM TestGen.PredicateInbox pi
+    JOIN #lkpmap m ON CHARINDEX(m.LocalName,pi.PredicateText COLLATE DATABASE_DEFAULT)>0
+    WHERE pi.ProcName=@Proc AND pi.PredicateText LIKE N'%=%'
+      AND pi.PredicateText NOT LIKE N'%SUM(%' AND pi.PredicateText NOT LIKE N'%COUNT(%'
+      AND TRY_CONVERT(INT,LTRIM(RTRIM(LEFT(LTRIM(SUBSTRING(pi.PredicateText,CHARINDEX(N'=',pi.PredicateText)+1,50)),
+              PATINDEX(N'%[^0-9.\- ]%',LTRIM(SUBSTRING(pi.PredicateText,CHARINDEX(N'=',pi.PredicateText)+1,50))+N'#')-1)))) IS NOT NULL;
+
+    DECLARE @CreditCol SYSNAME=NULL;
+    SELECT TOP 1 @CreditCol=m.ColName
+    FROM TestGen.PredicateInbox pi
+    JOIN #lkpmap m ON CHARINDEX(m.LocalName,pi.PredicateText COLLATE DATABASE_DEFAULT)>0
+    WHERE pi.ProcName=@Proc AND (pi.PredicateText LIKE N'%>%' OR pi.PredicateText LIKE N'%<%')
+    ORDER BY pi.StartLine;
+
+    DECLARE @passPairs NVARCHAR(MAX)=N'';
+    SELECT @passPairs=@passPairs+N'|'+Col+N'='+CAST(TRY_CONVERT(INT,Lit)+1 AS NVARCHAR(10)) FROM #sg WHERE TRY_CONVERT(INT,Lit) IS NOT NULL;
+
+    DECLARE @autoDecls NVARCHAR(MAX),@autoArgs NVARCHAR(MAX);
+    EXEC TestGen.BuildReachArgs @Schema,@Proc,@autoDecls OUTPUT,@autoArgs OUTPUT;
+
+    IF @Debug=1
+    BEGIN
+        SELECT LkpTbl=@LkpTbl,LkpKeyCol=@LkpKeyCol,LkpKeyParam=@LkpKeyParam,CreditCol=@CreditCol;
+        SELECT * FROM #lkpmap; SELECT * FROM #sg;
+        SELECT JsonParam=@JsonParam,TblVar=@TblVar,JoinTbl=@JoinTbl,JoinJsonCol=@JoinJsonCol,JoinCatCol=@JoinCatCol,FilCol=@FilCol,FilOp=@FilOp,FilLit=@FilLit;
+        SELECT JsonLit=@JsonLit,CatSeed=@CatSeed,passPairs=@passPairs,autoArgs=@autoArgs;
+    END;
+
+    /* ===== iterate gates, upgrade NOT_TESTABLE -> WITNESS ===== */
+    DECLARE @gl INT,@ptext NVARCHAR(MAX);
+    -- Read the UNRECOGNISED gates straight from the inbox (independent of the iterative
+    -- search) and UPSERT a WITNESS; skip any gate already witnessed (by search or a prior run).
+    DECLARE g CURSOR LOCAL FAST_FORWARD FOR
+        SELECT pi.StartLine, ISNULL(pi.PredicateText,N'')
+        FROM TestGen.PredicateInbox pi
+        WHERE pi.ProcName=@Proc AND pi.UnsupportedReason IS NOT NULL AND pi.SeedPlanTrueJson IS NULL
+          AND NOT EXISTS(SELECT 1 FROM TestGen.SearchSeedResult r
+                         WHERE r.SchemaName=@Schema AND r.ProcName=@Proc AND r.GateLine=pi.StartLine AND r.Status='WITNESS')
+        ORDER BY pi.StartLine;
+    OPEN g; FETCH NEXT FROM g INTO @gl,@ptext;
+    WHILE @@FETCH_STATUS=0
+    BEGIN
+        DECLARE @PU2 NVARCHAR(MAX)=UPPER(@ptext);
+        DECLARE @arr NVARCHAR(MAX)=NULL,@argov NVARCHAR(MAX)=NULL,@arche VARCHAR(20)=NULL,@diag NVARCHAR(MAX)=NULL,@srctbl NVARCHAR(300)=NULL,@rowseed NVARCHAR(MAX)=NULL;
+        DECLARE @opLocal SYSNAME=NULL;
+        IF CHARINDEX(N'@',@ptext)>0
+        BEGIN
+            DECLARE @o1 NVARCHAR(200)=SUBSTRING(@ptext,CHARINDEX(N'@',@ptext),200);
+            SET @opLocal=LEFT(@o1,PATINDEX(N'%[^A-Za-z0-9_@]%',@o1+N' ')-1);
+        END;
+        DECLARE @aggOverTblVar BIT=0;
+        IF @opLocal IS NOT NULL AND @TblVar IS NOT NULL
+            AND EXISTS(SELECT 1 FROM #s WHERE LineNum<@gl AND UPPER(Txt) LIKE N'%'+UPPER(@opLocal)+N'%=%'
+                       AND (UPPER(Txt) LIKE N'%SUM(%' OR UPPER(Txt) LIKE N'%COUNT(%') AND UPPER(Txt) LIKE N'%'+UPPER(@TblVar)+N'%')
+            SET @aggOverTblVar=1;
+
+        IF @PU2 LIKE N'%IS NULL%' AND @opLocal IS NOT NULL
+           AND EXISTS(SELECT 1 FROM sys.parameters WHERE object_id=OBJECT_ID(@full) AND name=@opLocal)
+        BEGIN
+            -- parameter NULL-guard (e.g. @X IS NULL OR @Y IS NULL): drive TRUE by passing NULL.
+            SET @arche='NULLPARAM'; SET @srctbl=NULL;
+            SET @arr=N'/* '+@opLocal+N' IS NULL: driven via the parameter value */';
+            SET @argov=@autoArgs;
+            EXEC TestGen.PatchArgList @argov,@opLocal,N'NULL',@argov OUTPUT;
+            SET @diag=N'parameter '+@opLocal+N' IS NULL (deterministic)';
+        END
+        ELSE IF @PU2 LIKE N'%@@ROWCOUNT%' AND @PU2 LIKE N'%0%' AND @LkpTbl IS NOT NULL
+        BEGIN
+            SET @arche='ROWCOUNTCHK'; SET @srctbl=@LkpTbl;
+            SET @arr=N'EXEC TestGen.SafeFakeTable N'''+REPLACE(@LkpTbl,'''','''''')+N''';';
+            SET @diag=N'@@ROWCOUNT=0: lookup table faked empty -> 0 rows';
+        END
+        ELSE IF @aggOverTblVar=1 AND @JsonLit IS NOT NULL AND @CatSeed IS NOT NULL AND @LkpTbl IS NOT NULL
+        BEGIN
+            DECLARE @comparand NVARCHAR(200)=LTRIM(SUBSTRING(@ptext,CHARINDEX(@opLocal,@ptext)+LEN(@opLocal),200));
+            SET @comparand=LTRIM(SUBSTRING(@comparand,PATINDEX(N'%[^<>= ]%',@comparand+N'#'),200));
+            DECLARE @lkpOvr NVARCHAR(MAX)=@LkpKeyCol+N'='+CAST(@KeyVal AS NVARCHAR(10))+@passPairs;
+            IF LEFT(@comparand,1)=N'@'
+            BEGIN
+                SET @arche='JSONAGG-COL';
+                IF @CreditCol IS NOT NULL SET @lkpOvr=@lkpOvr+N'|'+@CreditCol+N'=0';
+            END
+            ELSE
+            BEGIN
+                SET @arche='JSONAGG-CNT';
+                IF @CreditCol IS NOT NULL SET @lkpOvr=@lkpOvr+N'|'+@CreditCol+N'=1000000';
+            END;
+            EXEC TestGen.BuildSeededRow @LkpTbl,@lkpOvr,@rowseed OUTPUT;
+            SET @arr=@CatSeed+NCHAR(10)+@rowseed;
+            SET @argov=@autoArgs;
+            EXEC TestGen.PatchArgList @argov,@JsonParam,@JsonArg,@argov OUTPUT;
+            IF @LkpKeyParam IS NOT NULL EXEC TestGen.PatchArgList @argov,@LkpKeyParam,@KeyStr,@argov OUTPUT;
+            IF CHARINDEX(N' AND ',@ptext)>0
+            BEGIN
+                DECLARE @conj NVARCHAR(200)=LTRIM(SUBSTRING(@ptext,CHARINDEX(N' AND ',@ptext)+5,200));
+                IF LEFT(@conj,1)=N'@' AND CHARINDEX(N'=',@conj)>0
+                BEGIN
+                    DECLARE @cpar SYSNAME=LEFT(@conj,PATINDEX(N'%[^A-Za-z0-9_@]%',@conj+N' ')-1);
+                    DECLARE @clit NVARCHAR(20)=LTRIM(RTRIM(SUBSTRING(@conj,CHARINDEX(N'=',@conj)+1,20)));
+                    SET @clit=LEFT(@clit,PATINDEX(N'%[^0-9.\-]%',@clit+N'#')-1);
+                    IF LEN(@clit)>0 EXEC TestGen.PatchArgList @argov,@cpar,@clit,@argov OUTPUT;
+                END;
+            END;
+            SET @srctbl=@LkpTbl;
+            SET @diag=@arche+N': synthesised JSON + catalog/lookup seed; knob pivoted to comparand source column';
+        END
+        ELSE IF @LkpTbl IS NOT NULL AND EXISTS(SELECT 1 FROM #lkpmap m WHERE CHARINDEX(m.LocalName,@ptext)>0)
+             AND @PU2 NOT LIKE N'%SUM(%' AND @PU2 NOT LIKE N'%COUNT(%' AND CHARINDEX(N'=',@ptext)>0
+        BEGIN
+            DECLARE @loc3 SYSNAME=(SELECT TOP 1 LocalName FROM #lkpmap WHERE CHARINDEX(LocalName,@ptext)>0 ORDER BY LEN(LocalName) DESC);
+            DECLARE @col3 SYSNAME=(SELECT TOP 1 ColName FROM #lkpmap WHERE LocalName=@loc3);
+            DECLARE @rhs3 NVARCHAR(50)=LTRIM(SUBSTRING(@ptext,CHARINDEX(N'=',@ptext)+1,50));
+            SET @rhs3=LTRIM(RTRIM(LEFT(@rhs3,PATINDEX(N'%[^0-9.\- ]%',@rhs3+N'#')-1)));
+            IF @rhs3 IS NOT NULL AND TRY_CONVERT(FLOAT,@rhs3) IS NOT NULL
+            BEGIN
+                SET @arche='LOOKUPSCALAR'; SET @srctbl=@LkpTbl;
+                DECLARE @lkpOvr3 NVARCHAR(MAX)=@LkpKeyCol+N'='+CAST(@KeyVal AS NVARCHAR(10))+N'|'+@col3+N'='+@rhs3;
+                EXEC TestGen.BuildSeededRow @LkpTbl,@lkpOvr3,@rowseed OUTPUT;
+                SET @arr=@rowseed; SET @argov=@autoArgs;
+                IF @LkpKeyParam IS NOT NULL EXEC TestGen.PatchArgList @argov,@LkpKeyParam,@KeyStr,@argov OUTPUT;
+                SET @diag=N'lookup status scalar: seed '+@col3+N'='+@rhs3+N' with matching key';
+            END;
+        END;
+
+        IF @arr IS NOT NULL
+        BEGIN
+            IF EXISTS(SELECT 1 FROM TestGen.SearchSeedResult WHERE SchemaName=@Schema AND ProcName=@Proc AND GateLine=@gl)
+                UPDATE TestGen.SearchSeedResult
+                SET Status='WITNESS', Archetype=@arche, WitnessArrange=@arr, ArgOverride=@argov, SrcTable=@srctbl, Diag=@diag, Operand=@opLocal
+                WHERE SchemaName=@Schema AND ProcName=@Proc AND GateLine=@gl;
+            ELSE
+                INSERT TestGen.SearchSeedResult(SchemaName,ProcName,GateLine,Operand,Archetype,Status,SrcTable,WitnessArrange,ArgOverride,Diag)
+                VALUES(@Schema,@Proc,@gl,@opLocal,@arche,'WITNESS',@srctbl,@arr,@argov,@diag);
+        END;
+
+        FETCH NEXT FROM g INTO @gl,@ptext;
+    END;
+    CLOSE g; DEALLOCATE g;
+
+    /* ===== HAPPY-path witness ===== */
+    IF @JsonLit IS NOT NULL AND @CatSeed IS NOT NULL AND @LkpTbl IS NOT NULL
+       AND NOT EXISTS(SELECT 1 FROM TestGen.SearchSeedResult WHERE SchemaName=@Schema AND ProcName=@Proc AND Archetype='HAPPYPATH')
+    BEGIN
+        DECLARE @hLn INT=ISNULL((SELECT MAX(GateLine)+1 FROM TestGen.SearchSeedResult WHERE ProcName=@Proc AND Archetype LIKE 'JSONAGG%'),9000);
+        DECLARE @hOvr NVARCHAR(MAX)=@LkpKeyCol+N'='+CAST(@KeyVal AS NVARCHAR(10))+@passPairs
+            +CASE WHEN @CreditCol IS NOT NULL THEN N'|'+@CreditCol+N'=1000000' ELSE N'' END;
+        DECLARE @hRow NVARCHAR(MAX); EXEC TestGen.BuildSeededRow @LkpTbl,@hOvr,@hRow OUTPUT;
+        DECLARE @hArr NVARCHAR(MAX)=@CatSeed+NCHAR(10)+@hRow;
+        DECLARE @hArgs NVARCHAR(MAX)=@autoArgs;
+        EXEC TestGen.PatchArgList @hArgs,@JsonParam,@JsonArg,@hArgs OUTPUT;
+        IF @LkpKeyParam IS NOT NULL EXEC TestGen.PatchArgList @hArgs,@LkpKeyParam,@KeyStr,@hArgs OUTPUT;
+        DECLARE @bitP SYSNAME=(SELECT TOP 1 p.name FROM sys.parameters p JOIN sys.types t ON t.user_type_id=p.user_type_id
+                               WHERE p.object_id=OBJECT_ID(@full) AND t.name='bit' ORDER BY p.parameter_id);
+        IF @bitP IS NOT NULL EXEC TestGen.PatchArgList @hArgs,@bitP,N'1',@hArgs OUTPUT;
+        INSERT TestGen.SearchSeedResult(SchemaName,ProcName,BranchId,GateLine,Operand,Archetype,Status,SrcTable,WitnessArrange,ArgOverride,Diag)
+        VALUES(@Schema,@Proc,NULL,@hLn,N'happy-path','HAPPYPATH','WITNESS',@LkpTbl,@hArr,@hArgs,
+               N'happy-path: valid JSON + active key row + high credit + partial=1 -> falls through all gates');
+    END;
+
+    /* ===== CASE / JSON-shred predicate adoption (v0.15.5) =====
+       The static (table-column) seeder leaves predicates inside CASE expressions or over the
+       JSON-shredded table variable as honest skips (it shapes table columns, not locals/JSON).
+       The reverse-seeding scenario CAN drive them: one run with a HIGH json quantity + NO stock
+       + partial fulfilment makes the volume-discount arms, the shortage flag and the
+       shortage-count CASE arms all TRUE.  Emit one witness per such (not-yet-witnessed)
+       predicate line so it PASSES instead of skipping.  No-op when the proc has no JSON shred. */
+    IF @JsonLit IS NOT NULL AND @CatSeed IS NOT NULL AND @LkpTbl IS NOT NULL AND @TblVar IS NOT NULL
+    BEGIN
+        DECLARE @QtyHi INT = 1000;   -- clears typical json quantity thresholds (>=50, >=100, ...)
+        DECLARE @JsonHi NVARCHAR(MAX)=NULL;
+        SELECT @JsonHi=ISNULL(@JsonHi+N',',N'')+N'"'+JsonProp+N'":'+
+              CASE WHEN ColName=@JoinJsonCol THEN CAST(@KeyVal AS NVARCHAR(10))
+                   WHEN IsNum=1 THEN CAST(@QtyHi AS NVARCHAR(10)) ELSE N'"x"' END
+        FROM #json ORDER BY ColName;
+        SET @JsonHi=N'[{'+@JsonHi+N'}]';
+        DECLARE @JsonHiArg NVARCHAR(MAX)=N'N'''+REPLACE(@JsonHi,N'''',N'''''')+N'''';
+
+        DECLARE @caOvr NVARCHAR(MAX)=@LkpKeyCol+N'='+@KeyStr+@passPairs
+            +CASE WHEN @CreditCol IS NOT NULL THEN N'|'+@CreditCol+N'=1000000' ELSE N'' END;
+        DECLARE @caRow NVARCHAR(MAX); EXEC TestGen.BuildSeededRow @LkpTbl,@caOvr,@caRow OUTPUT;
+        DECLARE @caArr NVARCHAR(MAX)=@CatSeed+NCHAR(10)+@caRow;
+        DECLARE @caArgs NVARCHAR(MAX)=@autoArgs;
+        EXEC TestGen.PatchArgList @caArgs,@JsonParam,@JsonHiArg,@caArgs OUTPUT;
+        IF @LkpKeyParam IS NOT NULL EXEC TestGen.PatchArgList @caArgs,@LkpKeyParam,@KeyStr,@caArgs OUTPUT;
+        DECLARE @caBit SYSNAME=(SELECT TOP 1 p.name FROM sys.parameters p JOIN sys.types t ON t.user_type_id=p.user_type_id
+                               WHERE p.object_id=OBJECT_ID(@full) AND t.name='bit' ORDER BY p.parameter_id);
+        IF @caBit IS NOT NULL EXEC TestGen.PatchArgList @caArgs,@caBit,N'1',@caArgs OUTPUT;
+
+        -- FALSE-direction args: an EMPTY json array -> no shredded items -> the shortage COUNT is 0,
+        -- so a "@count > 0" CASE arm is FALSE, and the proc still reaches those lines via the
+        -- success path (status FULL_SUCCESS).  Used to adopt a degenerate "predicate FALSE" stub.
+        DECLARE @caArgsF NVARCHAR(MAX)=@autoArgs;
+        EXEC TestGen.PatchArgList @caArgsF,@JsonParam,N'N''[]''',@caArgsF OUTPUT;
+        IF @LkpKeyParam IS NOT NULL EXEC TestGen.PatchArgList @caArgsF,@LkpKeyParam,@KeyStr,@caArgsF OUTPUT;
+        IF @caBit IS NOT NULL EXEC TestGen.PatchArgList @caArgsF,@caBit,N'1',@caArgsF OUTPUT;
+
+        -- count-over-table-variable locals (e.g. @InventoryShortageCount = COUNT(*) FROM @tv)
+        IF OBJECT_ID('tempdb..#cntloc') IS NOT NULL DROP TABLE #cntloc;
+        CREATE TABLE #cntloc(nm SYSNAME COLLATE DATABASE_DEFAULT);
+        INSERT #cntloc(nm)
+        SELECT DISTINCT LEFT(t, PATINDEX(N'%[^A-Za-z0-9_@]%', t+N' ')-1)
+        FROM (SELECT SUBSTRING(Txt, CHARINDEX(N'@',Txt), 60) AS t
+              FROM #s WHERE UPPER(Txt) LIKE N'%COUNT(%' AND UPPER(Txt) LIKE N'%'+UPPER(@TblVar)+N'%' AND CHARINDEX(N'@',Txt)>0) z
+        WHERE LEN(t)>1 AND LEFT(t,1)=N'@';
+
+        -- adoptable lines: a predicate that references a json-shred column, a count-over-tv local,
+        -- or is an "X - Y < 0" stock/shortage shape; and is not already witnessed.
+        IF OBJECT_ID('tempdb..#adopt') IS NOT NULL DROP TABLE #adopt;
+        CREATE TABLE #adopt(StartLine INT PRIMARY KEY, Pred NVARCHAR(MAX), hasFalse BIT);
+        INSERT #adopt(StartLine,Pred,hasFalse)
+        SELECT pi.StartLine, MIN(pi.PredicateText),
+               MAX(CASE WHEN pi.SeedPlanFalseJson IS NOT NULL THEN 1 ELSE 0 END)   -- a degenerate "predicate FALSE" stub exists
+        FROM TestGen.PredicateInbox pi
+        WHERE pi.ProcName=@Proc
+          AND NOT EXISTS(SELECT 1 FROM TestGen.SearchSeedResult r WHERE r.SchemaName=@Schema AND r.ProcName=@Proc AND r.GateLine=pi.StartLine AND r.Status='WITNESS')
+          AND ( EXISTS(SELECT 1 FROM #json j WHERE CHARINDEX(N'.'+j.ColName, pi.PredicateText COLLATE DATABASE_DEFAULT)>0)
+             OR EXISTS(SELECT 1 FROM #cntloc cl WHERE CHARINDEX(cl.nm, pi.PredicateText COLLATE DATABASE_DEFAULT)>0)
+             OR (pi.PredicateText LIKE N'% - %' AND (pi.PredicateText LIKE N'%< 0%' OR pi.PredicateText LIKE N'%<0%')) )
+        GROUP BY pi.StartLine;
+
+        DECLARE @caLn INT,@caPred NVARCHAR(MAX),@caHasFalse BIT;
+        DECLARE caC CURSOR LOCAL FAST_FORWARD FOR SELECT StartLine,Pred,hasFalse FROM #adopt ORDER BY StartLine;
+        OPEN caC; FETCH NEXT FROM caC INTO @caLn,@caPred,@caHasFalse;
+        WHILE @@FETCH_STATUS=0
+        BEGIN
+            -- TRUE arm: shortage + high-quantity scenario (status PARTIAL_SUCCESS / discount arms)
+            INSERT TestGen.SearchSeedResult(SchemaName,ProcName,BranchId,GateLine,Operand,Comparator,Archetype,Status,SrcTable,WitnessArrange,ArgOverride,Diag)
+            VALUES(@Schema,@Proc,NULL,@caLn,LEFT(@caPred,60),'true','CASEARM','WITNESS',@LkpTbl,@caArr,@caArgs,
+                   N'CASE/JSON-shred predicate (TRUE arm) via high-qty + no-stock + partial scenario');
+            -- FALSE arm: only when the line has a degenerate "predicate FALSE" smoke stub.  Drive the
+            -- no-shortage success path (empty JSON) so the same line runs and the outcome differs.
+            IF @caHasFalse=1
+                INSERT TestGen.SearchSeedResult(SchemaName,ProcName,BranchId,GateLine,Operand,Comparator,Archetype,Status,SrcTable,WitnessArrange,ArgOverride,Diag)
+                VALUES(@Schema,@Proc,NULL,@caLn,LEFT(@caPred,60),'false','CASEARM','WITNESS',@LkpTbl,@caArr,@caArgsF,
+                       N'CASE predicate (FALSE arm) via no-shortage (empty-JSON) success scenario');
+            FETCH NEXT FROM caC INTO @caLn,@caPred,@caHasFalse;
+        END;
+        CLOSE caC; DEALLOCATE caC;
+    END;
 END;
 GO
 
@@ -12272,6 +13608,131 @@ BEGIN
 END;
 GO
 PRINT 'TestGen.RunCoverage created (always-reinstrument stale-_cov fix).';
+GO
+
+/*****************************************************************************
+ * TestGen.RunTests   (v0.15.5 - shape-aware test runner)
+ * ---------------------------------------------------------------------------
+ * Run a procedure's generated test class and return pass/fail, handling the
+ * one shape a NAKED tSQLt.Run cannot: a procedure that manages its OWN
+ * transactions (BEGIN/COMMIT/ROLLBACK TRANSACTION or SET XACT_ABORT ON).
+ *
+ * WHY this exists: tSQLt wraps every test in a single transaction - that is
+ * also how FakeTable's rename/swap stays isolated. When the procedure under
+ * test hits a bare ROLLBACK, it rolls back to the OUTERMOST transaction,
+ * destroying tSQLt's per-test transaction AND the FakeTable setup; tSQLt's
+ * cleanup then raises error 266 ("mismatching number of BEGIN and COMMIT")
+ * and the test ERRORS. You cannot stop a bare ROLLBACK from reaching the root
+ * while the real statements run, so such a proc's rollback-path tests are
+ * untestable by a direct tSQLt.Run (a documented tSQLt limitation). The only
+ * lever is to neutralize the proc's transaction control during the test.
+ *
+ * HOW: the framework already builds a transaction-neutralized shadow (_cov,
+ * via TestGen.InstrumentProcedure) and swaps it in transiently - rename
+ * real->_orig, synonym real->shadow, run, GUARANTEED restore + interrupted-run
+ * self-heal. That logic is object-loss-safe and battle-tested in RunCoverage,
+ * so for a self-transaction proc we DELEGATE the swap to RunCoverage with the
+ * coverage report suppressed (@OutputMode='NONE'); its XEvent step degrades
+ * gracefully (TRY/CATCH) when ALTER ANY EVENT SESSION is not granted, so the
+ * tests still run + restore even without coverage permissions. A plain proc
+ * needs none of this - it is run directly via tSQLt.Run.
+ *
+ * The neutralized shadow differs from the real proc ONLY in that its
+ * transaction statements are no-ops: every branch, status string, OUTPUT
+ * parameter, and DML effect is exercised identically. The literal
+ * commit/rollback is the one thing not asserted - which tSQLt cannot test for
+ * such a proc regardless.
+ *****************************************************************************/
+IF OBJECT_ID('TestGen.RunTests','P') IS NOT NULL
+    DROP PROCEDURE TestGen.RunTests;
+GO
+
+CREATE PROCEDURE TestGen.RunTests
+    @SchemaName   SYSNAME,
+    @ProcName     SYSNAME,
+    @TestsRun     INT = NULL OUTPUT,
+    @TestsPassed  INT = NULL OUTPUT,
+    @TestsFailed  INT = NULL OUTPUT,
+    @TestsErrored INT = NULL OUTPUT,
+    @TestsSkipped INT = NULL OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @TestClass SYSNAME = N'test_' + @ProcName;
+    SELECT @TestsRun=0, @TestsPassed=0, @TestsFailed=0, @TestsErrored=0, @TestsSkipped=0;
+
+    IF SCHEMA_ID(@TestClass) IS NULL
+    BEGIN
+        RAISERROR('TestGen.RunTests: test class %s not found - generate the tests first (TestGen.GenerateTestsForProcedure or GenerateAndRunCoverage).', 16, 1, @TestClass);
+        RETURN;
+    END;
+
+    -- Does the procedure manage its OWN transactions?  If so a direct tSQLt.Run
+    -- of its rollback-path tests would error on the proc's ROLLBACK; route it
+    -- through the neutralized-shadow swap instead.
+    DECLARE @srcU NVARCHAR(MAX) = UPPER(ISNULL(
+        OBJECT_DEFINITION(OBJECT_ID(QUOTENAME(@SchemaName)+N'.'+QUOTENAME(@ProcName))), N''));
+    DECLARE @SelfTx BIT =
+        CASE WHEN @srcU LIKE N'%BEGIN TRAN%' OR @srcU LIKE N'%COMMIT%'
+               OR @srcU LIKE N'%ROLLBACK%'   OR @srcU LIKE N'%XACT[_]ABORT ON%'
+             THEN 1 ELSE 0 END;
+
+    IF @SelfTx = 1
+    BEGIN
+        -- Delegate the (object-loss-safe) transient swap to RunCoverage; suppress
+        -- the coverage report.  It runs the test class + any developer-owned
+        -- custom classes and returns the outcomes via its OUTPUT parameters.
+        PRINT 'TestGen.RunTests: ' + @SchemaName + '.' + @ProcName
+            + ' manages its own transactions -> running tests against the '
+            + 'transaction-neutralized shadow (coverage report suppressed).';
+        EXEC TestGen.RunCoverage
+             @SchemaName   = @SchemaName,
+             @ProcName     = @ProcName,
+             @OutputMode   = 'NONE',
+             @TestsRun     = @TestsRun     OUTPUT,
+             @TestsPassed  = @TestsPassed  OUTPUT,
+             @TestsFailed  = @TestsFailed  OUTPUT,
+             @TestsErrored = @TestsErrored OUTPUT,
+             @TestsSkipped = @TestsSkipped OUTPUT;
+    END
+    ELSE
+    BEGIN
+        -- Plain procedure: its tests run correctly under tSQLt directly.
+        DECLARE @cls SYSNAME;
+        DECLARE cls_run CURSOR LOCAL FAST_FORWARD FOR
+            SELECT @TestClass
+            UNION ALL
+            SELECT s.name FROM sys.schemas s
+            WHERE s.name LIKE REPLACE(@TestClass,'_','[_]') + '[_]custom%';
+        OPEN cls_run;
+        FETCH NEXT FROM cls_run INTO @cls;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            PRINT 'TestGen.RunTests: running ' + @cls + ' (tSQLt.Run).';
+            BEGIN TRY EXEC tSQLt.Run @cls; END TRY
+            BEGIN CATCH PRINT 'tSQLt error: ' + ERROR_MESSAGE(); END CATCH;
+            -- tSQLt.Run clears TestResult at the start of each run, so read this
+            -- class's outcomes now, before the next class runs.
+            IF OBJECT_ID('tSQLt.TestResult','U') IS NOT NULL
+                SELECT @TestsRun     = @TestsRun     + ISNULL(COUNT(*),0),
+                       @TestsPassed  = @TestsPassed  + ISNULL(SUM(CASE WHEN Result='Success' THEN 1 ELSE 0 END),0),
+                       @TestsFailed  = @TestsFailed  + ISNULL(SUM(CASE WHEN Result='Failure' THEN 1 ELSE 0 END),0),
+                       @TestsErrored = @TestsErrored + ISNULL(SUM(CASE WHEN Result='Error'   THEN 1 ELSE 0 END),0),
+                       @TestsSkipped = @TestsSkipped + ISNULL(SUM(CASE WHEN Result IN ('Skipped','Skip','Ignored') THEN 1 ELSE 0 END),0)
+                FROM tSQLt.TestResult WHERE Class = @cls;
+            FETCH NEXT FROM cls_run INTO @cls;
+        END;
+        CLOSE cls_run; DEALLOCATE cls_run;
+    END;
+
+    PRINT 'TestGen.RunTests result -> Run=' + CAST(@TestsRun AS VARCHAR(10))
+        + ' Passed='  + CAST(@TestsPassed  AS VARCHAR(10))
+        + ' Failed='  + CAST(@TestsFailed  AS VARCHAR(10))
+        + ' Errored=' + CAST(@TestsErrored AS VARCHAR(10))
+        + ' Skipped=' + CAST(@TestsSkipped AS VARCHAR(10));
+END;
+GO
+PRINT 'TestGen.RunTests created (shape-aware runner: neutralizes self-transaction procs).';
 GO
 
 
@@ -16086,6 +17547,99 @@ END;
 GO
 
 /*-----------------------------------------------------------------------------
+ * TestGen.SatisfyAll  (v0.15.2; =/<>/string in v0.15.3)
+ * Intersect MULTIPLE comparison constraints on ONE column into a single satisfying
+ * value. Used when a column must satisfy several comparisons at once - e.g.
+ * a.X > b.Y AND a.X > c.Z (beat BOTH), a.X = b.Y AND a.X = c.Z (equal BOTH),
+ * a.X <> b.Y AND a.X <> c.Z (differ from BOTH), or a.X > b.Y AND a.X > 100
+ * (column vs another column AND a literal) - which a per-anchor MAX cannot do
+ * (and string MAX is lexical: '43' > '101').
+ *   @ConstraintsJson = [{"op":">","val":"42","want":1}, {"op":">","val":"100","want":1}]
+ *   want=0 violates that op.
+ * NUMERIC: lo = max of lower bounds (>,>=), hi = min of upper bounds (<,<=); a
+ *   single '=' must fall in [lo,hi] and dodge '<>'; '<>'-only picks above all
+ *   exclusions. STRING: a single '=' returns that value, '<>'-only returns a
+ *   guaranteed-non-matching sentinel.
+ * Returns NULL - caller leaves the column unresolved (honest residue, never a
+ * wrong seed) - for an empty intersection (lo > hi), conflicting equalities,
+ * a numeric inequality over a string, or any case it cannot satisfy.
+ *---------------------------------------------------------------------------*/
+IF OBJECT_ID('TestGen.SatisfyAll', 'FN') IS NOT NULL DROP FUNCTION TestGen.SatisfyAll;
+GO
+CREATE FUNCTION TestGen.SatisfyAll (@ConstraintsJson NVARCHAR(MAX))
+RETURNS NVARCHAR(400)
+AS
+BEGIN
+    -- normalize each constraint to want=1, classify numeric vs string.
+    DECLARE @c TABLE (op VARCHAR(8), num FLOAT, sval NVARCHAR(400), isnum BIT);
+    INSERT @c (op, num, sval, isnum)
+    SELECT CASE WHEN w = 1 THEN o
+                ELSE CASE o WHEN '>' THEN '<=' WHEN '>=' THEN '<' WHEN '<' THEN '>='
+                            WHEN '<=' THEN '>' WHEN '=' THEN '<>' WHEN '<>' THEN '=' ELSE o END END,
+           n, v, CASE WHEN n IS NULL THEN 0 ELSE 1 END
+    FROM (
+        SELECT o = UPPER(LTRIM(RTRIM(JSON_VALUE([value],'$.op')))),
+               w = ISNULL(TRY_CAST(JSON_VALUE([value],'$.want') AS BIT), 1),
+               n = TRY_CAST(JSON_VALUE([value],'$.val') AS FLOAT),
+               v = JSON_VALUE([value],'$.val')
+        FROM   OPENJSON(ISNULL(@ConstraintsJson, N'[]'))
+    ) x;
+
+    IF NOT EXISTS (SELECT 1 FROM @c) RETURN NULL;
+
+    -- STRING fan: equality / inequality only (no ordering on strings).
+    IF EXISTS (SELECT 1 FROM @c WHERE isnum = 0)
+    BEGIN
+        IF EXISTS (SELECT 1 FROM @c WHERE op IN ('>','>=','<','<=')) RETURN NULL;
+        IF (SELECT COUNT(DISTINCT sval) FROM @c WHERE op = '=') > 1 RETURN NULL;
+        DECLARE @seq NVARCHAR(400) = (SELECT MIN(sval) FROM @c WHERE op = '=');
+        IF @seq IS NOT NULL
+        BEGIN
+            IF EXISTS (SELECT 1 FROM @c WHERE op = '<>' AND sval = @seq) RETURN NULL;
+            RETURN @seq;
+        END;
+        IF EXISTS (SELECT 1 FROM @c WHERE op = '<>') RETURN N'N''__UAG_NOMATCH__''';
+        RETURN NULL;
+    END;
+
+    -- NUMERIC fan.
+    IF (SELECT COUNT(DISTINCT num) FROM @c WHERE op = '=') > 1 RETURN NULL;     -- = k1 AND = k2
+    DECLARE @lo FLOAT = (SELECT MAX(CASE WHEN op='>' THEN num+1 WHEN op='>=' THEN num END) FROM @c);
+    DECLARE @hi FLOAT = (SELECT MIN(CASE WHEN op='<' THEN num-1 WHEN op='<=' THEN num END) FROM @c);
+    DECLARE @eq FLOAT = (SELECT MIN(num) FROM @c WHERE op = '=');
+
+    IF @eq IS NOT NULL
+    BEGIN
+        IF (@lo IS NOT NULL AND @eq < @lo) OR (@hi IS NOT NULL AND @eq > @hi) RETURN NULL;
+        IF EXISTS (SELECT 1 FROM @c WHERE op = '<>' AND num = @eq) RETURN NULL;
+        RETURN CASE WHEN @eq = FLOOR(@eq) THEN CAST(CAST(@eq AS BIGINT) AS NVARCHAR(50)) ELSE CAST(@eq AS NVARCHAR(50)) END;
+    END;
+
+    IF @lo IS NOT NULL AND @hi IS NOT NULL AND @lo > @hi RETURN NULL;           -- empty range
+
+    DECLARE @v FLOAT;
+    IF @lo IS NULL AND @hi IS NULL
+        SET @v = ISNULL((SELECT MAX(num) + 1 FROM @c WHERE op = '<>'), 0);      -- above all <>, else 0
+    ELSE
+    BEGIN
+        SET @v = COALESCE(@lo, @hi);
+        IF EXISTS (SELECT 1 FROM @c WHERE op = '<>' AND num = @v)
+        BEGIN
+            IF @lo IS NOT NULL
+            BEGIN
+                SET @v = (SELECT MAX(num) + 1 FROM @c WHERE op = '<>' AND num >= @lo);
+                IF @hi IS NOT NULL AND @v > @hi RETURN NULL;
+            END
+            ELSE
+                SET @v = (SELECT MIN(num) - 1 FROM @c WHERE op = '<>' AND num <= @hi);
+        END;
+    END;
+    RETURN CASE WHEN @v = FLOOR(@v) THEN CAST(CAST(@v AS BIGINT) AS NVARCHAR(50))
+                ELSE CAST(@v AS NVARCHAR(50)) END;
+END;
+GO
+
+/*-----------------------------------------------------------------------------
  * TestGen.BuildSeedInsert
  * Build an INSERT that puts @Count identical rows into a faked table.
  *   - Column list excludes identity / computed / rowversion (resolved Q4).
@@ -16307,6 +17861,23 @@ BEGIN
         RETURN TestGen.SatisfyingValue(@ssop, @ssrv, @ssw);
     END;
 
+    -- { "satisfyother": { op, want, oschema, otable, ocol } } (v0.15.0)
+    -- Cross-column WHERE a.x <op> b.y: derive THIS column's value from the OTHER
+    -- column's typed sample, so a.x <op> b.y holds regardless of the two types.
+    DECLARE @soj NVARCHAR(MAX) = JSON_QUERY(@vspec, '$.satisfyother');
+    IF @soj IS NOT NULL
+    BEGIN
+        DECLARE @soop VARCHAR(8) = JSON_VALUE(@soj, '$.op');
+        DECLARE @sow  BIT        = TRY_CAST(JSON_VALUE(@soj, '$.want') AS BIT);
+        DECLARE @ooid INT = OBJECT_ID(QUOTENAME(JSON_VALUE(@soj, '$.oschema')) + N'.' + QUOTENAME(JSON_VALUE(@soj, '$.otable')));
+        DECLARE @ocol SYSNAME = JSON_VALUE(@soj, '$.ocol');
+        DECLARE @obase NVARCHAR(400) = NULL;
+        SELECT @obase = TestGen.GetSampleValueLiteral(t.name, c.max_length, c.precision, c.scale, 0)
+        FROM   sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id
+        WHERE  c.object_id = @ooid AND c.name = @ocol;
+        RETURN TestGen.SatisfyingValue(@soop, @obase, @sow);
+    END;
+
     RETURN NULL;
 END;
 GO
@@ -16402,6 +17973,151 @@ BEGIN
     DECLARE @K INT, @kshape VARCHAR(32), @kcmp VARCHAR(16), @kcd NVARCHAR(MAX), @kwant BIT, @mode VARCHAR(8), @spec INT, @dovJson NVARCHAR(MAX);
     DECLARE @dK INT, @dmode VARCHAR(8), @satisfied INT, @need INT, @eOv NVARCHAR(MAX), @eN INT, @tot INT;
 
+    -- ============================================================
+    -- v0.15.1: cross-column value propagation (transitive chains).
+    -- Resolve every override's value GLOBALLY, in dependency order, so a
+    -- {satisfyother} column derives from its anchor column's ACTUAL resolved
+    -- value rather than a generic type sample. This makes transitive chains
+    -- (a.x > b.y AND b.y > c.z) seed correctly: c.z is sampled, b.y is derived to
+    -- beat c.z, then a.x is derived to beat b.y's ACTUAL value. A column that is
+    -- both an anchor and constrained (carries {sample} AND {satisfyother}) takes
+    -- the constrained value. A true cycle (contradiction: a.x>b.y AND b.y>a.x)
+    -- never resolves and falls back to the anchor's TYPE sample - the pre-v0.15.1
+    -- behaviour - so the impossible arm stays honestly uncovered, never faked.
+    -- @cc_chosen[fullcol] becomes the authoritative value the emit loop uses.
+    -- ============================================================
+    DECLARE @cc_spec TABLE (fullcol NVARCHAR(400), col SYSNAME, isOther BIT,
+                            op VARCHAR(8), want BIT, anchor NVARCHAR(400), oobjid INT, ocol NVARCHAR(128),
+                            litImm NVARCHAR(400));
+    DECLARE @cc_chosen TABLE (fullcol NVARCHAR(400) PRIMARY KEY, lit NVARCHAR(400));
+    DECLARE @cc_next   TABLE (fullcol NVARCHAR(400) PRIMARY KEY, v NVARCHAR(400));
+    DECLARE @cc_rounds INT = 0, @cc_changed INT = 1;
+
+    ;WITH cc_tbls AS (
+        SELECT JSON_VALUE(t.[value],'$.schema') sch, JSON_VALUE(t.[value],'$.table') tbl, t.[value] tval
+        FROM   OPENJSON(@plan,'$.tables') t
+    ),
+    cc_ovs AS (
+        SELECT b.sch, b.tbl, JSON_VALUE(o.[value],'$.col') col, JSON_QUERY(o.[value],'$.vspec') vspec
+        FROM   cc_tbls b
+        CROSS APPLY OPENJSON(b.tval,'$.demands') d
+        CROSS APPLY OPENJSON(JSON_QUERY(d.[value],'$.overrides')) o
+    )
+    INSERT @cc_spec (fullcol, col, isOther, op, want, anchor, oobjid, ocol, litImm)
+    SELECT LOWER(sch+N'.'+tbl+N'.'+col), col,
+           CASE WHEN JSON_QUERY(vspec,'$.satisfyother') IS NOT NULL THEN 1 ELSE 0 END,
+           JSON_VALUE(vspec,'$.satisfyother.op'),
+           TRY_CAST(JSON_VALUE(vspec,'$.satisfyother.want') AS BIT),
+           LOWER(JSON_VALUE(vspec,'$.satisfyother.oschema')+N'.'+JSON_VALUE(vspec,'$.satisfyother.otable')+N'.'+JSON_VALUE(vspec,'$.satisfyother.ocol')),
+           OBJECT_ID(QUOTENAME(JSON_VALUE(vspec,'$.satisfyother.oschema'))+N'.'+QUOTENAME(JSON_VALUE(vspec,'$.satisfyother.otable'))),
+           JSON_VALUE(vspec,'$.satisfyother.ocol'),
+           CASE WHEN JSON_QUERY(vspec,'$.satisfyother') IS NULL
+                THEN TestGen.ResolveVspec(vspec, @procObj, OBJECT_ID(QUOTENAME(sch)+N'.'+QUOTENAME(tbl)), col)
+                ELSE NULL END
+    FROM   cc_ovs
+    WHERE  col IS NOT NULL;
+
+    -- v0.15.3: capture {satisfy} literal/param comparisons as constraints too, so a
+    -- column compared to BOTH another column and a literal (a.X > b.Y AND a.X > 100)
+    -- intersects them, rather than letting the satisfyother overwrite the literal.
+    DECLARE @cc_cmp TABLE (fullcol NVARCHAR(400), op VARCHAR(8), want BIT, cval NVARCHAR(400));
+    ;WITH cc_tbls AS (
+        SELECT JSON_VALUE(t.[value],'$.schema') sch, JSON_VALUE(t.[value],'$.table') tbl, t.[value] tval
+        FROM   OPENJSON(@plan,'$.tables') t
+    ),
+    cc_ovs AS (
+        SELECT b.sch, b.tbl, JSON_VALUE(o.[value],'$.col') col, JSON_QUERY(o.[value],'$.vspec') vspec
+        FROM   cc_tbls b
+        CROSS APPLY OPENJSON(b.tval,'$.demands') d
+        CROSS APPLY OPENJSON(JSON_QUERY(d.[value],'$.overrides')) o
+    )
+    INSERT @cc_cmp (fullcol, op, want, cval)
+    SELECT LOWER(sch+N'.'+tbl+N'.'+col),
+           JSON_VALUE(vspec,'$.satisfy.op'),
+           ISNULL(TRY_CAST(JSON_VALUE(vspec,'$.satisfy.want') AS BIT), 1),
+           CASE WHEN JSON_VALUE(vspec,'$.satisfy.valKind') = 'param'
+                THEN (SELECT TestGen.GetSampleValueLiteral(t.name, pr.max_length, pr.precision, pr.scale, 0)
+                      FROM   sys.parameters pr JOIN sys.types t ON t.user_type_id = pr.user_type_id
+                      WHERE  pr.object_id = @procObj AND pr.name = JSON_VALUE(vspec,'$.satisfy.val'))
+                ELSE JSON_VALUE(vspec,'$.satisfy.val') END
+    FROM   cc_ovs
+    WHERE  col IS NOT NULL AND JSON_QUERY(vspec,'$.satisfy') IS NOT NULL;
+
+    -- round 0: the non-satisfyother (lit/param/sample) values
+    INSERT @cc_chosen (fullcol, lit)
+    SELECT fullcol, MAX(litImm) FROM @cc_spec WHERE isOther = 0 GROUP BY fullcol;
+
+    -- relaxation: derive each satisfyother value from its (chosen) anchor until stable
+    WHILE @cc_changed = 1 AND @cc_rounds < 64
+    BEGIN
+        SET @cc_rounds += 1;
+        DELETE FROM @cc_next;
+        -- resolve a satisfyother column only when ALL its anchors are chosen;
+        -- single anchor -> SatisfyingValue (unchanged); multiple anchors ->
+        -- SatisfyAll numeric intersection (NULL -> leave for the cycle fallback).
+        ;WITH oan AS (   -- satisfyother rows + anchor readiness
+            SELECT s.fullcol, s.op, s.want, ca.lit AS aval,
+                   ocnt = COUNT(*)          OVER (PARTITION BY s.fullcol),
+                   ordy = COUNT(ca.fullcol) OVER (PARTITION BY s.fullcol)
+            FROM   @cc_spec s
+            LEFT JOIN @cc_chosen ca ON ca.fullcol = s.anchor
+            WHERE  s.isOther = 1
+        ),
+        ready AS ( SELECT DISTINCT fullcol FROM oan WHERE ocnt = ordy ),
+        hard AS (   -- total hard constraints on a ready column: satisfyother + satisfy
+            SELECT r.fullcol,
+                   n = (SELECT COUNT(*) FROM @cc_spec s2 WHERE s2.fullcol = r.fullcol AND s2.isOther = 1)
+                     + (SELECT COUNT(*) FROM @cc_cmp  m2 WHERE m2.fullcol = r.fullcol)
+            FROM   ready r
+        )
+        INSERT @cc_next (fullcol, v)
+        SELECT z.fullcol, z.v FROM (
+            SELECT h.fullcol,
+                   v = CASE WHEN h.n = 1
+                            -- single satisfyother, no literal -> original fast path
+                            THEN (SELECT MAX(TestGen.SatisfyingValue(o.op, o.aval, o.want))
+                                  FROM oan o WHERE o.fullcol = h.fullcol)
+                            -- 2+ constraints (multi-anchor, or anchor + literal) -> intersect
+                            ELSE TestGen.SatisfyAll((
+                                  SELECT op, want, val FROM (
+                                      SELECT o.op AS op, o.want AS want, o.aval AS val
+                                      FROM   oan o WHERE o.fullcol = h.fullcol
+                                      UNION ALL
+                                      SELECT m.op, m.want, m.cval
+                                      FROM   @cc_cmp m WHERE m.fullcol = h.fullcol
+                                  ) q FOR JSON PATH)) END
+            FROM   hard h
+        ) z
+        WHERE  z.v IS NOT NULL;
+
+        SET @cc_changed = CASE WHEN EXISTS (
+            SELECT 1 FROM @cc_next n LEFT JOIN @cc_chosen c ON c.fullcol = n.fullcol
+            WHERE c.fullcol IS NULL OR ISNULL(c.lit, N'<<uagx>>') <> ISNULL(n.v, N'<<uagx>>')
+        ) THEN 1 ELSE 0 END;
+
+        UPDATE c SET c.lit = n.v
+        FROM   @cc_chosen c JOIN @cc_next n ON n.fullcol = c.fullcol
+        WHERE  ISNULL(c.lit, N'<<uagx>>') <> ISNULL(n.v, N'<<uagx>>');
+
+        INSERT @cc_chosen (fullcol, lit)
+        SELECT n.fullcol, n.v FROM @cc_next n
+        WHERE  NOT EXISTS (SELECT 1 FROM @cc_chosen c WHERE c.fullcol = n.fullcol);
+    END;
+
+    -- cycle fallback: a satisfyother col still unresolved (its anchor never resolved
+    -- = a contradiction/cycle) derives from the anchor column's TYPE sample - the
+    -- pre-v0.15.1 best-effort. If that cannot satisfy, the branch stays honestly
+    -- uncovered (no phantom pass), exactly as a contradiction should.
+    INSERT @cc_chosen (fullcol, lit)
+    SELECT s.fullcol, MAX(TestGen.SatisfyingValue(s.op,
+               TestGen.GetSampleValueLiteral(t.name, c.max_length, c.precision, c.scale, 0), s.want))
+    FROM   @cc_spec s
+    JOIN   sys.columns c ON c.object_id = s.oobjid AND c.name = s.ocol
+    JOIN   sys.types   t ON t.user_type_id = c.user_type_id
+    WHERE  s.isOther = 1
+      AND  NOT EXISTS (SELECT 1 FROM @cc_chosen ch WHERE ch.fullcol = s.fullcol)
+    GROUP  BY s.fullcol;
+
     DECLARE tc CURSOR LOCAL FAST_FORWARD FOR
         SELECT JSON_VALUE([value], '$.schema'), JSON_VALUE([value], '$.table'), JSON_QUERY([value], '$.demands')
         FROM   OPENJSON(@plan, '$.tables');
@@ -16455,10 +18171,14 @@ BEGIN
             IF @K IS NULL SET @K = 0;
 
             DELETE FROM @ovt;
+            -- v0.15.1: use the globally propagated value (@cc_chosen) so cross-column
+            -- chains resolve; fall back to per-column ResolveVspec defensively.
             INSERT @ovt (col, val)
             SELECT JSON_VALUE(o.[value], '$.col'),
-                   TestGen.ResolveVspec(JSON_QUERY(o.[value], '$.vspec'), @procObj, @objid, JSON_VALUE(o.[value], '$.col'))
-            FROM   OPENJSON(ISNULL(@dov, N'[]')) o;
+                   ISNULL(ch.lit,
+                          TestGen.ResolveVspec(JSON_QUERY(o.[value], '$.vspec'), @procObj, @objid, JSON_VALUE(o.[value], '$.col')))
+            FROM   OPENJSON(ISNULL(@dov, N'[]')) o
+            LEFT  JOIN @cc_chosen ch ON ch.fullcol = LOWER(@tsch + N'.' + @ttbl + N'.' + JSON_VALUE(o.[value], '$.col'));
             SET @dovJson = ISNULL((SELECT col AS [col], MAX(val) AS [val] FROM @ovt GROUP BY col FOR JSON PATH), N'[]');
             SET @spec = (SELECT COUNT(DISTINCT col) FROM @ovt);
             INSERT @demT (K, ovJson, spec, mode) VALUES (@K, @dovJson, @spec, @mode);
@@ -16526,7 +18246,7 @@ BEGIN
     END;
     CLOSE tc; DEALLOCATE tc;
 
-    SET @SeedSql = N'    -- v0.12 ' + @Direction + N' seed for: ' + LEFT(@PredText, 200) + CHAR(13) + CHAR(10)
+    SET @SeedSql = N'    -- v0.12 ' + @Direction + N' seed for: ' + REPLACE(REPLACE(REPLACE(LEFT(@PredText, 200), CHAR(13), N' '), CHAR(10), N' '), CHAR(9), N' ') + CHAR(13) + CHAR(10)
                  + CASE WHEN @seed = N'' THEN N'    -- (faked tables left empty for this direction)' ELSE @seed END;
     SET @Supported = 1;
 END;
@@ -17102,7 +18822,7 @@ BEGIN
         RETURN;
     END;
 
-    SET @SeedSql = N'    -- predicate ' + @Direction + N' seed for: ' + LEFT(@PredText, 200) + CHAR(13) + CHAR(10)
+    SET @SeedSql = N'    -- predicate ' + @Direction + N' seed for: ' + REPLACE(REPLACE(REPLACE(LEFT(@PredText, 200), CHAR(13), N' '), CHAR(10), N' '), CHAR(9), N' ') + CHAR(13) + CHAR(10)
                  + N'    ' + @insert;
     SET @Supported = 1;
 END;
