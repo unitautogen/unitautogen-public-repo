@@ -1,6 +1,8 @@
-# Design - v10: Universal Test Generator
+# Architecture — the Universal Test Generator
 
-Status: **proposed** (for review before any implementation). Builds on v9.4.2.
+> **Versioning note.** This is the architecture the current **0.x public beta** ships (see [`VERSION`](../VERSION)). It was originally written as the *v10* design proposal and has since been **built and validated** on the reference databases; the v9.x / v10.x numbers are the pre-public internal release lines.
+
+Status: **implemented** — shipping in the 0.x beta. (Builds on the strong-assertions work from the internal v9.4.2 line.)
 
 ## 1. Goal and non-goals
 

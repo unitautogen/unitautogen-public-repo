@@ -8,13 +8,12 @@ expected; if you hit something *not* here, please open a bug report.
 
 ## Validated against
 
-Three reference databases at the time of this Beta release:
+Two reference databases at the time of this Beta release:
 
 | Database              | Pass rate          | Coverage          | Autonomy |
 | --------------------- | ------------------ | ----------------- | -------- |
 | AdventureWorks 2025   | 167 / 167 pass     | 87.1% line / 79.7% branch | 100% |
 | Northwind             | 42 / 42 pass       | 100% line / 100% branch   | 100% |
-| WideWorldImporters    | 24 / 24 pass / 0 err | 94.2% line / 100% autonomy | 100% |
 
 If you run UnitAutogen on a database in this list and see materially different
 numbers, please open a bug report — that's a regression worth investigating.

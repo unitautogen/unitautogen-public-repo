@@ -1,0 +1,115 @@
+=== TestGen.GenerateAndRunCoverage: Production.uspCalcInventoryAdjustment ===
+--- Step 1 of 3: parse predicates for this procedure ---
+Wrote 2 ParsedPredicate rows (2 UNRECOGNISED) over 1 procedure(s) under RunId 7c62089d-7d6a-4123-885c-6dc5ab19528e.
+--- Step 2 of 3: generate + install the test class ---
+  CREATE_TABLE - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_TABLE - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_TABLE - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_TABLE - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_SCHEMA - test_uspCalcInventoryAdjustment.test_uspCalcInventoryAdjustment
+  CREATE_EXTENDED_PROPERTY - .test_uspCalcInventoryAdjustment
+  CREATE_PROCEDURE - test_uspCalcInventoryAdjustment.test uspCalcInventoryAdjustment executes with valid inputs
+  CREATE_PROCEDURE - test_uspCalcInventoryAdjustment.test uspCalcInventoryAdjustment accepts low boundary values
+  CREATE_PROCEDURE - test_uspCalcInventoryAdjustment.test uspCalcInventoryAdjustment accepts high boundary values
+  CREATE_PROCEDURE - test_uspCalcInventoryAdjustment.test uspCalcInventoryAdjustment touches only mocked tables
+  CREATE_PROCEDURE - test_uspCalcInventoryAdjustment.test uspCalcInventoryAdjustment assigns its OUTPUT parameters
+Generated 5 test(s) for [Production].[uspCalcInventoryAdjustment] as class [test_uspCalcInventoryAdjustment].
+  adding seeded predicate-branch tests (data-shape arms)
+  CREATE_PROCEDURE - test_uspCalcInventoryAdjustment.test uspCalcInventoryAdjustment branch 1 line 8 NOT_TESTABLE
+  CREATE_PROCEDURE - test_uspCalcInventoryAdjustment.test uspCalcInventoryAdjustment branch 2 line 10 NOT_TESTABLE
+GeneratePredicateBranchTests: emitted 2 predicate-branch test(s) into [test_uspCalcInventoryAdjustment].
+  search-seeding UNRECOGNISED gates (loop-local / coupled / per-row)
+  CREATE_PROCEDURE - Production.uspCalcInventoryAdjustment_cov
+Instrumented procedure created: [Production].[uspCalcInventoryAdjustment_cov]
+RecordCoverageHit injections   : 10
+Registry IsExec lines          : 10
+Registry IsBranch lines        : 3
+  CREATE_TABLE - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  DROP_PROCEDURE - test_uspCalcInventoryAdjustment.test uspCalcInventoryAdjustment branch 1 line 8 NOT_TESTABLE
+  CREATE_PROCEDURE - test_uspCalcInventoryAdjustment.test @OnHandQty <= at L8 (PARAM) search seed
+  CREATE_TABLE - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  DROP_PROCEDURE - test_uspCalcInventoryAdjustment.test uspCalcInventoryAdjustment branch 2 line 10 NOT_TESTABLE
+  CREATE_PROCEDURE - test_uspCalcInventoryAdjustment.test @OnHandQty < at L10 (PARAM) search seed
+EmitSearchSeedTests: 2 witness test(s) + 0 skip(s) into [test_uspCalcInventoryAdjustment]
+ 
+--- Step 3 of 3: instrument + run coverage ---
+XEL path: D:\Program Files\Microsoft SQL Server\MSSQL17.MSSQLSERVER\MSSQL\DATA\TestGenCoverage_20260616_110803
+Instrumenting uspCalcInventoryAdjustment (fresh _cov every run)...
+  DROP_PROCEDURE - Production.uspCalcInventoryAdjustment_cov
+  CREATE_PROCEDURE - Production.uspCalcInventoryAdjustment_cov
+Instrumented procedure created: [Production].[uspCalcInventoryAdjustment_cov]
+RecordCoverageHit injections   : 10
+Registry IsExec lines          : 10
+Registry IsBranch lines        : 3
+XEvent session started.
+Caution: Changing any part of an object name could break scripts and stored procedures.
+  RENAME - Production.uspCalcInventoryAdjustment
+Original renamed to _orig.
+  CREATE_SYNONYM - Production.uspCalcInventoryAdjustment
+Synonym created: uspCalcInventoryAdjustment -> uspCalcInventoryAdjustment_cov
+Running: test_uspCalcInventoryAdjustment (via synonym to instrumented proc)
+  CREATE_TABLE - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_TABLE - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_TABLE - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+-->[test_uspCalcInventoryAdjustment].[test uspCalcInventoryAdjustment accepts low boundary values] skipped: UnitAutogen generated a boundary or NULL value that is outside this procedure's accepted input domain (the procedure raised an error on it at generation time).  This is not necessarily a defect - supply a custom test with in-domain values, then remove this annotation.
+  CREATE_TABLE - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_TABLE - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_TABLE - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+  CREATE_EXTENDED_PROPERTY - Production.InventoryAdjustmentLog
+ 
++----------------------+
+|Test Execution Summary|
++----------------------+
+ 
+|No|Test Case Name                                                                                   |Dur(ms)|Result |
++--+-------------------------------------------------------------------------------------------------+-------+-------+
+|1 |[test_uspCalcInventoryAdjustment].[test @OnHandQty < at L10 (PARAM) search seed]                 |   1148|Success|
+|2 |[test_uspCalcInventoryAdjustment].[test @OnHandQty <= at L8 (PARAM) search seed]                 |    916|Success|
+|3 |[test_uspCalcInventoryAdjustment].[test uspCalcInventoryAdjustment accepts high boundary values] |   1028|Success|
+|4 |[test_uspCalcInventoryAdjustment].[test uspCalcInventoryAdjustment assigns its OUTPUT parameters]|   1027|Success|
+|5 |[test_uspCalcInventoryAdjustment].[test uspCalcInventoryAdjustment executes with valid inputs]   |    932|Success|
+|6 |[test_uspCalcInventoryAdjustment].[test uspCalcInventoryAdjustment touches only mocked tables]   |   1028|Success|
+|7 |[test_uspCalcInventoryAdjustment].[test uspCalcInventoryAdjustment accepts low boundary values]  |     58|Skipped|
+----------------------------------------------------------------------------------------
+Test Case Summary: 7 test case(s) executed, 6 succeeded, 1 skipped, 0 failed, 0 errored.
+----------------------------------------------------------------------------------------
+  DROP_SYNONYM - Production.uspCalcInventoryAdjustment
+Caution: Changing any part of an object name could break scripts and stored procedures.
+  RENAME - Production.uspCalcInventoryAdjustment_orig
+Original proc restored.
+XEvent session stopped. Reading events...
+XEvent rows captured: 42
+Coverage hits recorded: 9
+/* =================== COVERAGE REPORT HTML =================== */
+/* Copy everything between the markers, save as coverage.html    */
+/* then open in your browser.                                    */
+/* ============================================================= */
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Coverage: [Production].[uspCalcInventoryAdjustment]</title><style>body{font-family:Consolas,monospace;background:#1e1e1e;color:#d4d4d4;margin:0;padding:20px}h1{color:#569cd6;font-size:18px}.stats{background:#252526;padding:12px;border-radius:4px;margin-bottom:16px;display:flex;gap:32px}.stat-box{text-align:center;min-width:180px}.stat-pct{font-size:36px;font-weight:bold}.stat-pct.good{color:#4ec9b0}.stat-pct.warn{color:#dcdcaa}.stat-pct.bad{color:#f44747}.stat-label{font-size:12px;color:#858585}.bar-bg{background:#3e3e42;height:8px;border-radius:4px;margin:6px 0}.bar-fill{height:8px;border-radius:4px}.bar-fill.good{background:#4ec9b0}.bar-fill.warn{background:#dcdcaa}.bar-fill.bad{background:#f44747}table{width:100%;border-collapse:collapse;font-size:13px}tr.hit{background:#1a2e1a}tr.miss{background:#2e1a1a}tr.noexec{background:#1e1e1e;opacity:0.5}tr.branch-hit{background:#1a2a2e}tr.branch-miss{background:#2e2a1a}tr:hover{filter:brightness(1.2)}td.lnum{color:#858585;text-align:right;padding:2px 12px 2px 4px;width:40px;border-right:2px solid #3e3e42}td.badge{width:20px;text-align:center;font-size:11px}td.code{padding:2px 8px;white-space:pre}.hit-badge{color:#4ec9b0}.miss-badge{color:#f44747}.branch-badge{color:#dcdcaa;font-size:9px}</style></head><body><h1>Code Coverage &mdash; [Production].[uspCalcInventoryAdjustment]</h1><p style="color:#858585;font-size:12px">Generated: 2026-06-16 11:08:13</p><div class="stats"><div class="stat-box"><div class="stat-pct good">90.0%</div><div class="bar-bg"><div class="bar-fill good" style="width:90.0%"></div></div><div class="stat-label">Line Coverage (9/10 lines)</div></div><div class="stat-box"><div class="stat-pct good">100.0%</div><div class="bar-bg"><div class="bar-fill good" style="width:100.0%"></div></div><div class="stat-label">Branch Coverage (3/3 branches)</div></div></div><table><tr class="noexec"><td class="lnum">5</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">BEGIN</td></tr><tr class="noexec"><td class="lnum">6</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">    SET NOCOUNT ON;</td></tr><tr class="noexec"><td class="lnum">7</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code"></td></tr><tr class="branch-hit"><td class="lnum">8</td><td class="badge"><span class="hit-badge">&#10</span></td><td class="badge"><span class="branch-badge">B</span></td><td class="code">    IF @OnHandQty &lt;= 0</td></tr><tr class="hit"><td class="lnum">9</td><td class="badge"><span class="hit-badge">&#10</span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">        SET @Action = N'REORDER';</td></tr><tr class="branch-hit"><td class="lnum">10</td><td class="badge"><span class="hit-badge">&#10</span></td><td class="badge"><span class="branch-badge">B</span></td><td class="code">    ELSE IF @OnHandQty &lt; 50</td></tr><tr class="hit"><td class="lnum">11</td><td class="badge"><span class="hit-badge">&#10</span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">        SET @Action = N'LOW';</td></tr><tr class="branch-hit"><td class="lnum">12</td><td class="badge"><span class="hit-badge">&#10</span></td><td class="badge"><span class="branch-badge">B</span></td><td class="code">    ELSE</td></tr><tr class="hit"><td class="lnum">13</td><td class="badge"><span class="hit-badge">&#10</span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">        SET @Action = N'OK';</td></tr><tr class="noexec"><td class="lnum">14</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code"></td></tr><tr class="noexec"><td class="lnum">15</td><td class="badge"><span class=""></span></td><td class="badge"><spa
+n class="branch-badge"></span></td><td class="code">    DECLARE @target int =</td></tr><tr class="hit"><td class="lnum">16</td><td class="badge"><span class="hit-badge">&#10</span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">        CASE @ReorderClass WHEN 'A' THEN 200 WHEN 'B' THEN 100 WHEN 'C' THEN 50 ELSE 25 END;</td></tr><tr class="noexec"><td class="lnum">17</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code"></td></tr><tr class="hit"><td class="lnum">18</td><td class="badge"><span class="hit-badge">&#10</span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">    SET @AdjustQty = @target - @OnHandQty;</td></tr><tr class="noexec"><td class="lnum">19</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code"></td></tr><tr class="noexec"><td class="lnum">20</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">    DECLARE @severity tinyint =</td></tr><tr class="hit"><td class="lnum">21</td><td class="badge"><span class="hit-badge">&#10</span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">        CASE @Action WHEN N'REORDER' THEN 3 WHEN N'LOW' THEN 2 ELSE 1 END;</td></tr><tr class="noexec"><td class="lnum">22</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code"></td></tr><tr class="noexec"><td class="lnum">23</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">    DECLARE @weight int =</td></tr><tr class="hit"><td class="lnum">24</td><td class="badge"><span class="hit-badge">&#10</span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">        CASE @ReorderClass WHEN 'A' THEN 3 WHEN 'B' THEN 2 ELSE 1 END;</td></tr><tr class="noexec"><td class="lnum">25</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code"></td></tr><tr class="noexec"><td class="lnum">26</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">    DECLARE @note nvarchar(40) =</td></tr><tr class="hit"><td class="lnum">27</td><td class="badge"><span class="hit-badge">&#10</span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">        @Action + N' sev' + CAST(@severity AS nvarchar(2)) + N' w' + CAST(@weight AS nvarchar(2));</td></tr><tr class="noexec"><td class="lnum">28</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code"></td></tr><tr class="noexec"><td class="lnum">29</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">    BEGIN TRY</td></tr><tr class="hit"><td class="lnum">30</td><td class="badge"><span class="hit-badge">&#10</span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">        INSERT Production.InventoryAdjustmentLog</td></tr><tr class="noexec"><td class="lnum">31</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">            (ProductID, OnHandQty, ReorderClass, Action, AdjustQty, Note, LoggedAt)</td></tr><tr class="noexec"><td class="lnum">32</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">        VALUES (@ProductID, @OnHandQty, @ReorderClass, @Action, @AdjustQty, @note, GETDATE());</td></tr><tr class="noexec"><td class="lnum">33</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">    END TRY</td></tr><tr class="noexec"><td class="lnum">34</td><
+td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">    BEGIN CATCH</td></tr><tr class="miss"><td class="lnum">35</td><td class="badge"><span class="miss-badge">&#10</span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">        SET @AdjustQty = -1;</td></tr><tr class="noexec"><td class="lnum">36</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">    END CATCH;</td></tr><tr class="noexec"><td class="lnum">37</td><td class="badge"><span class=""></span></td><td class="badge"><span class="branch-badge"></span></td><td class="code">END</td></tr></table></body></html>
+/* =================== END HTML =================== */
+
+Completion time: 2026-06-16T11:08:13.1606291+05:30

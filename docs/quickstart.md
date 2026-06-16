@@ -128,12 +128,13 @@ filled in — that's the most valuable contribution you can make during Beta.
 
 ## Worked examples
 
-See [`usage-examples.sql`](usage-examples.sql) for a longer worked example
-against AdventureWorks-style procedures.
+See [`worked-example.md`](worked-example.md) for a full end-to-end walkthrough — a clean
+AdventureWorks2025 sweep (real HTML report), then two example procedures up close with
+their definitions, generated tests, and coverage (one at 100%, one at an honest 90%).
 
 ## Full reference guide
 
-[`REFERENCE_GUIDE.md`](REFERENCE_GUIDE.md) contains the complete usage guide
-for the v10 release line, including every stored procedure the framework
+[`REFERENCE_GUIDE.md`](REFERENCE_GUIDE.md) is the complete reference — every
+stored procedure the framework
 exposes, the coverage architecture, troubleshooting tips, and the full feature
 history.

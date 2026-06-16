@@ -1,0 +1,308 @@
+TestGen.CleanupInterruptedRuns: no interrupted runs detected. Database is clean.
+GenerateAndCoverDatabase: 7 object(s) (procedures + functions) to process.
+ 
+NOTE: turn SYSTEM_VERSIONING OFF on any system-versioned temporal
+      tables before this run, and back ON afterwards - see the
+      README_v9_4 temporal prerequisite.  A procedure still
+      system-versioned, or using FOR SYSTEM_TIME, is reported
+      NOT TESTABLE.
+  [1/7] dbo.CustOrderHist
+CaptureResultBaseline: test_CustOrderHist captured 2 col(s), 1 row(s).
+Generated 7 test(s) for [dbo].[CustOrderHist] as class [test_CustOrderHist].
+Instrumented procedure created: [dbo].[CustOrderHist_cov]
+RecordCoverageHit injections   : 1
+Registry IsExec lines          : 1
+Registry IsBranch lines        : 0
+EmitSearchSeedTests: 0 witness test(s) + 0 skip(s) into [test_CustOrderHist]
+XEL path: D:\Program Files\Microsoft SQL Server\MSSQL17.MSSQLSERVER\MSSQL\DATA\TestGenCoverage_20260616_121605
+Instrumenting CustOrderHist (fresh _cov every run)...
+Instrumented procedure created: [dbo].[CustOrderHist_cov]
+RecordCoverageHit injections   : 1
+Registry IsExec lines          : 1
+Registry IsBranch lines        : 0
+XEvent session started.
+Caution: Changing any part of an object name could break scripts and stored procedures.
+Original renamed to _orig.
+Synonym created: CustOrderHist -> CustOrderHist_cov
+Running: test_CustOrderHist (via synonym to instrumented proc)
+-->[test_CustOrderHist].[test CustOrderHist result set matches a hand-built expectation] skipped: MANUAL TEST REQUIRED: characterization scaffold - replace the auto-seed with a small designed dataset, fill #Expected with the hand-computed result, then remove the SkipTest annotation above to activate this test.
+ 
++----------------------+
+|Test Execution Summary|
++----------------------+
+ 
+|No|Test Case Name                                                                       |Dur(ms)|Result |
++--+-------------------------------------------------------------------------------------+-------+-------+
+|1 |[test_CustOrderHist].[test CustOrderHist accepts high boundary values]               |    275|Success|
+|2 |[test_CustOrderHist].[test CustOrderHist accepts low boundary values]                |    312|Success|
+|3 |[test_CustOrderHist].[test CustOrderHist executes with valid inputs]                 |    246|Success|
+|4 |[test_CustOrderHist].[test CustOrderHist returns a stable result-set shape]          |   1153|Success|
+|5 |[test_CustOrderHist].[test CustOrderHist returns rows matching baseline]             |    395|Success|
+|6 |[test_CustOrderHist].[test CustOrderHist touches only mocked tables]                 |    300|Success|
+|7 |[test_CustOrderHist].[test CustOrderHist result set matches a hand-built expectation]|     43|Skipped|
+----------------------------------------------------------------------------------------
+Test Case Summary: 7 test case(s) executed, 6 succeeded, 1 skipped, 0 failed, 0 errored.
+----------------------------------------------------------------------------------------
+Caution: Changing any part of an object name could break scripts and stored procedures.
+Original proc restored.
+XEvent session stopped. Reading events...
+XEvent rows captured: 5
+Coverage hits recorded: 1
+  [2/7] dbo.CustOrdersDetail
+CaptureResultBaseline: test_CustOrdersDetail captured 5 col(s), 1 row(s).
+Generated 7 test(s) for [dbo].[CustOrdersDetail] as class [test_CustOrdersDetail].
+Instrumented procedure created: [dbo].[CustOrdersDetail_cov]
+RecordCoverageHit injections   : 1
+Registry IsExec lines          : 1
+Registry IsBranch lines        : 0
+EmitSearchSeedTests: 0 witness test(s) + 0 skip(s) into [test_CustOrdersDetail]
+XEL path: D:\Program Files\Microsoft SQL Server\MSSQL17.MSSQLSERVER\MSSQL\DATA\TestGenCoverage_20260616_121611
+Instrumenting CustOrdersDetail (fresh _cov every run)...
+Instrumented procedure created: [dbo].[CustOrdersDetail_cov]
+RecordCoverageHit injections   : 1
+Registry IsExec lines          : 1
+Registry IsBranch lines        : 0
+XEvent session started.
+Caution: Changing any part of an object name could break scripts and stored procedures.
+Original renamed to _orig.
+Synonym created: CustOrdersDetail -> CustOrdersDetail_cov
+Running: test_CustOrdersDetail (via synonym to instrumented proc)
+-->[test_CustOrdersDetail].[test CustOrdersDetail result set matches a hand-built expectation] skipped: MANUAL TEST REQUIRED: characterization scaffold - replace the auto-seed with a small designed dataset, fill #Expected with the hand-computed result, then remove the SkipTest annotation above to activate this test.
+ 
++----------------------+
+|Test Execution Summary|
++----------------------+
+ 
+|No|Test Case Name                                                                             |Dur(ms)|Result |
++--+-------------------------------------------------------------------------------------------+-------+-------+
+|1 |[test_CustOrdersDetail].[test CustOrdersDetail accepts high boundary values]               |    264|Success|
+|2 |[test_CustOrdersDetail].[test CustOrdersDetail accepts low boundary values]                |    118|Success|
+|3 |[test_CustOrdersDetail].[test CustOrdersDetail executes with valid inputs]                 |     78|Success|
+|4 |[test_CustOrdersDetail].[test CustOrdersDetail returns a stable result-set shape]          |    143|Success|
+|5 |[test_CustOrdersDetail].[test CustOrdersDetail returns rows matching baseline]             |     93|Success|
+|6 |[test_CustOrdersDetail].[test CustOrdersDetail touches only mocked tables]                 |    134|Success|
+|7 |[test_CustOrdersDetail].[test CustOrdersDetail result set matches a hand-built expectation]|      4|Skipped|
+----------------------------------------------------------------------------------------
+Test Case Summary: 7 test case(s) executed, 6 succeeded, 1 skipped, 0 failed, 0 errored.
+----------------------------------------------------------------------------------------
+Caution: Changing any part of an object name could break scripts and stored procedures.
+Original proc restored.
+XEvent session stopped. Reading events...
+XEvent rows captured: 5
+Coverage hits recorded: 1
+  [3/7] dbo.CustOrdersOrders
+CaptureResultBaseline: test_CustOrdersOrders captured 4 col(s), 1 row(s).
+Generated 7 test(s) for [dbo].[CustOrdersOrders] as class [test_CustOrdersOrders].
+Instrumented procedure created: [dbo].[CustOrdersOrders_cov]
+RecordCoverageHit injections   : 1
+Registry IsExec lines          : 1
+Registry IsBranch lines        : 0
+EmitSearchSeedTests: 0 witness test(s) + 0 skip(s) into [test_CustOrdersOrders]
+XEL path: D:\Program Files\Microsoft SQL Server\MSSQL17.MSSQLSERVER\MSSQL\DATA\TestGenCoverage_20260616_121614
+Instrumenting CustOrdersOrders (fresh _cov every run)...
+Instrumented procedure created: [dbo].[CustOrdersOrders_cov]
+RecordCoverageHit injections   : 1
+Registry IsExec lines          : 1
+Registry IsBranch lines        : 0
+XEvent session started.
+Caution: Changing any part of an object name could break scripts and stored procedures.
+Original renamed to _orig.
+Synonym created: CustOrdersOrders -> CustOrdersOrders_cov
+Running: test_CustOrdersOrders (via synonym to instrumented proc)
+-->[test_CustOrdersOrders].[test CustOrdersOrders result set matches a hand-built expectation] skipped: MANUAL TEST REQUIRED: characterization scaffold - replace the auto-seed with a small designed dataset, fill #Expected with the hand-computed result, then remove the SkipTest annotation above to activate this test.
+ 
++----------------------+
+|Test Execution Summary|
++----------------------+
+ 
+|No|Test Case Name                                                                             |Dur(ms)|Result |
++--+-------------------------------------------------------------------------------------------+-------+-------+
+|1 |[test_CustOrdersOrders].[test CustOrdersOrders accepts high boundary values]               |     98|Success|
+|2 |[test_CustOrdersOrders].[test CustOrdersOrders accepts low boundary values]                |    105|Success|
+|3 |[test_CustOrdersOrders].[test CustOrdersOrders executes with valid inputs]                 |    201|Success|
+|4 |[test_CustOrdersOrders].[test CustOrdersOrders returns a stable result-set shape]          |    140|Success|
+|5 |[test_CustOrdersOrders].[test CustOrdersOrders returns rows matching baseline]             |    106|Success|
+|6 |[test_CustOrdersOrders].[test CustOrdersOrders touches only mocked tables]                 |    130|Success|
+|7 |[test_CustOrdersOrders].[test CustOrdersOrders result set matches a hand-built expectation]|     10|Skipped|
+----------------------------------------------------------------------------------------
+Test Case Summary: 7 test case(s) executed, 6 succeeded, 1 skipped, 0 failed, 0 errored.
+----------------------------------------------------------------------------------------
+Caution: Changing any part of an object name could break scripts and stored procedures.
+Original proc restored.
+XEvent session stopped. Reading events...
+XEvent rows captured: 5
+Coverage hits recorded: 1
+  [4/7] dbo.Employee Sales by Country
+CaptureResultBaseline: test_Employee Sales by Country captured 6 col(s), 5 row(s).
+Generated 7 test(s) for [dbo].[Employee Sales by Country] as class [test_Employee Sales by Country].
+Instrumented procedure created: [dbo].[Employee Sales by Country_cov]
+RecordCoverageHit injections   : 1
+Registry IsExec lines          : 1
+Registry IsBranch lines        : 0
+EmitSearchSeedTests: 0 witness test(s) + 0 skip(s) into [test_Employee Sales by Country]
+XEL path: D:\Program Files\Microsoft SQL Server\MSSQL17.MSSQLSERVER\MSSQL\DATA\TestGenCoverage_20260616_121618
+Instrumenting Employee Sales by Country (fresh _cov every run)...
+Instrumented procedure created: [dbo].[Employee Sales by Country_cov]
+RecordCoverageHit injections   : 1
+Registry IsExec lines          : 1
+Registry IsBranch lines        : 0
+XEvent session started.
+Caution: Changing any part of an object name could break scripts and stored procedures.
+Original renamed to _orig.
+Synonym created: Employee Sales by Country -> Employee Sales by Country_cov
+Running: test_Employee Sales by Country (via synonym to instrumented proc)
+-->[test_Employee Sales by Country].[test Employee Sales by Country result set matches a hand-built expectation] skipped: MANUAL TEST REQUIRED: characterization scaffold - replace the auto-seed with a small designed dataset, fill #Expected with the hand-computed result, then remove the SkipTest annotation above to activate this test.
+ 
++----------------------+
+|Test Execution Summary|
++----------------------+
+ 
+|No|Test Case Name                                                                                               |Dur(ms)|Result |
++--+-------------------------------------------------------------------------------------------------------------+-------+-------+
+|1 |[test_Employee Sales by Country].[test Employee Sales by Country accepts high boundary values]               |    255|Success|
+|2 |[test_Employee Sales by Country].[test Employee Sales by Country accepts low boundary values]                |    315|Success|
+|3 |[test_Employee Sales by Country].[test Employee Sales by Country executes with valid inputs]                 |    149|Success|
+|4 |[test_Employee Sales by Country].[test Employee Sales by Country returns a stable result-set shape]          |    503|Success|
+|5 |[test_Employee Sales by Country].[test Employee Sales by Country returns rows matching baseline]             |    430|Success|
+|6 |[test_Employee Sales by Country].[test Employee Sales by Country touches only mocked tables]                 |    313|Success|
+|7 |[test_Employee Sales by Country].[test Employee Sales by Country result set matches a hand-built expectation]|      8|Skipped|
+----------------------------------------------------------------------------------------
+Test Case Summary: 7 test case(s) executed, 6 succeeded, 1 skipped, 0 failed, 0 errored.
+----------------------------------------------------------------------------------------
+Caution: Changing any part of an object name could break scripts and stored procedures.
+Original proc restored.
+XEvent session stopped. Reading events...
+XEvent rows captured: 5
+Coverage hits recorded: 1
+  [5/7] dbo.Sales by Year
+CaptureResultBaseline: test_Sales by Year captured 4 col(s), 5 row(s).
+Generated 7 test(s) for [dbo].[Sales by Year] as class [test_Sales by Year].
+Instrumented procedure created: [dbo].[Sales by Year_cov]
+RecordCoverageHit injections   : 1
+Registry IsExec lines          : 1
+Registry IsBranch lines        : 0
+EmitSearchSeedTests: 0 witness test(s) + 0 skip(s) into [test_Sales by Year]
+XEL path: D:\Program Files\Microsoft SQL Server\MSSQL17.MSSQLSERVER\MSSQL\DATA\TestGenCoverage_20260616_121623
+Instrumenting Sales by Year (fresh _cov every run)...
+Instrumented procedure created: [dbo].[Sales by Year_cov]
+RecordCoverageHit injections   : 1
+Registry IsExec lines          : 1
+Registry IsBranch lines        : 0
+XEvent session started.
+Caution: Changing any part of an object name could break scripts and stored procedures.
+Original renamed to _orig.
+Synonym created: Sales by Year -> Sales by Year_cov
+Running: test_Sales by Year (via synonym to instrumented proc)
+-->[test_Sales by Year].[test Sales by Year result set matches a hand-built expectation] skipped: MANUAL TEST REQUIRED: characterization scaffold - replace the auto-seed with a small designed dataset, fill #Expected with the hand-computed result, then remove the SkipTest annotation above to activate this test.
+ 
++----------------------+
+|Test Execution Summary|
++----------------------+
+ 
+|No|Test Case Name                                                                       |Dur(ms)|Result |
++--+-------------------------------------------------------------------------------------+-------+-------+
+|1 |[test_Sales by Year].[test Sales by Year accepts high boundary values]               |    157|Success|
+|2 |[test_Sales by Year].[test Sales by Year accepts low boundary values]                |    173|Success|
+|3 |[test_Sales by Year].[test Sales by Year executes with valid inputs]                 |    212|Success|
+|4 |[test_Sales by Year].[test Sales by Year returns a stable result-set shape]          |    140|Success|
+|5 |[test_Sales by Year].[test Sales by Year returns rows matching baseline]             |    181|Success|
+|6 |[test_Sales by Year].[test Sales by Year touches only mocked tables]                 |    173|Success|
+|7 |[test_Sales by Year].[test Sales by Year result set matches a hand-built expectation]|      4|Skipped|
+----------------------------------------------------------------------------------------
+Test Case Summary: 7 test case(s) executed, 6 succeeded, 1 skipped, 0 failed, 0 errored.
+----------------------------------------------------------------------------------------
+Caution: Changing any part of an object name could break scripts and stored procedures.
+Original proc restored.
+XEvent session stopped. Reading events...
+XEvent rows captured: 5
+Coverage hits recorded: 1
+  [6/7] dbo.SalesByCategory
+CaptureResultBaseline: test_SalesByCategory captured 2 col(s), 0 row(s).
+Generated 8 test(s) for [dbo].[SalesByCategory] as class [test_SalesByCategory].
+Instrumented procedure created: [dbo].[SalesByCategory_cov]
+RecordCoverageHit injections   : 2
+Registry IsExec lines          : 2
+Registry IsBranch lines        : 1
+EmitSearchSeedTests: 0 witness test(s) + 0 skip(s) into [test_SalesByCategory]
+XEL path: D:\Program Files\Microsoft SQL Server\MSSQL17.MSSQLSERVER\MSSQL\DATA\TestGenCoverage_20260616_121626
+Instrumenting SalesByCategory (fresh _cov every run)...
+Instrumented procedure created: [dbo].[SalesByCategory_cov]
+RecordCoverageHit injections   : 2
+Registry IsExec lines          : 2
+Registry IsBranch lines        : 1
+XEvent session started.
+Caution: Changing any part of an object name could break scripts and stored procedures.
+Original renamed to _orig.
+Synonym created: SalesByCategory -> SalesByCategory_cov
+Running: test_SalesByCategory (via synonym to instrumented proc)
+-->[test_SalesByCategory].[test SalesByCategory result set matches a hand-built expectation] skipped: MANUAL TEST REQUIRED: characterization scaffold - replace the auto-seed with a small designed dataset, fill #Expected with the hand-computed result, then remove the SkipTest annotation above to activate this test.
+-->[test_SalesByCategory].[test SalesByCategory executes @OrdYear = 1996 path] skipped: MANUAL TEST REQUIRED: no analysable branches were found in this part of the procedure - only a smoke run was generated. Assert its behaviour by hand.
+NOTE: result set is EMPTY for the generated seed/args - the baseline comparison is trivial; design a seed that returns rows.
+ 
++----------------------+
+|Test Execution Summary|
++----------------------+
+ 
+|No|Test Case Name                                                                           |Dur(ms)|Result |
++--+-----------------------------------------------------------------------------------------+-------+-------+
+|1 |[test_SalesByCategory].[test SalesByCategory accepts high boundary values]               |    271|Success|
+|2 |[test_SalesByCategory].[test SalesByCategory accepts low boundary values]                |    279|Success|
+|3 |[test_SalesByCategory].[test SalesByCategory executes with valid inputs]                 |    366|Success|
+|4 |[test_SalesByCategory].[test SalesByCategory returns a stable result-set shape]          |    331|Success|
+|5 |[test_SalesByCategory].[test SalesByCategory returns rows matching baseline]             |    222|Success|
+|6 |[test_SalesByCategory].[test SalesByCategory touches only mocked tables]                 |    434|Success|
+|7 |[test_SalesByCategory].[test SalesByCategory executes @OrdYear = 1996 path]              |     10|Skipped|
+|8 |[test_SalesByCategory].[test SalesByCategory result set matches a hand-built expectation]|      8|Skipped|
+----------------------------------------------------------------------------------------
+Test Case Summary: 8 test case(s) executed, 6 succeeded, 2 skipped, 0 failed, 0 errored.
+----------------------------------------------------------------------------------------
+Caution: Changing any part of an object name could break scripts and stored procedures.
+Original proc restored.
+XEvent session stopped. Reading events...
+XEvent rows captured: 10
+Coverage hits recorded: 2
+  [7/7] dbo.Ten Most Expensive Products
+CaptureResultBaseline: test_Ten Most Expensive Products captured 2 col(s), 5 row(s).
+Generated 5 test(s) for [dbo].[Ten Most Expensive Products] as class [test_Ten Most Expensive Products].
+Instrumented procedure created: [dbo].[Ten Most Expensive Products_cov]
+RecordCoverageHit injections   : 2
+Registry IsExec lines          : 2
+Registry IsBranch lines        : 0
+EmitSearchSeedTests: 0 witness test(s) + 0 skip(s) into [test_Ten Most Expensive Products]
+XEL path: D:\Program Files\Microsoft SQL Server\MSSQL17.MSSQLSERVER\MSSQL\DATA\TestGenCoverage_20260616_121631
+Instrumenting Ten Most Expensive Products (fresh _cov every run)...
+Instrumented procedure created: [dbo].[Ten Most Expensive Products_cov]
+RecordCoverageHit injections   : 2
+Registry IsExec lines          : 2
+Registry IsBranch lines        : 0
+XEvent session started.
+Caution: Changing any part of an object name could break scripts and stored procedures.
+Original renamed to _orig.
+Synonym created: Ten Most Expensive Products -> Ten Most Expensive Products_cov
+Running: test_Ten Most Expensive Products (via synonym to instrumented proc)
+-->[test_Ten Most Expensive Products].[test Ten Most Expensive Products result set matches a hand-built expectation] skipped: MANUAL TEST REQUIRED: characterization scaffold - replace the auto-seed with a small designed dataset, fill #Expected with the hand-computed result, then remove the SkipTest annotation above to activate this test.
+ 
++----------------------+
+|Test Execution Summary|
++----------------------+
+ 
+|No|Test Case Name                                                                                                   |Dur(ms)|Result |
++--+-----------------------------------------------------------------------------------------------------------------+-------+-------+
+|1 |[test_Ten Most Expensive Products].[test Ten Most Expensive Products executes with valid inputs]                 |     76|Success|
+|2 |[test_Ten Most Expensive Products].[test Ten Most Expensive Products returns a stable result-set shape]          |    123|Success|
+|3 |[test_Ten Most Expensive Products].[test Ten Most Expensive Products returns rows matching baseline]             |    244|Success|
+|4 |[test_Ten Most Expensive Products].[test Ten Most Expensive Products touches only mocked tables]                 |    115|Success|
+|5 |[test_Ten Most Expensive Products].[test Ten Most Expensive Products result set matches a hand-built expectation]|      4|Skipped|
+----------------------------------------------------------------------------------------
+Test Case Summary: 5 test case(s) executed, 4 succeeded, 1 skipped, 0 failed, 0 errored.
+----------------------------------------------------------------------------------------
+Caution: Changing any part of an object name could break scripts and stored procedures.
+Original proc restored.
+XEvent session stopped. Reading events...
+XEvent rows captured: 6
+Coverage hits recorded: 2
+/* =============== DATABASE COVERAGE REPORT HTML =============== */
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>UnitAutogen Coverage Report</title><style>body{font-family:Segoe UI,Arial,sans-serif;margin:20px;color:#222}h2{margin:0 0 2px}.meta{color:#777;font-size:12px;margin:0 0 14px}.cards{display:flex;gap:14px;margin-bottom:16px;flex-wrap:wrap}.card{border:1px solid #ddd;border-radius:6px;padding:10px 16px;min-width:150px}.big{font-size:30px;font-weight:bold}.lbl{font-size:12px;color:#777}.g{color:#1a7f37}.a{color:#9a6700}.r{color:#cf222e}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #ddd;padding:4px 8px;text-align:right}th{background:#f3f3f3}td.l,th.l{text-align:left}tr.total{font-weight:bold;background:#f3f3f3}</style></head><body><h2>UnitAutogen &mdash; Database Coverage Report</h2><p class="meta">NorthWind-v0.16.1 &middot; 2026-06-16 06:46:00 &middot; 7 objects (0 failed generation, 0 not testable)</p><div class="cards"><div class="card"><div class="big g">100.0%</div><div class="lbl">Line coverage<br>9/9 lines</div></div><div class="card"><div class="big g">100.0%</div><div class="lbl">Branch coverage<br>1/1 branches</div></div><div class="card"><div class="big">48</div><div class="lbl">Tests &middot; <span class="g">40 pass 83.3%</span>, <span class="r">0 fail 0.0%</span>, 0 err 0.0%, 8 skip 16.7%</div></div><div class="card"><div class="big g">100.0%</div><div class="lbl">Autonomy<br>48 of 48 tests framework-owned<br><span style="color:#999">0 user-modified</span></div></div></div><table><tr><th class="l">Schema</th><th class="l">Object</th><th>Testable</th><th>Gen</th><th>Tests</th><th>Pass</th><th>Fail</th><th>Err</th><th>Skip</th><th>Lines</th><th>Covered</th><th>Line %</th><th>Branch %</th></tr><tr><td class="l">dbo</td><td class="l">CustOrderHist</td><td><span class="g">Y</span></td><td>Y</td><td>7</td><td>6</td><td>0</td><td>0</td><td>1</td><td>1</td><td>1</td><td class="g">100.0%</td><td style="color:#999">n/a</td></tr><tr><td class="l">dbo</td><td class="l">CustOrdersDetail</td><td><span class="g">Y</span></td><td>Y</td><td>7</td><td>6</td><td>0</td><td>0</td><td>1</td><td>1</td><td>1</td><td class="g">100.0%</td><td style="color:#999">n/a</td></tr><tr><td class="l">dbo</td><td class="l">CustOrdersOrders</td><td><span class="g">Y</span></td><td>Y</td><td>7</td><td>6</td><td>0</td><td>0</td><td>1</td><td>1</td><td>1</td><td class="g">100.0%</td><td style="color:#999">n/a</td></tr><tr><td class="l">dbo</td><td class="l">Employee Sales by Country</td><td><span class="g">Y</span></td><td>Y</td><td>7</td><td>6</td><td>0</td><td>0</td><td>1</td><td>1</td><td>1</td><td class="g">100.0%</td><td style="color:#999">n/a</td></tr><tr><td class="l">dbo</td><td class="l">Sales by Year</td><td><span class="g">Y</span></td><td>Y</td><td>7</td><td>6</td><td>0</td><td>0</td><td>1</td><td>1</td><td>1</td><td class="g">100.0%</td><td style="color:#999">n/a</td></tr><tr><td class="l">dbo</td><td class="l">SalesByCategory</td><td><span class="g">Y</span></td><td>Y</td><td>8</td><td>6</td><td>0</td><td>0</td><td>2</td><td>2</td><td>2</td><td class="g">100.0%</td><td class="g">100.0%</td></tr><tr><td class="l">dbo</td><td class="l">Ten Most Expensive Products</td><td><span class="g">Y</span></td><td>Y</td><td>5</td><td>4</td><td>0</td><td>0</td><td>1</td><td>2</td><td>2</td><td class="g">100.0%</td><td style="color:#999">n/a</td></tr><tr class="total"><td class="l" colspan="4">TOTAL &mdash; 7 objects (7 testable, 0 not)</td><td>48</td><td>40</td><td>0</td><td>0</td><td>8</td><td>9</td><td>9</td><td>100.0%</td><td>100.0%</td></tr></table></body></html>
+/* =================== END HTML =================== */
+
+Completion time: 2026-06-16T12:16:32.9983255+05:30

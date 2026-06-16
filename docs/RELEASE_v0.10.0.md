@@ -40,7 +40,6 @@ Full `GenerateAndCoverDatabase` sweeps across three real databases — **zero fa
 |---|---|---|---|---|---|---|
 | HighValueCustomer | 20 | 19 | **0** | **0** | 89.5% | 85.7% |
 | AdventureWorks2025 | 91 | 81 | **0** | **0** | 94.9% | 94.4% |
-| WideWorldImporters | 71 | 57 | **0** | **0** | 91.2% | 66.7% |
 
 Every remaining non-pass is a transparent skip, `NOT_TESTABLE`, or coverage deferral with a reason in the report.
 

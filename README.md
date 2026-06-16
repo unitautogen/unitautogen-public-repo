@@ -11,7 +11,7 @@ It is built on top of the open-source [tSQLt](https://tsqlt.org) framework. The 
 ---
 
 **Website:** [unitautogen.com](https://unitautogen.com) · **Status: Beta** — see [Releases](https://github.com/unitautogen/unitautogen-public-repo/releases) for the current version, or install the latest from the [PowerShell Gallery](https://www.powershellgallery.com/packages/UnitAutogen).
-Validated end-to-end against AdventureWorks, Northwind, and WideWorldImporters. Expect rough edges on production schemas it hasn't seen. See [docs/what-works.md](docs/what-works.md) for the honest scope.
+Validated end-to-end against AdventureWorks and Northwind. Expect rough edges on production schemas it hasn't seen. See [docs/what-works.md](docs/what-works.md) for the honest scope.
 
 ---
 
@@ -20,6 +20,8 @@ Validated end-to-end against AdventureWorks, Northwind, and WideWorldImporters. 
 One command generates the tests, runs them, measures coverage, and emits the CI-standard artifacts your pipeline already understands — Cobertura (coverage), JUnit (test results), and a human-readable HTML report:
 
 ![End to end: one PowerShell command to coverage report to Cobertura and JUnit](assets/end-to-end.png)
+
+**Want the full walkthrough?** [`docs/worked-example.md`](docs/worked-example.md) runs UnitAutogen on a clean, stock AdventureWorks2025 (the real HTML coverage report — 19 objects, 94.9% line / 94.4% branch, 100% autonomous), then takes two example procedures up close — definitions, the generated tests, and the assertions inside them (one at 100%, one at an honest 90% with the missing line named).
 
 ---
 
@@ -148,6 +150,7 @@ Full usage guide: [`powershell/USAGE.md`](powershell/USAGE.md).
 | Document                                          | When to read it                                                                                |
 |---------------------------------------------------|------------------------------------------------------------------------------------------------|
 | [docs/quickstart.md](docs/quickstart.md)          | First 15 minutes - install, generate, see a coverage report.                                   |
+| [docs/worked-example.md](docs/worked-example.md) | End-to-end: a clean AdventureWorks2025 sweep (real HTML report), then two example procedures up close — definitions, generated tests, coverage. |
 | [docs/EASY_USAGE.md](docs/EASY_USAGE.md)          | The four commands that cover 80% of normal usage. Start here after the quickstart.             |
 | [docs/ADVANCED_USAGE.md](docs/ADVANCED_USAGE.md)  | Every user-facing method, every switch, the custom-test-class pattern.                         |
 | [docs/REFERENCE_GUIDE.md](docs/REFERENCE_GUIDE.md)| Complete reference - every method, the coverage architecture, troubleshooting, feature history.|

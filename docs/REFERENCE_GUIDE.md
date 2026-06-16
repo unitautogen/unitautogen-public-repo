@@ -1,8 +1,10 @@
-# tSQLt Auto-Generation Framework v10.0.8 — Usage Guide
+# UnitAutogen — Reference Guide
+
+> **Versioning note.** UnitAutogen's public beta is versioned **0.x** (see [`VERSION`](../VERSION) for the current build). The **v9.x / v10.x** numbers in the feature history below are the **pre-public internal release lines** where each capability first landed — kept as a record of how the engine evolved, not as separate products. The current 0.x beta is the continuation of that work.
 
 ## What's new in v10.0.8
 
-v10.0.8 is the **final stable release** of the v10 line.  It closes
+v10.0.8 was the final release of the pre-public **v10 internal line** (the engine now ships as the 0.x public beta).  It closes
 four pre-emptive robustness gaps in the coverage instrumenter's line
 walker — each a theoretical-but-realistic case where a real proc could
 trip a false statement boundary.  v10.0.7 did not exhibit any of these
@@ -13,7 +15,6 @@ Validated on:
 
 - AdventureWorks2025: 167 pass / 0 fail / 87.1% line / 79.7% branch / 100% autonomy
 - Northwind:          42 pass / 0 fail / 100% line / 100% branch / 100% autonomy (identical to v10.0.7)
-- WideWorldImporters: 24 pass / 0 fail / 0 err / 94.2% line / 100% autonomy (identical to v10.0.7)
 
 The four:
 
@@ -46,7 +47,6 @@ Validated on:
 
 - AdventureWorks2025: 167 pass / 0 fail / 88.3% line coverage
 - Northwind:          42 pass / 0 fail / 100% line coverage / 9 lines
-- WideWorldImporters: 24 pass / 0 fail / 0 err / 94.2% line / 100% autonomy
 
 Other v10 features (cumulative since v9.4.4):
 

@@ -28,6 +28,9 @@ obj/
 *.tmp
 TestResults/
 coverage/
+reports/*
+# ...but DO commit the curated v0.16.1 showcase reports (linked from docs/worked-example.md)
+!reports/v0.16.1/
 
 # Secrets — never commit
 .env
