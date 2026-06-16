@@ -2,7 +2,7 @@
 
 > **Built on tSQLt — auto-generated unit tests with real branch coverage.**
 
-![UnitAutogen coverage report: 94.9% line, 94.4% branch, 100% autonomous on a full AdventureWorks2025 sweep](assets/hero-coverage.png)
+![UnitAutogen coverage report: 95.2% line, 94.7% branch, 100% autonomous on a full AdventureWorks2025 sweep](assets/hero-coverage.png)
 
 UnitAutogen is a framework for SQL Server that **reads a stored procedure, generates a complete tSQLt unit-test class for it, and reports real line *and* branch coverage** of the test run. Point it at a procedure; minutes later you have a runnable test class that exercises every IF / CASE / EXISTS path and a coverage report that tells you what was actually hit.
 
@@ -21,7 +21,7 @@ One command generates the tests, runs them, measures coverage, and emits the CI-
 
 ![End to end: one PowerShell command to coverage report to Cobertura and JUnit](assets/end-to-end.png)
 
-**Want the full walkthrough?** [`docs/worked-example.md`](docs/worked-example.md) runs UnitAutogen on a clean, stock AdventureWorks2025 (the real HTML coverage report — 19 objects, 94.9% line / 94.4% branch, 100% autonomous), then takes two example procedures up close — definitions, the generated tests, and the assertions inside them (one at 100%, one at an honest 90% with the missing line named).
+**Want the full walkthrough?** [`docs/worked-example.md`](docs/worked-example.md) runs UnitAutogen on a clean, stock AdventureWorks2025 (the real HTML coverage report — 19 objects, 95.2% line / 94.7% branch, 100% autonomous), then takes two example procedures up close — definitions, the generated tests, and the assertions inside them (one at 100%, one at an honest 90% with the missing line named).
 
 ---
 
@@ -29,7 +29,7 @@ One command generates the tests, runs them, measures coverage, and emits the CI-
 
 The SQL Server testing ecosystem already has unit-testing frameworks (tSQLt, Redgate SQL Test, Devart dbForge Unit Test) and coverage tools (SQLCover, SQLServerCoverage). Every one of them assumes a human has already written the tests. **UnitAutogen is the missing front half.** It writes the tests, runs them, and measures real branch coverage — converting "we should write tests for these 200 legacy procs" from a person-months task into an afternoon's curation.
 
-![Branch coverage: 50% with line-only tools versus 94.4% with UnitAutogen on the same tests](assets/branch-before-after.png)
+![Branch coverage: 50% with line-only tools versus 94.7% with UnitAutogen on the same tests](assets/branch-before-after.png)
 
 ## How it works: reverse predicate seeding
 
@@ -175,7 +175,7 @@ Full architecture: [docs/architecture.md](docs/architecture.md).
 
 UnitAutogen is in active Beta, labelled Beta because real-world testing only happens at scale once strangers run it on their own schemas. The engineering has been validated on three reference databases at high coverage, but you will surface things on production schemas that nobody has tried. Bug reports are the most valuable thing you can give us right now.
 
-**Recently shipped (v0.13 → v0.14.1):**
+**Recently shipped (through v0.16.1):**
 
 - Branch tests rebuilt to **Arrange-Act-Assert** with *measured effect* assertions — INSERT / DELETE / UPDATE effects verified before and after the call, not merely executed (fixes an assert-before-run defect)
 - **Scalar OUTPUT-parameter value assertions** — exact for deterministic outputs, a constant `LIKE` skeleton for volatile ones, with determinism confirmed by double measurement

@@ -12,8 +12,8 @@ Two reference databases at the time of this Beta release:
 
 | Database              | Pass rate          | Coverage          | Autonomy |
 | --------------------- | ------------------ | ----------------- | -------- |
-| AdventureWorks 2025   | 167 / 167 pass     | 87.1% line / 79.7% branch | 100% |
-| Northwind             | 42 / 42 pass       | 100% line / 100% branch   | 100% |
+| AdventureWorks 2025   | 57 / 67 pass (10 skip) | 95.2% line / 94.7% branch | 100% |
+| Northwind             | 40 / 48 pass (8 skip)  | 100% line / 100% branch   | 100% |
 
 If you run UnitAutogen on a database in this list and see materially different
 numbers, please open a bug report — that's a regression worth investigating.
