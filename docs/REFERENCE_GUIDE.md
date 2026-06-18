@@ -2,6 +2,21 @@
 
 > **Versioning note.** UnitAutogen's public beta is versioned **0.x** (see [`VERSION`](../VERSION) for the current build). The **v9.x / v10.x** numbers in the feature history below are the **pre-public internal release lines** where each capability first landed — kept as a record of how the engine evolved, not as separate products. The current 0.x beta is the continuation of that work.
 
+## What's new in the 0.x public beta
+
+The public beta (0.x) is where the engine became a full **data-shape reverse seeder**. Highlights, newest first — see [`CHANGES.md`](../CHANGES.md) for the complete log:
+
+- **v0.16.7** — nondeterministic-gate guard: a branch driven by a clock (`GETDATE` / `SYSDATETIME`), `NEWID`, or `RAND` is reported `NOT_TESTABLE` up front instead of being brute-forced, plus a search wall-clock budget and a seed-row knob cap.
+- **v0.16.6** — `IN` / `BETWEEN` recognition in the in-database (SQLCLR) predicate parser: one TRUE test per `IN` value; `BETWEEN` seeded as a range.
+- **v0.16.5** — `OR` per-arm coverage: one TRUE test per disjunct.
+- **v0.16.4** — temp-table tracing (`SELECT … INTO #t FROM <base>`) and a fail-safe guard for parenthesised derived expressions.
+- **v0.16.2** — configurable `@MaxSeedRows`, date/string range seeding, and a "provably unreachable" dead-branch warning.
+- **v0.14** — branch tests rebuilt to Arrange-Act-Assert with *measured-effect* assertions; scalar `OUTPUT`-parameter value assertions (v0.14.1).
+- **v0.13** — the predicate parser moved **in-database** as a single SQLCLR (ScriptDom) component, removing the PowerShell-side parser.
+- **v0.10–v0.12** — reverse **predicate seeding**: deriving the seed rows that drive each branch (joins, aggregates, `OR` / DNF, `NULL` semantics, cross-column and parameter comparands).
+
+The internal **v9.x / v10.x** sections below predate the public beta and are kept as engineering history.
+
 ## What's new in v10.0.8
 
 v10.0.8 was the final release of the pre-public **v10 internal line** (the engine now ships as the 0.x public beta).  It closes

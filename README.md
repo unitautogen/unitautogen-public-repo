@@ -35,7 +35,7 @@ The SQL Server testing ecosystem already has unit-testing frameworks (tSQLt, Red
 
 Mocking a table is the easy half — and on its own it isn't enough. `tSQLt.FakeTable` hands you an **empty** table, which only ever exercises the "no rows" arm of a branch. To reach the *other* arm, someone has to insert rows that actually satisfy the procedure's conditions. Every other tool leaves that to you.
 
-UnitAutogen does it automatically. It parses each branch predicate — `WHERE`, `IF` / `CASE`, `JOIN` / `EXISTS` / `NOT EXISTS`, aggregate gates (`COUNT` / `SUM` / `MIN` / `MAX`), `OR` / DNF compositions, `NULL` checks, parameter comparisons — and works **backwards** from it to synthesize the exact seed rows that drive that branch to a chosen direction, both the TRUE and the FALSE side.
+UnitAutogen does it automatically. It parses each branch predicate — `WHERE`, `IF` / `CASE`, `JOIN` / `EXISTS` / `NOT EXISTS`, aggregate gates (`COUNT` / `SUM` / `MIN` / `MAX`), `IN` / `BETWEEN` lists and ranges, `OR` / DNF compositions, `NULL` checks, parameter comparisons — and works **backwards** from it to synthesize the exact seed rows that drive that branch to a chosen direction, both the TRUE and the FALSE side.
 
 ```sql
 -- a gate inside your procedure:
@@ -59,6 +59,11 @@ Run these in SSMS from the repo root. The two install files are each
 self-contained, so the simplest path is to just **open each `.sql` file in SSMS and
 press F5** — no SQLCMD Mode needed. The script below uses `:r` includes purely as a
 convenience; for those, turn on **SQLCMD Mode** first (Query → SQLCMD Mode).
+
+**Prefer not to clone?** Download `UnitAutogen-<version>-install.zip` from the
+[Releases page](https://github.com/unitautogen/unitautogen-public-repo/releases), extract it,
+and in SSMS run `1_Install_UnitAutogen.sql` then `2_Install-UnitAutogenClr.SSMS.sql` against
+your database — full walkthrough in [INSTALL.md](INSTALL.md).
 
 ```sql
 -- 1. Install the framework into your database (idempotent; safe to re-run)
@@ -175,8 +180,12 @@ Full architecture: [docs/architecture.md](docs/architecture.md).
 
 UnitAutogen is in active Beta, labelled Beta because real-world testing only happens at scale once strangers run it on their own schemas. The engineering has been validated on three reference databases at high coverage, but you will surface things on production schemas that nobody has tried. Bug reports are the most valuable thing you can give us right now.
 
-**Recently shipped (through v0.16.1):**
+**Recently shipped (through v0.16.7):**
 
+- **`IN` / `BETWEEN` / `OR` data-shape seeding** — `WHERE col IN (v1, v2, …)` now generates one TRUE test per value, `col BETWEEN a AND b` becomes a seedable range, and each arm of an `OR` predicate gets its own covering test (in-database SQLCLR parser)
+- **Nondeterministic-gate guard** — a branch whose value derives from a clock (`GETDATE` / `SYSDATETIME`), `NEWID`, or `RAND` is detected and reported `NOT_TESTABLE` up front *with the reason*, instead of the seeder brute-forcing an unsatisfiable search; the search also has wall-clock and seed-row backstops
+- **Temp-table tracing** — a branch gated on a `#temp` populated by `SELECT … INTO #t FROM <base>` is traced back to its base table and seeded (the procedure fills the temp at run time)
+- **Configurable seed-row cap, date/string range seeding, and a "provably unreachable" dead-branch warning** — `@MaxSeedRows` is now tunable per run; `>` `>=` `<` `<=` on dates and strings are seeded (reporting windows, alphabetical filters); a single-column contradiction (e.g. `x > y AND x < y`) is reported as dead code instead of a silent skip
 - Branch tests rebuilt to **Arrange-Act-Assert** with *measured effect* assertions — INSERT / DELETE / UPDATE effects verified before and after the call, not merely executed (fixes an assert-before-run defect)
 - **Scalar OUTPUT-parameter value assertions** — exact for deterministic outputs, a constant `LIKE` skeleton for volatile ones, with determinism confirmed by double measurement
 - NULL tests **off by default** — covers the NULL handling a procedure actually contains rather than a speculative per-parameter test (`@EmitNullChecks = 1` opts back in)

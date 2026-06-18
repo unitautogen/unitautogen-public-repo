@@ -49,16 +49,16 @@ That's it. Output prints into the SSMS messages tab and looks like:
 ```
 === TestGen.GenerateAndRunCoverage: dbo.uspGetBillOfMaterials ===
 --- Step 1 of 2: generate + install the test class ---
-... 12 tests generated for test_uspGetBillOfMaterials.
+... 7 tests generated for test_uspGetBillOfMaterials.
 --- Step 2 of 2: run + measure coverage ---
-+----------------------+--------+--------+---------+
-| Test                 | Result | Time   | ...     |
-| test path branch 1   | PASS   | 12 ms  |         |
++------------------------------+--------+--------+
+| Test                         | Result | Time   |
+| executes with valid inputs   | PASS   | 12 ms  |
 ... (one row per generated test)
-+----------------------+--------+--------+---------+
-Line coverage   : 87.5 %  (35 / 40)
-Branch coverage : 80.0 %  (12 / 15)
-Autonomy        : 100 %   (12 of 12 tests pass without manual edits)
++------------------------------+--------+--------+
+Line coverage   : 100.0 %  (1 / 1)
+Branch coverage : n/a       (single set-based statement — no branches)
+Autonomy        : 100 %    (7 of 7 tests generated, 0 hand-edited)
 ```
 
 ---

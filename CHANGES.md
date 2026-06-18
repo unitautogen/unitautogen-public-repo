@@ -8947,3 +8947,247 @@ STILL OPEN (deferred to v0.16.2 - build cleanly in a new session):
 
 FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
 (byte-identical). dist/UnitAutogen-0.16.1-install.zip rebuilt.
+
+
+================================================================================
+2026-06-17  v0.16.2  SEEDER ROBUSTNESS PASS (external code-review items, batch 1 of 2)
+================================================================================
+Scope: the v0.16.1-deferred residuals (parenthesised sub-expr; date '<=' agg filter;
+temp-table tracing) PLUS the actionable items from an external code review of the
+deterministic reverse-seeder (module 32). Recalibration of that review: items #7
+(cross-column tight boundary), #9 (search-based loop-local seeding) and the FK half
+of #4 are ALREADY shipped (the reviewer saw module 32 only, not module 04); CHECK/
+UNIQUE seeding is moot because tSQLt.FakeTable strips constraints on the faked target.
+
+--- #6  CONFIGURABLE SEED-ROW CAP -------------------------------------------------
+Root cause: the per-table/per-predicate seed-row cap was hardcoded @MaxSeedRows = 500
+in two seeder procs (ExecuteSeedPlan, SatisfyPredicate) -> a COUNT(*) gate needing
+>500 rows always honest-skipped with no way to raise it.
+Fix: new @MaxSeedRows INT = 500 parameter on TestGen.GenerateAndRunCoverage and
+TestGen.GenerateAndCoverDatabase. Each orchestrator clamps NULL/<1 to 500 and
+publishes the value via SESSION_CONTEXT(N'UAG_MaxSeedRows') so it crosses the deep
+call chain without threading a parameter through every routine; the two cap sites read
+ISNULL(TRY_CAST(SESSION_CONTEXT(N'UAG_MaxSeedRows') AS INT), 500). Default behaviour is
+unchanged (500). The two orchestrators do not call each other, so there is no nested
+clobber; an unset context (e.g. seeder called directly) falls back to 500.
+VALIDATED on AdventureWorks2025 with synthetic pz.BigCountGate ("COUNT(*) > 600"):
+@MaxSeedRows=500 -> both arms NOT_TESTABLE "seed row count exceeds cap" -> branch 50%
+(1/2); @MaxSeedRows=1000 -> both arms seeded -> 100% line + 100% branch. Regression
+pz.CountEqGate unchanged at 100%/100%. Synthetic dropped.
+
+--- #8  CONTRADICTION -> PROVABLY-UNREACHABLE WARNING ------------------------------
+Root cause: when the cross-column resolver could not satisfy a column's constraints it
+fell through to a generic best-effort skip, even when the constraints were a genuine
+contradiction (e.g. x > y AND x < y) - the user got no signal that the branch is dead
+code rather than merely hard to seed.
+Fix: new pure function TestGen.SatisfyAllStatus(@ConstraintsJson) classifies why
+SatisfyAll cannot produce a value - 'SAT' / 'CONTRADICTION' (conflicting '=', '='
+outside [lo,hi], empty range lo>hi, '<>' exhausting a bounded range) / 'UNSUPPORTED'
+(string ordering, empty set); it mirrors SatisfyAll's control flow exactly. ExecuteSeedPlan
+then, AFTER the relaxation loop and ONLY for @Direction='TRUE', flags a column that has a
+single anchor, no literal part, and a CONTRADICTION status as a dead THEN arm:
+"PROVABLY UNREACHABLE: the predicate can never be TRUE ... this branch (THEN arm) is dead
+code." Soundness guards: (a) gated to the TRUE direction so the reachable FALSE arm is
+never mislabelled (making a conjunction false needs only ONE conjunct violated); (b) OR
+predicates are filtered upstream by the DNF driver, so a contradiction reaching here is
+the binding constraint; (c) single-anchor + no-literal keeps the claim seeding-INDEPENDENT.
+VALIDATED: SatisfyAllStatus unit-tested on 9 cases (lit-range, x>y&x<y, =k1&=k2, string
+=A&=B, want=0 flips, empty -> all correct). Synthetic pz.DeadXColGate
+("EXISTS WHERE A > B AND A < B") -> TRUE arm flagged PROVABLY UNREACHABLE, FALSE arm seeds
+& covers normally (NO false dead-code label - an earlier un-gated version wrongly flagged
+the FALSE arm; fixed). Regression pz.ContradictionGate (a COUNT-conflict, different path)
+UNCHANGED ("needs 2 rows but 5 already required", 1/2). Synthetic dropped.
+
+--- #1  NON-NUMERIC (DATE / STRING) INEQUALITY SEEDING (+ backlog item 2) ----------
+Root cause: TestGen.SatisfyingValue returned NULL for every string/date <,<=,>,>= comparand
+(only numeric inequalities were handled) -> date-range and alphabetical-filter WHERE clauses were
+silently unseedable; and the aggregate-filter seed builder defaulted date columns to the far-future
+'99991231', which a "col <= '<date>'" filter excludes (aggregate -> NULL).
+Fix: SatisfyingValue now handles the 4 inequality ops for non-numeric comparands too, returning a
+comparand-DERIVED T-SQL expression (no fragile quote/collation predecessor logic):
+  - DATE/DATETIME (TRY_CAST of the unquoted inner value -> DATETIME2): step a day past the bound;
+    '>' sat=DATEADD(DAY,1,lit) viol=lit; '>=' sat=lit viol=DATEADD(-1); '<' sat=DATEADD(-1) viol=lit;
+    '<=' sat=lit viol=DATEADD(1).
+  - STRING (collation-safe ends only; hard middle stays honest NULL): just-after = lit + NCHAR(65535);
+    just-before = LEFT(lit,0) (empty string).
+The aggregate-filter cursor (fltcur) now reuses SatisfyingValue for a NON-numeric range filter (the
+shared date-dispatch the backlog called for), so "AVG(x) ... WHERE d <= '<date>'" seeds an included
+row instead of the excluded far-future default. NOT yet coverage-tested (deferred per request).
+
+--- v0.16.2 RELEASE SUMMARY -------------------------------------------------------
+SHIPPED (4): #6 configurable @MaxSeedRows cap; #8 contradiction -> PROVABLY-UNREACHABLE
+warning (+ new TestGen.SatisfyAllStatus classifier); #1 non-numeric (date/string)
+inequality seeding; backlog item 2 date '<=' aggregate filter (reuses #1's SatisfyingValue
+date dispatch). #6 and #8 are coverage-verified on AdventureWorks2025; #1 + the date filter
+are compile-clean and passed a release sanity (pz CountEqGate / ScalarCmpGate / SumGate all
+100% line+branch, 0 fail / 0 err - the broad SatisfyingValue change did not regress numeric/
+scalar/sum seeding). Full date/string-range coverage validation deferred to a focused pass.
+
+DEFERRED to v0.16.3 (the deeper changes): #2 OR per-arm coverage; #10 IN/BETWEEN enumeration;
+parenthesised sub-expressions in a derived local; temp-table tracing (Reconcile L77
+SELECT...INTO #temp); #5 COUNT(col) NULL semantics (needs the in-DB CLR parser to record the
+counted column). These touch the predicate-branch test generator (multiplication), the
+PERROW-ARITH expression parser, and the SQLCLR parser - each a focused, separately-verified
+change.
+
+FILES: Install_UnitAutogen.sql + powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(byte-identical); VERSION + powershell/UnitAutogen/UnitAutogen.psd1 -> 0.16.2;
+dist/UnitAutogen-0.16.2-install.zip built.
+
+
+================================================================================
+2026-06-17  v0.16.4  SEEDER ROBUSTNESS PASS (temp-table tracing + parens guard)
+================================================================================
+The deeper items deferred from v0.16.2 (test-generator / parser changes).
+
+--- TEMP-TABLE TRACING (SELECT...INTO #temp) ---------------------------------------
+Root cause: a gate over a #temp (e.g. WHILE @i <= (SELECT COUNT(*) FROM #PendingTrades),
+where #PendingTrades is built by SELECT...INTO from a base table) could not be seeded - the
+#temp is absent from the catalog at generation time, so ExecuteSeedPlan skipped "tree target
+table not found" AND the generator tried to FakeTable the #temp (fails at run time).
+Fix (two sites): (1) ExecuteSeedPlan traces "SELECT ... INTO #temp ... FROM <base>" in the
+proc-under-test body back to <base> (a real catalog table) and retargets the seed there - the
+proc itself copies <base> -> #temp at run time, so seeding <base> drives the #temp gate;
+fail-safe (no single real base resolved -> the honest skip stays). (2) GeneratePredicateBranchTests
+no longer emits SafeFakeTable for a #temp target (LEFT(table,1)='#') - a proc-created temp cannot
+be faked; its traced base is faked+seeded instead.
+VALIDATED on synthetic pz.TempGate ("SELECT...INTO #T FROM pz.RawSrc; IF (SELECT COUNT(*) FROM
+#T) > 3 ..."): was a "tree target table not found" skip; now 100% line (3/3) + 100% branch (2/2),
+4 passed / 0 err / 0 skip. (The verify loop caught an intermediate state where the seed retarget
+alone left an errored FakeTable #T - fixed by site 2.) Regression pz.CountEqGate unchanged. Synthetic dropped.
+
+--- PARENTHESISED SUB-EXPRESSIONS (PERROW-ARITH) - fail-safe guard ----------------
+Root cause: the derived-arithmetic term-split flattens parentheses (REPLACE '(' / ')' with
+spaces), so a paren GROUPING an additive sub-expression - @a*(@b-@c) - is mis-read as
+@a*@b - @c (the @a co-factor lost on the @c term), producing a WRONG witness.
+Fix (fail-safe guard, per backlog "never a wrong witness"): skip the arithmetic archetype
+(-> honest NOT_TESTABLE) when a '(' co-occurs with a '+' or '-'. No-paren expressions and
+pure-product parens @a*(@b*@c) (multiplication is associative) are unaffected, so the
+v0.16.x arithmetic cases (Volume*Price*RiskMult, qty*price-fee, @v*@p-100 - all paren-free)
+are byte-for-byte unchanged. The full fix (a precedence-aware walk that DISTRIBUTES the factor
+over the group) remains future work.
+VALIDATED: guard decision table correct on 6 RHS shapes (no-paren -> ENTER; pure-product-paren
+-> ENTER; paren+'-'/'+' -> SKIP); installer compiles + installs clean; pz.CountEqGate regression
+unchanged (100%/100%, 0 fail/err).
+
+--- #2 OR per-arm / #10 IN/BETWEEN - DEFERRED (deeper than estimated) --------------
+Attempted #2; the verify loop showed every real OR gate parses as PREDTREE (the v0.12 unified
+engine, WhereAstJson NULL) and is seeded from pre-built SeedPlanTrue/FalseJson - NOT the flat
+WhereAstJson / SatisfyPredicate path. A per-arm implementation must decompose the predicate TREE's
+top-level OR into N per-arm seed plans in GeneratePredicateBranchPlan (module 33); the flat-path
+attempt was inert + unverifiable and was reverted (no untested code shipped). #10 is the same
+PREDTREE situation. Both deferred to a dedicated design pass. #5 COUNT(col) stays CLR-parser-blocked.
+
+
+================================================================================
+2026-06-17  v0.16.5  OR PER-ARM via PREDTREE seed-plan decomposition
+================================================================================
+
+--- #2 OR PER-ARM COVERAGE (PREDTREE path) -----------------------------------------
+Why v0.16.4 reverted it: real OR gates parse as PREDTREE (v0.12 tree); the parser's
+SeedPlanTrueJson collapses the OR to its FIRST disjunct, so only one arm got a TRUE test, and
+the flat WhereAstJson hook was inert.
+Fix: SatisfyPredicate gains @DriverTerm (0-based OR arm). On TRUE, when the gate's source.where
+is a top-level OR over a single seeded table, it rebuilds the TRUE seed plan's row overrides
+(JSON_MODIFY tables[0].demands[0].overrides) to satisfy disjunct @DriverTerm, derived from
+PredicateTreeJson source.where.items[@DriverTerm] (colpred arms). GeneratePredicateBranchTests
+counts the disjuncts and emits one TRUE test per arm ("predicate TRUE arm 1..N"), each seeded for
+ITS disjunct; FALSE stays single. Guards: colpred arm + single table/single demand only; non-OR /
+multi-table gates keep arm-count=1 -> byte-identical to before.
+VALIDATED on synthetic pz.OrGate (EXISTS WHERE a=1 OR b=2 OR c=3): TRUE arm 1/2/3 + FALSE, all 4
+pass (branch 2/2); seeds VERIFIED distinct per arm - arm1 (1,42,42), arm2 (42,2,42), arm3
+(42,42,3), each satisfying ONLY its disjunct. Regression pz.CountEqGate unchanged (single TRUE+FALSE,
+2/2). NOTE: per-arm tests don't change the branch % (both arms hit the same THEN) - condition-level
+thoroughness, on by default per user.
+
+--- #10 IN/BETWEEN enumeration - PARSER-BLOCKED (intended case) ---------------------
+the review's #10 targets "WHERE col IN (...)" and "col BETWEEN a AND b". Investigation (parsed
+synthetics): the CLR parser marks the WHERE-column form UNRECOGNISED in every framing - EXISTS
+WHERE a IN (...), (SELECT COUNT(*) ... WHERE a IN (...)), and the BETWEEN equivalents - so they are
+already honest NOT_TESTABLE with NO seed plan to enumerate. Recognising a column IN/BETWEEN in a
+WHERE requires a CLR-parser change (same constraint as #5). Only the niche value-form
+"(SELECT COUNT(*) ...) IN (1,2,3)" / "... BETWEEN 1 AND 3" parses (COUNT_IN / COUNT_BETWEEN) and is
+seedable; enumerating those is low-value and not the review's target. => #10 DEFERRED as CLR-blocked.
+
+--- #5 COUNT(col) NULL - PARSER-BLOCKED ---------------------------------------------
+Still requires the CLR parser to record the counted column (the strong assertion normalizes to
+COUNT(*)). CLR change, can't be done/verified here.
+
+v0.16.5 SHIPPED CONTENT: #2 OR per-arm (verified). #10 + #5 are CLR-parser-blocked (documented).
+
+
+================================================================================
+2026-06-17  v0.16.6  IN / BETWEEN recognition (CLR parser) -> seeded + per-value
+================================================================================
+User opened CLR changes. clr/UnitAutogenClr.cs BuildWhereTree now expands, in a WHERE:
+  col IN (v1..vn)  -> {k:"or",  items:[col=v1, ...]}   (NOT IN -> {k:"and", items:[col<>vi]})
+  col BETWEEN a,b  -> {k:"and", items:[col>=a, col<=b]} (NOT BETWEEN -> {k:"or", items:[col<a, col>b]})
+Both were UNRECOGNISED before. The OR form flows through the v0.16.5 per-arm generator, so
+"WHERE col IN (...)" AUTO-generates one TRUE test per value; BETWEEN becomes a seedable AND.
+BUILD NOTE: PowerShell's `& csc` call operator is blocked in this env (treats the exe as a
+"document"), but csc runs fine via the .NET [Diagnostics.Process]::Start API - used that (same args
+as Build-Clr.ps1) to produce the CANONICAL csc-built dll: clr/lib/UnitAutogenClr.dll = 65024 bytes,
+SHA-512 0xB107980D2FECC3C2FB8F2080FFDABD40B23D523DD73D28B2E1A363C4E8A1B1F4374328C6A8E4EF5CB7FD24FC48F2BC03B44A21BED48AA2D93CAE9EE34BA5AD08.
+Registered via embedded bytes over T-SQL (sysadmin; rollback guarded) + verified on AW2025
+(pz.InGate -> TRUE arm 1/2/3); Emit-InstallerSql.ps1 regenerated Install-UnitAutogenClr.SSMS.sql with
+the csc bytes; Build-ReleaseBundle rebuilt the zip. (An interim Add-Type build was used to verify the
+logic first, then replaced by this canonical csc build; no Add-Type artifact ships.)
+VALIDATED on AW2025: pz.InGate (a IN (1,2,3)) -> TRUE arm 1/2/3 + FALSE, all pass, seeds distinct
+(a=1 / a=2 / a=3); pz.BetweenGate (a BETWEEN 10 AND 20) -> recognized + seeded (TRUE+FALSE, was
+NOT_TESTABLE); pz CountEq/ScalarCmp unchanged. Synthetics dropped.
+#5 COUNT(col) NULL - VERIFIED ALREADY HANDLED (no change needed): on the PREDTREE path the strong
+assertion already uses the real COUNT(c) (selectExpr="COUNT(c)", predSql "(SELECT COUNT(c) ...) > 3"),
+NOT COUNT(*); and the seeder sets the nullable counted column to a NON-NULL sample, so COUNT(c) counts
+the seeded rows and the gate is driven. VALIDATED: pz.CountColGate (COUNT(c) > 3, c NULL) -> 100%
+branch, 0 fail/err, TRUE seed = 4 rows with c=42 (non-null) -> COUNT(c)=4>3. the review's #5 premise
+(COUNT(col) mishandled / assertion=COUNT(*)) was the OLD flat path. The only residual - a dedicated
+NULL-row exclusion test - is speculative NULL injection that conflicts with @EmitNullChecks-default-off
+("cover what the code does, not speculative injection"), so it was deliberately NOT added.
+
+================================================================================
+Code review: COMPLETE (all 10 items resolved across v0.16.2 / .4 / .5 / .6)
+================================================================================
+ #1 date/string inequality (v0.16.2) · #2 OR per-arm (v0.16.5) · #6 configurable cap (v0.16.2) ·
+ #8 dead-path warning (v0.16.2) · #10 IN/BETWEEN (v0.16.6, CLR) · parens guard + temp-table (v0.16.4) ·
+ date '<=' agg filter (v0.16.2). ALREADY-DONE before the review: #4 FK-chaining, #7 tight boundary,
+ #9 search-seeding. NOT-ADDED (by design, anti-over-generation): #3 varied rows (CROSS JOIN is correct
+ for COUNT multiplicity); #5 NULL-exclusion extra test (speculative NULL injection). Per-arm #2/#10
+ add condition thoroughness (don't move branch %), shipped on-by-default per user.
+
+================================================================================
+2026-06-18  v0.16.7  Nondeterministic-operand guard + search time/row backstop
+================================================================================
+Follow-up from investigating the pz.UnseedableLoopGate fixture: a loop accumulator
+"SET @sum = @sum + DATEPART(MILLISECOND, SYSDATETIME())" gated by "IF @sum > 100000".
+The proc itself is finite (3 ms at rest), but the search-seeding sweep ground for 37+
+min of CPU before giving up: @sum is built from a runtime CLOCK value the seeder cannot
+control, and the LOOPCOUNT path ramped its seeded row-count knob toward ABS(@cand)*2
+(= 200005 rows for >100000), so each probe seeded + looped 100k+ rows under instrumentation.
+
+FIX (TestGen.SearchSeedForProc + TestGen.SearchSeedForGate; pure T-SQL, NO CLR change):
+ 1. NONDETERMINISTIC-OPERAND DETECTOR. Before dispatching a gate to any search archetype,
+    scan the operand's OWN pre-gate assignment lineage for a nondeterministic token
+    (SYSDATETIME / SYSUTCDATETIME / SYSDATETIMEOFFSET / GETDATE / GETUTCDATE /
+    CURRENT_TIMESTAMP / NEWID / NEWSEQUENTIALID / RAND). If found -> record an honest
+    NOT_TESTABLE (Archetype='NONDET') naming the token, and skip the search. Scan-only /
+    fail-safe (never a wrong witness). @@-globals are deliberately EXCLUDED (@@ROWCOUNT etc.
+    reflect seedable row state and ARE drivable). Extends the intent of the existing
+    @resolved=0 environmental fallback, which only scanned the PREDICATE text (the clock
+    call lives in the ASSIGNMENT) and only fired AFTER LOOPCOUNT had already claimed the gate.
+ 2. SEARCH WALL-CLOCK BACKSTOP. New @TimeBudgetSec (default 90s) on SearchSeedForGate: a
+    non-converging search is abandoned -> the standard "NO WITNESS (NOT_TESTABLE)" result.
+ 3. LOOPCOUNT ROW-COUNT KNOB CAP. The seeded row-count knob (@khiL) is capped at
+    @MaxSeedRows (default 500), so a large accumulator comparand can no longer request
+    100k+ rows per probe. Raise @MaxSeedRows to test a loop-count gate that needs more rows.
+
+RESULT: pz.UnseedableLoopGate 37+ min (runaway, never completed before) -> 10 s, honest
+0% / 3 NOT_TESTABLE skips / 0 fail / 0 err (NONDET on @sum; the COUNT(*) loop predicate
+stays an unsupported skip). REGRESSION-CLEAN on AW2025 + HighValueCustomer:
+  AW2025 pz - HardLoop 2/4 (unchanged), LoopLocal 3/3 (deterministic accumulator NOT
+   caught by the detector), CountEq/CountGt/Sum/ScalarCmp/ScalarNull 100%,
+   Contradiction 1/2 (honest), OrComposition 2/2 - all 0 fail/err.
+  HighValueCustomer - AssessCustomer 6/6, GetVIP 0/1 (honest residue),
+   usp_ReconcileTradedPositions 15/16 (90% line) with NO NONDET false-catch (all 11
+   witnesses intact) - all 0 fail/err.
+FILES: Install_UnitAutogen.sql (root) == powershell/UnitAutogen/sql/Install_UnitAutogen.sql
+(byte-identical). No CLR change (clr/lib/UnitAutogenClr.dll unchanged from v0.16.6).

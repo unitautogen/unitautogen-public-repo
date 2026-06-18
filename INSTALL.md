@@ -31,7 +31,25 @@ UnitAutogen has two installable pieces:
 
 ---
 
-## Option A — SSMS (manual)
+## Option A — Release download (.zip) — easiest, no clone
+
+Every release ships a ready-to-run bundle on the
+[Releases page](https://github.com/unitautogen/unitautogen-public-repo/releases):
+**`UnitAutogen-<version>-install.zip`**. You don't need to clone the repository.
+
+1. Download `UnitAutogen-<version>-install.zip` from the latest release and extract it.
+2. In SSMS, connect to your target database (`USE YourDatabase;`), then open and execute
+   **`1_Install_UnitAutogen.sql`** — the framework. You should see
+   `Framework installed successfully.`
+3. In the **same** database, open and execute **`2_Install-UnitAutogenClr.SSMS.sql`** —
+   the in-database predicate parser (needs sysadmin once). Run it in **SSMS**, not
+   `sqlcmd` — it is ~12 MB because it carries the assembly bytes (~10–15 s).
+
+Both files are pure T-SQL and idempotent (safe to re-run / upgrade). The bundle also
+contains `README-INSTALL.md` with these same steps, plus `LICENSE`, `COPYRIGHT`, and
+`THIRD-PARTY-NOTICES.txt`. After installing, jump to [Quick start](#quick-start-after-install).
+
+## Option B — SSMS from a repo clone
 
 **Step 1 — install the framework.** Open `Install_UnitAutogen.sql` in SSMS,
 `USE YourDatabase;`, and execute the whole file. It is idempotent (safe to re-run
@@ -45,7 +63,7 @@ the file is ~12 MB because it carries the assembly bytes. Run it in **SSMS**, no
 
 That's it — both steps are pure T-SQL.
 
-## Option B — PowerShell (one command, e.g. CI/CD)
+## Option C — PowerShell (one command, e.g. CI/CD)
 
     Install-Module UnitAutogen          # from the PowerShell Gallery
     Install-UnitAutogenDatabase -ServerInstance 'localhost' -Database 'YourDb'

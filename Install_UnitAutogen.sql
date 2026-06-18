@@ -8908,11 +8908,18 @@ CREATE PROCEDURE TestGen.GenerateAndRunCoverage
     @AssertExceptionOnInvalidInputs BIT          = 1,
     @EmitNullChecks                BIT           = 0,
     @EmitScaffold                  BIT           = 1,
+    @MaxSeedRows                   INT           = 500,     -- v0.16.2: seed-row cap (per table/predicate); NULL/<1 -> 500
     @OutputMode                    VARCHAR(10)   = 'TEXT',   -- coverage report mode
     @RunId                         INT           = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+
+    -- v0.16.2 (review #6): publish the configurable seed-row cap to the seeder
+    -- procs (ExecuteSeedPlan / SatisfyPredicate) via SESSION_CONTEXT so it crosses
+    -- the call chain without threading a parameter through every routine.
+    IF @MaxSeedRows IS NULL OR @MaxSeedRows < 1 SET @MaxSeedRows = 500;
+    EXEC sys.sp_set_session_context @key = N'UAG_MaxSeedRows', @value = @MaxSeedRows;
 
     PRINT '=== TestGen.GenerateAndRunCoverage: ' + @SchemaName + '.' + @ProcName + ' ===';
 
@@ -11378,6 +11385,7 @@ CREATE PROCEDURE TestGen.SearchSeedForGate
     @KnobHi          FLOAT,
     @AggMode         VARCHAR(3)  = 'MAX',-- across loop iterations: MAX|MIN
     @Budget          INT         = 24,
+    @TimeBudgetSec   INT         = 90,  -- v0.16.7 wall-clock backstop: abandon a non-converging search
     @WitnessKnob     FLOAT          OUTPUT,
     @WitnessArrange  NVARCHAR(MAX)  OUTPUT,
     @Diag            NVARCHAR(MAX)  OUTPUT
@@ -11443,8 +11451,18 @@ BEGIN
              WHEN @Comparator='BETWEEN' THEN (@Comparand + @ComparandHi)/2.0
              ELSE @Comparand END;
 
+    DECLARE @t0 DATETIME2(0) = SYSDATETIME();   -- v0.16.7 search wall-clock start
     WHILE @i < @Budget
     BEGIN
+        -- v0.16.7: wall-clock backstop. A search whose every probe runs a large instrumented loop
+        -- (e.g. an accumulator gate seeding thousands of rows) can grind far past any reasonable time
+        -- even within @Budget probes. Abandon it here -> @WitnessKnob stays NULL -> the post-loop diag
+        -- below records the standard "NO WITNESS ... (NOT_TESTABLE)", so the caller files NOT_TESTABLE.
+        IF DATEDIFF(SECOND,@t0,SYSDATETIME()) > @TimeBudgetSec
+        BEGIN
+            SET @Diag = @Diag + N'|time-budget '+CAST(@TimeBudgetSec AS NVARCHAR(10))+N's exceeded after '+CAST(@i AS NVARCHAR(5))+N' probe(s) - abandoning search';
+            BREAK;
+        END;
         -- choose next knob
         IF @i=0 SET @knob=@kLo;
         ELSE IF @i=1 SET @knob=@kHi;
@@ -11654,6 +11672,47 @@ BEGIN
             END;
         END;
 
+        -- v0.16.7: NONDETERMINISTIC-OPERAND guard (code-review follow-up; UnseedableLoopGate).
+        -- If the operand local is assigned from a nondeterministic runtime value (clock / NEWID /
+        -- RAND), no DATA seed can deterministically drive the gate. The existing @resolved=0 fallback
+        -- (further below) already recognises this intent, but (a) it only scans the PREDICATE text -
+        -- and the clock call lives in the ASSIGNMENT (e.g. "SET @sum=@sum+DATEPART(MS,SYSDATETIME())"),
+        -- not the predicate "@sum>100000" - and (b) it only fires AFTER the LOOPCOUNT search has already
+        -- claimed the accumulator gate and ramped its seeded row-count knob toward ABS(@cand)*2 (a
+        -- runaway). Catch it HERE, before any archetype dispatch: scan the operand's own pre-gate
+        -- assignment lineage for the token, record an honest NOT_TESTABLE, and skip to the next gate.
+        -- Scan-only / fail-safe - never emits a wrong witness. (@@-globals deliberately NOT in the list:
+        -- @@ROWCOUNT etc. reflect seedable row state and ARE drivable.)
+        IF @op IS NOT NULL
+        BEGIN
+            DECLARE @ndScan NVARCHAR(MAX), @ndHit NVARCHAR(40);
+            SET @ndScan = UPPER(ISNULL(@ptext,N''));
+            SELECT @ndScan = @ndScan + N' ' + UPPER(Txt)
+              FROM #src
+             WHERE LineNum < @gl AND Txt LIKE N'%'+@op+N'%=%'
+               AND UPPER(LTRIM(Txt)) NOT LIKE N'IF %' AND UPPER(LTRIM(Txt)) NOT LIKE N'ELSE %'
+               AND UPPER(LTRIM(Txt)) NOT LIKE N'WHILE %';
+            SET @ndHit =
+                CASE WHEN @ndScan LIKE N'%SYSDATETIMEOFFSET%' THEN N'SYSDATETIMEOFFSET'
+                     WHEN @ndScan LIKE N'%SYSUTCDATETIME%'    THEN N'SYSUTCDATETIME'
+                     WHEN @ndScan LIKE N'%SYSDATETIME%'       THEN N'SYSDATETIME'
+                     WHEN @ndScan LIKE N'%GETUTCDATE%'        THEN N'GETUTCDATE'
+                     WHEN @ndScan LIKE N'%GETDATE%'           THEN N'GETDATE'
+                     WHEN @ndScan LIKE N'%CURRENT_TIMESTAMP%' THEN N'CURRENT_TIMESTAMP'
+                     WHEN @ndScan LIKE N'%NEWSEQUENTIALID%'   THEN N'NEWSEQUENTIALID'
+                     WHEN @ndScan LIKE N'%NEWID%'             THEN N'NEWID'
+                     WHEN @ndScan LIKE N'%RAND(%'             THEN N'RAND'
+                     ELSE NULL END;
+            IF @ndHit IS NOT NULL
+            BEGIN
+                INSERT TestGen.SearchSeedResult(SchemaName,ProcName,BranchId,GateLine,Operand,Comparator,Comparand,Archetype,Status,Diag)
+                VALUES(@Schema,@Proc,@bid,@gl,@op,@cmp,@cand,'NONDET','NOT_TESTABLE',
+                       N'nondeterministic operand ('+@ndHit+N'): '+@op+N' derives from a runtime value the seeder cannot control - no data seed can drive the gate (search skipped)');
+                FETCH NEXT FROM c INTO @bid,@gl,@ptext;
+                CONTINUE;
+            END;
+        END;
+
         -- find @op's assignment line (aggregate or scalar) before the gate
         DECLARE @aline INT=NULL,@atxt NVARCHAR(MAX)=NULL,@agg VARCHAR(10)=NULL,@col SYSNAME=NULL,@tbl NVARCHAR(300)=NULL,@isAgg BIT=0;
         IF @op IS NOT NULL
@@ -11777,6 +11836,11 @@ BEGIN
                             SET @fltNum=TRY_CAST(LTRIM(RTRIM(@fltLit)) AS FLOAT);
                             IF @fltNum IS NOT NULL
                                 SET @fltVal=CONVERT(NVARCHAR(40),CAST(CASE WHEN @fltOp=N'>' THEN @fltNum+1 WHEN @fltOp=N'<' THEN @fltNum-1 ELSE @fltNum END AS DECIMAL(38,4)));
+                            ELSE
+                                -- v0.16.2 (backlog item 2 / review #1): NON-numeric range (date or string)
+                                -- -> reuse SatisfyingValue so a "col <= '<date>'" filter no longer excludes the
+                                -- far-future '99991231' default row (which would leave the aggregate NULL).
+                                SET @fltVal = ISNULL(TestGen.SatisfyingValue(@fltOp, LTRIM(RTRIM(@fltLit)), 1), @fltVal);
                         END
                         ELSE IF @fltAft LIKE N'IN[ (]%'
                         BEGIN  -- IN list -> first element
@@ -12143,6 +12207,15 @@ BEGIN
                                 @adConstSum FLOAT, @adNeg INT;
                         SET @adFirstVar=NULL; SET @adDrvNeutral=N'1'; SET @adConstSum=0;  -- reset per gate (loop-DECLARE initialisers run once)
                         IF @adRhs IS NOT NULL AND (CHARINDEX(N'*',@adRhs)>0 OR CHARINDEX(N'+',@adRhs)>0 OR CHARINDEX(N'-',@adRhs)>0)
+                           -- v0.16.4 (parenthesised sub-expressions): the term-split below flattens
+                           -- parens by replacing '(' / ')' with spaces, so a paren GROUPING an additive
+                           -- sub-expression (e.g. @a*(@b-@c)) is mis-read as @a*@b - @c - the @a co-factor
+                           -- is lost on the @c term -> a WRONG witness. Pure-product parens like
+                           -- @a*(@b*@c) are safe (multiplication is associative). Fail SAFE: skip the
+                           -- arithmetic archetype (-> honest NOT_TESTABLE, never a wrong witness) only when
+                           -- a '(' co-occurs with a '+' or '-'. (Backlog item: a precedence-aware walk that
+                           -- DISTRIBUTES the factor is the future full fix; this guard prevents the bug.)
+                           AND (CHARINDEX(N'(',@adRhs)=0 OR (CHARINDEX(N'+',@adRhs)=0 AND CHARINDEX(N'-',@adRhs)=0))
                         BEGIN
                             SET @adIsProd=1;
                             IF CHARINDEX(N'@',@adRhs)>0
@@ -12290,6 +12363,14 @@ BEGIN
                                 DECLARE @pfxL NVARCHAR(MAX); EXEC TestGen.BuildReachPrefix @Schema,@Proc,@cntTbl,@pfxL OUTPUT;
                                 SET @pfxL=@autoDecls+ISNULL(@pfxL,N'');
                                 DECLARE @khiL FLOAT=CASE WHEN ABS(@cand)*2+5 > 12 THEN ABS(@cand)*2+5 ELSE 12 END;
+                                -- v0.16.7: cap the seeded row-count knob at @MaxSeedRows (default 500).
+                                -- The knob here is "how many rows to seed so the WHILE trips that many
+                                -- times"; an accumulator gate with a large comparand (e.g. @sum>100000)
+                                -- would otherwise set @khiL to 200005 and a single probe would seed/loop
+                                -- 200k rows (the 37-min runaway). A loop-count gate genuinely needing more
+                                -- rows -> raise @MaxSeedRows.
+                                DECLARE @lcCap FLOAT = ISNULL(TRY_CAST(SESSION_CONTEXT(N'UAG_MaxSeedRows') AS INT), 500);
+                                IF @khiL > @lcCap SET @khiL = @lcCap;
                                 DECLARE @wkL FLOAT,@waL NVARCHAR(MAX),@dgL NVARCHAR(MAX);
                                 -- seed BOTH arms: the gate direction AND its negation (so the
                                 -- loop's TRUE and FALSE branches are both covered).
@@ -16757,6 +16838,7 @@ GO
 CREATE PROCEDURE TestGen.GenerateAndCoverDatabase
     @SchemaFilter   SYSNAME       = NULL,   -- NULL = every user schema
     @ExcludePattern NVARCHAR(200) = NULL,   -- LIKE pattern of proc names to skip
+    @MaxSeedRows    INT           = 500,    -- v0.16.2: seed-row cap; NULL/<1 -> 500
     @OutputMode     VARCHAR(10)   = 'HTML'  -- HTML, TEXT, or COBERTURA
 AS
 BEGIN
@@ -16768,6 +16850,11 @@ BEGIN
         RAISERROR('The tSQLt Auto-Gen framework is not fully installed in this database.',16,1);
         RETURN;
     END;
+
+    -- v0.16.2 (review #6): publish the configurable seed-row cap to the seeder
+    -- via SESSION_CONTEXT (read by ExecuteSeedPlan / SatisfyPredicate; NULL/<1 -> 500).
+    IF @MaxSeedRows IS NULL OR @MaxSeedRows < 1 SET @MaxSeedRows = 500;
+    EXEC sys.sp_set_session_context @key = N'UAG_MaxSeedRows', @value = @MaxSeedRows;
 
     -- v0.9.5: defensively self-heal any procedures left in a broken state
     -- by a previously-killed coverage run.  Safe no-op if database is clean.
@@ -17534,15 +17621,54 @@ BEGIN
                     WHEN @num IS NOT NULL THEN @numPlus
                     ELSE @diffStr END;
 
-    -- Numeric inequalities require a numeric comparand.
-    IF @num IS NULL RETURN NULL;
+    -- NUMERIC inequalities (numeric comparand).
+    IF @num IS NOT NULL
+    BEGIN
+        IF @op2 = '>'  RETURN CASE WHEN @Satisfy = 1 THEN @numPlus  ELSE @numSame  END;
+        IF @op2 = '>=' RETURN CASE WHEN @Satisfy = 1 THEN @numSame  ELSE @numMinus END;
+        IF @op2 = '<'  RETURN CASE WHEN @Satisfy = 1 THEN @numMinus ELSE @numSame  END;
+        IF @op2 = '<=' RETURN CASE WHEN @Satisfy = 1 THEN @numSame  ELSE @numPlus  END;
+        RETURN NULL;
+    END;
 
-    IF @op2 = '>'  RETURN CASE WHEN @Satisfy = 1 THEN @numPlus  ELSE @numSame  END;
-    IF @op2 = '>=' RETURN CASE WHEN @Satisfy = 1 THEN @numSame  ELSE @numMinus END;
-    IF @op2 = '<'  RETURN CASE WHEN @Satisfy = 1 THEN @numMinus ELSE @numSame  END;
-    IF @op2 = '<=' RETURN CASE WHEN @Satisfy = 1 THEN @numSame  ELSE @numPlus  END;
+    -- v0.16.2 (review #1): NON-NUMERIC inequalities - date/datetime and string ranges,
+    -- which previously fell straight to NULL (silent skip of reporting-window and
+    -- alphabetical-filter predicates). Returns a T-SQL EXPRESSION derived from the comparand
+    -- so it needs no fragile quote/collation predecessor logic.
+    IF @op2 IN ('>','>=','<','<=')
+    BEGIN
+        -- strip an optional leading N + the surrounding quotes to type-test the inner value
+        DECLARE @inner NVARCHAR(400) =
+            CASE WHEN LEFT(LTRIM(@Literal),1) = 'N' THEN LTRIM(SUBSTRING(LTRIM(@Literal),2,400))
+                 ELSE LTRIM(@Literal) END;
+        IF DATALENGTH(@inner) >= 4 AND LEFT(@inner,1) = '''' AND RIGHT(@inner,1) = ''''
+            SET @inner = SUBSTRING(@inner, 2, LEN(@inner + 'x') - 3);
 
-    RETURN NULL;   -- unknown operator
+        -- DATE / DATETIME: step one day past the bound (deterministic, T-SQL-native).
+        IF @isStr = 1 AND TRY_CAST(@inner AS DATETIME2(3)) IS NOT NULL
+        BEGIN
+            DECLARE @plusD  NVARCHAR(160) = N'DATEADD(DAY, 1, '  + @Literal + N')';
+            DECLARE @minusD NVARCHAR(160) = N'DATEADD(DAY, -1, ' + @Literal + N')';
+            IF @op2 = '>'  RETURN CASE WHEN @Satisfy = 1 THEN @plusD   ELSE @Literal END;
+            IF @op2 = '>=' RETURN CASE WHEN @Satisfy = 1 THEN @Literal ELSE @minusD  END;
+            IF @op2 = '<'  RETURN CASE WHEN @Satisfy = 1 THEN @minusD  ELSE @Literal END;
+            IF @op2 = '<=' RETURN CASE WHEN @Satisfy = 1 THEN @Literal ELSE @plusD   END;
+        END;
+
+        -- STRING: collation-safe ends only (the hard middle stays an honest NULL).
+        --   just-after = <lit> + NCHAR(65535); just-before = LEFT(<lit>,0) (empty string).
+        IF @isStr = 1
+        BEGIN
+            DECLARE @hiS NVARCHAR(160) = @Literal + N' + NCHAR(65535)';
+            DECLARE @loS NVARCHAR(160) = N'LEFT(' + @Literal + N', 0)';
+            IF @op2 = '>'  RETURN CASE WHEN @Satisfy = 1 THEN @hiS     ELSE @Literal END;
+            IF @op2 = '>=' RETURN CASE WHEN @Satisfy = 1 THEN @Literal ELSE @loS     END;
+            IF @op2 = '<'  RETURN CASE WHEN @Satisfy = 1 THEN @loS     ELSE @Literal END;
+            IF @op2 = '<=' RETURN CASE WHEN @Satisfy = 1 THEN @Literal ELSE @hiS     END;
+        END;
+    END;
+
+    RETURN NULL;   -- unknown operator / unsupported comparand
 END;
 GO
 
@@ -17636,6 +17762,84 @@ BEGIN
     END;
     RETURN CASE WHEN @v = FLOOR(@v) THEN CAST(CAST(@v AS BIGINT) AS NVARCHAR(50))
                 ELSE CAST(@v AS NVARCHAR(50)) END;
+END;
+GO
+
+/*-----------------------------------------------------------------------------
+ * TestGen.SatisfyAllStatus  (v0.16.2, review #8)
+ * Classify WHY TestGen.SatisfyAll cannot produce a value, so a caller can tell a
+ * PROVABLY-UNREACHABLE branch (contradictory constraints) from a merely UNSUPPORTED
+ * grammar (e.g. ordering on strings). Mirrors SatisfyAll's control flow EXACTLY:
+ * every point SatisfyAll returns a value -> 'SAT'; an impossible constraint set
+ * (conflicting '=', '=' outside [lo,hi], empty range lo>hi, '<>' exhausting a bounded
+ * range) -> 'CONTRADICTION'; an undecidable one (string ordering, empty set) ->
+ * 'UNSUPPORTED'. Keep in lockstep with SatisfyAll if that logic ever changes.
+ *---------------------------------------------------------------------------*/
+IF OBJECT_ID('TestGen.SatisfyAllStatus', 'FN') IS NOT NULL DROP FUNCTION TestGen.SatisfyAllStatus;
+GO
+CREATE FUNCTION TestGen.SatisfyAllStatus (@ConstraintsJson NVARCHAR(MAX))
+RETURNS VARCHAR(16)
+AS
+BEGIN
+    DECLARE @c TABLE (op VARCHAR(8), num FLOAT, sval NVARCHAR(400), isnum BIT);
+    INSERT @c (op, num, sval, isnum)
+    SELECT CASE WHEN w = 1 THEN o
+                ELSE CASE o WHEN '>' THEN '<=' WHEN '>=' THEN '<' WHEN '<' THEN '>='
+                            WHEN '<=' THEN '>' WHEN '=' THEN '<>' WHEN '<>' THEN '=' ELSE o END END,
+           n, v, CASE WHEN n IS NULL THEN 0 ELSE 1 END
+    FROM (
+        SELECT o = UPPER(LTRIM(RTRIM(JSON_VALUE([value],'$.op')))),
+               w = ISNULL(TRY_CAST(JSON_VALUE([value],'$.want') AS BIT), 1),
+               n = TRY_CAST(JSON_VALUE([value],'$.val') AS FLOAT),
+               v = JSON_VALUE([value],'$.val')
+        FROM   OPENJSON(ISNULL(@ConstraintsJson, N'[]'))
+    ) x;
+
+    IF NOT EXISTS (SELECT 1 FROM @c) RETURN 'UNSUPPORTED';
+
+    -- STRING fan (no ordering on strings).
+    IF EXISTS (SELECT 1 FROM @c WHERE isnum = 0)
+    BEGIN
+        IF EXISTS (SELECT 1 FROM @c WHERE op IN ('>','>=','<','<=')) RETURN 'UNSUPPORTED';
+        IF (SELECT COUNT(DISTINCT sval) FROM @c WHERE op = '=') > 1 RETURN 'CONTRADICTION';
+        DECLARE @seq NVARCHAR(400) = (SELECT MIN(sval) FROM @c WHERE op = '=');
+        IF @seq IS NOT NULL
+        BEGIN
+            IF EXISTS (SELECT 1 FROM @c WHERE op = '<>' AND sval = @seq) RETURN 'CONTRADICTION';
+            RETURN 'SAT';
+        END;
+        IF EXISTS (SELECT 1 FROM @c WHERE op = '<>') RETURN 'SAT';
+        RETURN 'UNSUPPORTED';
+    END;
+
+    -- NUMERIC fan.
+    IF (SELECT COUNT(DISTINCT num) FROM @c WHERE op = '=') > 1 RETURN 'CONTRADICTION';   -- = k1 AND = k2
+    DECLARE @lo FLOAT = (SELECT MAX(CASE WHEN op='>' THEN num+1 WHEN op='>=' THEN num END) FROM @c);
+    DECLARE @hi FLOAT = (SELECT MIN(CASE WHEN op='<' THEN num-1 WHEN op='<=' THEN num END) FROM @c);
+    DECLARE @eq FLOAT = (SELECT MIN(num) FROM @c WHERE op = '=');
+
+    IF @eq IS NOT NULL
+    BEGIN
+        IF (@lo IS NOT NULL AND @eq < @lo) OR (@hi IS NOT NULL AND @eq > @hi) RETURN 'CONTRADICTION';
+        IF EXISTS (SELECT 1 FROM @c WHERE op = '<>' AND num = @eq) RETURN 'CONTRADICTION';
+        RETURN 'SAT';
+    END;
+
+    IF @lo IS NOT NULL AND @hi IS NOT NULL AND @lo > @hi RETURN 'CONTRADICTION';         -- empty range
+
+    IF @lo IS NULL AND @hi IS NULL RETURN 'SAT';                                          -- '<>'-only / unbounded
+
+    DECLARE @v FLOAT = COALESCE(@lo, @hi);
+    IF EXISTS (SELECT 1 FROM @c WHERE op = '<>' AND num = @v)
+    BEGIN
+        IF @lo IS NOT NULL
+        BEGIN
+            SET @v = (SELECT MAX(num) + 1 FROM @c WHERE op = '<>' AND num >= @lo);
+            IF @hi IS NOT NULL AND @v > @hi RETURN 'CONTRADICTION';                       -- '<>' exhausts [lo,hi]
+        END;
+        -- @lo NULL, @hi present: step below all '<>' is always available -> SAT
+    END;
+    RETURN 'SAT';
 END;
 GO
 
@@ -17927,7 +18131,7 @@ BEGIN
     SET @SeedSql = NULL; SET @Supported = 0; SET @Reason = NULL;
     SET @PredicateSql = NULL; SET @ExpectedBit = NULL;
 
-    DECLARE @MaxSeedRows INT = 500;
+    DECLARE @MaxSeedRows INT = ISNULL(TRY_CAST(SESSION_CONTEXT(N'UAG_MaxSeedRows') AS INT), 500);  -- v0.16.2: configurable cap (review #6)
     DECLARE @plan NVARCHAR(MAX) = CASE WHEN UPPER(@Direction) = 'TRUE' THEN @PlanTrue ELSE @PlanFalse END;
     IF @plan IS NULL OR ISJSON(@plan) = 0
     BEGIN SET @Reason = N'no seed plan for direction ' + @Direction; RETURN; END;
@@ -18104,6 +18308,35 @@ BEGIN
         WHERE  NOT EXISTS (SELECT 1 FROM @cc_chosen c WHERE c.fullcol = n.fullcol);
     END;
 
+    -- v0.16.2 (review #8): PROVABLY-UNREACHABLE detection. ONLY for the predicate-TRUE
+    -- seed direction: if a cross-column column has a SINGLE anchor and NO literal part yet
+    -- its constraints contradict (e.g. x > y AND x < y -> empty for EVERY value of y), the
+    -- predicate can NEVER be true, so the TRUE (THEN) arm is dead code. Gated to
+    -- @Direction='TRUE' so we never mislabel the reachable FALSE arm (making a conjunction
+    -- false only needs ONE conjunct violated, which is satisfiable); OR-predicates are
+    -- already filtered upstream by the DNF driver (it picks a seedable disjunct), so a
+    -- contradiction reaching here is the binding constraint. Single-anchor / no-literal
+    -- keeps the claim seeding-INDEPENDENT (sound); other cases stay the honest skip below.
+    IF UPPER(@Direction) = 'TRUE' AND EXISTS (
+        SELECT s.fullcol
+        FROM   (SELECT DISTINCT fullcol FROM @cc_spec WHERE isOther = 1) s
+        WHERE  (SELECT COUNT(*) FROM @cc_cmp m3 WHERE m3.fullcol = s.fullcol) = 0
+          AND  (SELECT COUNT(DISTINCT o2.anchor) FROM @cc_spec o2
+                WHERE o2.fullcol = s.fullcol AND o2.isOther = 1) = 1
+          AND  TestGen.SatisfyAllStatus((
+                   SELECT o.op AS op, o.want AS want, ca.lit AS val
+                   FROM   @cc_spec o
+                   JOIN   @cc_chosen ca ON ca.fullcol = o.anchor
+                   WHERE  o.fullcol = s.fullcol AND o.isOther = 1
+                   FOR JSON PATH)) = 'CONTRADICTION'
+    )
+    BEGIN
+        SET @Reason = N'PROVABLY UNREACHABLE: the predicate can never be TRUE - it needs '
+                    + N'contradictory values on one column (e.g. x > y AND x < y) that no data '
+                    + N'can satisfy; this branch (THEN arm) is dead code.';
+        RETURN;
+    END;
+
     -- cycle fallback: a satisfyother col still unresolved (its anchor never resolved
     -- = a contradiction/cycle) derives from the anchor column's TYPE sample - the
     -- pre-v0.15.1 best-effort. If that cannot satisfy, the branch stays honestly
@@ -18125,6 +18358,39 @@ BEGIN
     WHILE @@FETCH_STATUS = 0
     BEGIN
         SET @objid = OBJECT_ID(QUOTENAME(@tsch) + N'.' + QUOTENAME(@ttbl));
+
+        -- v0.16.3 (temp-table tracing): a #temp target does not exist at generation time.
+        -- Trace "SELECT ... INTO #temp ... FROM <base>" in the proc-under-test body back to
+        -- <base> (a real catalog table) and retarget the seed there - the proc itself copies
+        -- <base> -> #temp at runtime, so seeding <base> drives the #temp-based gate. Fail-safe:
+        -- if a single real base table is not resolved, fall through to the honest skip below.
+        IF @objid IS NULL AND LEFT(LTRIM(@ttbl), 1) = N'#'
+        BEGIN
+            DECLARE @uagBody NVARCHAR(MAX), @uagU NVARCHAR(MAX), @uagTmp NVARCHAR(300),
+                    @uagInto INT, @uagFrom INT, @uagTbl NVARCHAR(300), @uagStop INT, @uagBaseId INT;
+            SET @uagTmp  = UPPER(LTRIM(RTRIM(@ttbl)));
+            SET @uagBody = ISNULL(OBJECT_DEFINITION(@procObj), N'');
+            SET @uagU    = UPPER(@uagBody);
+            SET @uagInto = CHARINDEX(N'INTO ' + @uagTmp, @uagU);
+            IF @uagInto > 0
+            BEGIN
+                SET @uagFrom = CHARINDEX(N' FROM ', @uagU, @uagInto + 5);
+                IF @uagFrom > 0
+                BEGIN
+                    SET @uagTbl  = LTRIM(SUBSTRING(@uagBody, @uagFrom + 6, 300));   -- original-case token after FROM
+                    SET @uagStop = PATINDEX(N'%[ ;,()' + NCHAR(13) + NCHAR(10) + NCHAR(9) + N']%', @uagTbl + N' ');
+                    IF @uagStop > 1 SET @uagTbl = LEFT(@uagTbl, @uagStop - 1);
+                    SET @uagBaseId = OBJECT_ID(@uagTbl);
+                    IF @uagBaseId IS NOT NULL          -- a real base table -> retarget the seed
+                    BEGIN
+                        SET @tsch  = ISNULL(PARSENAME(@uagTbl, 2), N'dbo');
+                        SET @ttbl  = PARSENAME(@uagTbl, 1);
+                        SET @objid = @uagBaseId;
+                    END;
+                END;
+            END;
+        END;
+
         IF @objid IS NULL
         BEGIN SET @Reason = N'tree target table not found: ' + @tsch + N'.' + @ttbl; CLOSE tc; DEALLOCATE tc; RETURN; END;
 
@@ -18266,6 +18532,7 @@ GO
 CREATE PROCEDURE TestGen.SatisfyPredicate
     @InboxId    INT,
     @Direction  VARCHAR(8),                 -- 'TRUE' | 'FALSE'
+    @DriverTerm INT           = NULL,        -- v0.16.5 (#2): force this top-level OR arm (0-based) on TRUE; NULL = parser default
     @SeedSql    NVARCHAR(MAX) = NULL OUTPUT,
     @Supported  BIT           = NULL OUTPUT,
     @Reason     NVARCHAR(400) = NULL OUTPUT,
@@ -18281,7 +18548,7 @@ BEGIN
     DECLARE @whereSql NVARCHAR(MAX) = NULL;
 
     DECLARE @want BIT = CASE WHEN UPPER(@Direction) = 'TRUE' THEN 1 ELSE 0 END;
-    DECLARE @MaxSeedRows INT = 500;
+    DECLARE @MaxSeedRows INT = ISNULL(TRY_CAST(SESSION_CONTEXT(N'UAG_MaxSeedRows') AS INT), 500);  -- v0.16.2: configurable cap (review #6)
 
     DECLARE @Shape VARCHAR(32), @Comparator VARCHAR(16), @Comparand NVARCHAR(MAX),
             @AggCol NVARCHAR(256), @TablesJson NVARCHAR(MAX), @WhereJson NVARCHAR(MAX),
@@ -18312,6 +18579,37 @@ BEGIN
     --------------------------------------------------------------------------
     IF @PredTreeJson IS NOT NULL AND ISJSON(@PredTreeJson) = 1
     BEGIN
+        -- v0.16.5 (#2 OR per-arm): if the caller requested a specific OR arm (@DriverTerm) on the
+        -- TRUE direction, and this gate's source WHERE is a top-level OR over a single seeded table,
+        -- rebuild the TRUE seed plan's row overrides to satisfy THAT disjunct (the parser's plan
+        -- defaults to the first arm). Each OR arm then gets its own TRUE test. Conservative: a
+        -- colpred arm of a single-table / single-demand plan only; anything else falls through unchanged.
+        IF @DriverTerm IS NOT NULL AND UPPER(@Direction) = 'TRUE'
+           AND JSON_VALUE(@PredTreeJson, '$.source.where.k') = 'or'
+           AND @SeedPlanTrue IS NOT NULL AND ISJSON(@SeedPlanTrue) = 1
+           AND (SELECT COUNT(*) FROM OPENJSON(JSON_QUERY(@SeedPlanTrue, '$.tables'))) = 1
+           AND (SELECT COUNT(*) FROM OPENJSON(JSON_QUERY(@SeedPlanTrue, '$.tables[0].demands'))) = 1
+        BEGIN
+            DECLARE @armPath NVARCHAR(80) = N'$.source.where.items[' + CAST(@DriverTerm AS VARCHAR(10)) + N']';
+            DECLARE @armK    VARCHAR(16)  = JSON_VALUE(@PredTreeJson, @armPath + N'.k');
+            DECLARE @armCol  SYSNAME      = JSON_VALUE(@PredTreeJson, @armPath + N'.col');
+            DECLARE @armOp   VARCHAR(16)  = JSON_VALUE(@PredTreeJson, @armPath + N'.op');
+            DECLARE @armVal  NVARCHAR(400)= JSON_VALUE(@PredTreeJson, @armPath + N'.val');
+            DECLARE @armKind VARCHAR(16)  = ISNULL(JSON_VALUE(@PredTreeJson, @armPath + N'.valKind'), N'literal');
+            IF @armK = N'colpred' AND @armCol IS NOT NULL AND @armOp IS NOT NULL
+            BEGIN
+                DECLARE @armOv NVARCHAR(MAX) = (
+                    SELECT @armCol AS col,
+                           JSON_QUERY((
+                               SELECT JSON_QUERY((
+                                   SELECT @armOp AS op, @armVal AS val, @armKind AS valKind, 1 AS want
+                                   FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)) AS satisfy
+                               FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)) AS vspec
+                    FOR JSON PATH);
+                SET @SeedPlanTrue = JSON_MODIFY(@SeedPlanTrue, '$.tables[0].demands[0].overrides', JSON_QUERY(@armOv));
+            END;
+        END;
+
         EXEC TestGen.ExecuteSeedPlan
              @Direction = @Direction, @ProcSchema = @ProcSchema, @ProcName = @ProcName2,
              @PlanTrue = @SeedPlanTrue, @PlanFalse = @SeedPlanFalse, @PredText = @PredText,
@@ -19173,7 +19471,8 @@ BEGIN
              + ISNULL(JSON_VALUE([value], '$.schema'), 'dbo') + N'.' + JSON_VALUE([value], '$.table')
              + N''';' + @crlf
         FROM OPENJSON(@TablesJson)
-        WHERE JSON_VALUE([value], '$.table') IS NOT NULL;
+        WHERE JSON_VALUE([value], '$.table') IS NOT NULL
+          AND LEFT(JSON_VALUE([value], '$.table'), 1) <> N'#';   -- v0.16.3: never FakeTable a #temp (the proc creates it at runtime; ExecuteSeedPlan seeds its traced base instead)
 
         IF @Shape = 'UNRECOGNISED'
         BEGIN
@@ -19189,17 +19488,37 @@ BEGIN
         END
         ELSE
         BEGIN
+            -- v0.16.5 (#2 OR per-arm): count top-level OR disjuncts of this gate's seedable WHERE
+            -- (PredicateTreeJson source.where.items, k='or'). When >1, the TRUE direction emits ONE
+            -- test per disjunct (arm i seeded so that disjunct holds via SatisfyPredicate @DriverTerm)
+            -- so each OR arm is exercised independently; FALSE stays a single test. Non-OR gates keep
+            -- @uagNumArms=1 -> the original TRUE+FALSE pair, unchanged.
+            DECLARE @uagNumArms INT, @uagArmTerm INT;
+            SET @uagNumArms = 1;
+            SELECT @uagNumArms = CASE
+                       WHEN PredicateTreeJson IS NOT NULL AND ISJSON(PredicateTreeJson) = 1
+                            AND JSON_VALUE(PredicateTreeJson, '$.source.where.k') = 'or'
+                       THEN (SELECT COUNT(*) FROM OPENJSON(JSON_QUERY(PredicateTreeJson, '$.source.where.items')))
+                       ELSE 1 END
+            FROM   TestGen.PredicateInbox WHERE InboxId = @InboxId;
+            IF @uagNumArms IS NULL OR @uagNumArms < 1 SET @uagNumArms = 1;
+
             SET @i = 0;
-            WHILE @i < 2
+            WHILE @i <= @uagNumArms                 -- 0..N-1 = TRUE arms; N = the single FALSE test
             BEGIN
-                SET @dir = CASE @i WHEN 0 THEN 'TRUE' ELSE 'FALSE' END;
-                EXEC TestGen.SatisfyPredicate @InboxId = @InboxId, @Direction = @dir,
+                IF @i < @uagNumArms
+                BEGIN SET @dir = 'TRUE';  SET @uagArmTerm = CASE WHEN @uagNumArms > 1 THEN @i ELSE NULL END; END
+                ELSE
+                BEGIN SET @dir = 'FALSE'; SET @uagArmTerm = NULL; END
+
+                EXEC TestGen.SatisfyPredicate @InboxId = @InboxId, @Direction = @dir, @DriverTerm = @uagArmTerm,
                      @SeedSql = @seed OUTPUT, @Supported = @sup OUTPUT, @Reason = @rsn OUTPUT,
                      @PredicateSql = @ps OUTPUT, @ExpectedBit = @eb OUTPUT;
 
                 SET @tname = N'test ' + @ProcName + N' branch ' + CAST(@BranchId AS NVARCHAR(10))
                            + N' line ' + CAST(ISNULL(@StartLine, 0) AS NVARCHAR(10))
-                           + N' predicate ' + @dir;
+                           + N' predicate ' + @dir
+                           + CASE WHEN @dir = 'TRUE' AND @uagNumArms > 1 THEN N' arm ' + CAST(@i + 1 AS NVARCHAR(10)) ELSE N'' END;
 
                 IF @sup = 1 AND @ps IS NOT NULL
                 BEGIN

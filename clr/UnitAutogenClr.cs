@@ -496,6 +496,53 @@ public static class UnitAutogenClr
             var i = BuildWhereTree(bn.Expression); if (!i.ok) return i;
             return TOk(M("k", "not", "item", i.node));
         }
+        // v0.16.6 (#10): expand IN / BETWEEN into the colpred tree the seeder + #2 per-arm coverage
+        // already handle, so "WHERE col IN (...)" and "col BETWEEN a AND b" become seedable (they were
+        // UNRECOGNISED). col IN (v1..vn) -> OR(col=v1,...) [NOT IN -> AND(col<>v1,...)]; col BETWEEN a
+        // AND b -> AND(col>=a, col<=b) [NOT BETWEEN -> OR(col<a, col>b)]. The OR form then flows
+        // straight through the v0.16.5 per-arm generator -> one TRUE test per IN value, for free.
+        var ip = n as SD.InPredicate;
+        if (ip != null)
+        {
+            if (ip.Subquery != null) return TFail("WHERE col IN (subquery) not supported");
+            var icol = ip.Expression as SD.ColumnReferenceExpression;
+            if (icol == null || icol.MultiPartIdentifier == null) return TFail("WHERE IN over a non-column expression");
+            var iids = icol.MultiPartIdentifier.Identifiers;
+            string icn = iids[iids.Count - 1].Value;
+            string itn = iids.Count >= 2 ? iids[iids.Count - 2].Value : null;
+            string ieq = ip.NotDefined ? "<>" : "=";
+            var iitems = new List<object>();
+            foreach (var v in ip.Values)
+            {
+                string ival, ivk;
+                var ivr = v as SD.VariableReference;
+                if (ivr != null) { ival = ivr.Name; ivk = "param"; }
+                else { ival = LiteralText(v); ivk = "literal"; }
+                if (ival == null) return TFail("WHERE IN list has a non-literal/@param element");
+                iitems.Add(M("k", "colpred", "tbl", itn, "col", icn, "op", ieq, "val", ival, "valKind", ivk));
+            }
+            if (iitems.Count == 0) return TFail("WHERE IN list is empty");
+            return TOk(M("k", ip.NotDefined ? "and" : "or", "items", iitems));
+        }
+        var bt = n as SD.BooleanTernaryExpression;
+        if (bt != null && (bt.TernaryExpressionType == SD.BooleanTernaryExpressionType.Between
+                        || bt.TernaryExpressionType == SD.BooleanTernaryExpressionType.NotBetween))
+        {
+            var bcol = bt.FirstExpression as SD.ColumnReferenceExpression;
+            if (bcol == null || bcol.MultiPartIdentifier == null) return TFail("WHERE BETWEEN over a non-column expression");
+            var bids = bcol.MultiPartIdentifier.Identifiers;
+            string bcn = bids[bids.Count - 1].Value;
+            string btn = bids.Count >= 2 ? bids[bids.Count - 2].Value : null;
+            string blo = LiteralText(bt.SecondExpression), bhi = LiteralText(bt.ThirdExpression);
+            if (blo == null || bhi == null) return TFail("WHERE BETWEEN bounds must be literals");
+            if (bt.TernaryExpressionType == SD.BooleanTernaryExpressionType.NotBetween)
+                return TOk(M("k", "or", "items", new List<object> {
+                    M("k","colpred","tbl",btn,"col",bcn,"op","<","val",blo,"valKind","literal"),
+                    M("k","colpred","tbl",btn,"col",bcn,"op",">","val",bhi,"valKind","literal") }));
+            return TOk(M("k", "and", "items", new List<object> {
+                M("k","colpred","tbl",btn,"col",bcn,"op",">=","val",blo,"valKind","literal"),
+                M("k","colpred","tbl",btn,"col",bcn,"op","<=","val",bhi,"valKind","literal") }));
+        }
         var leaf = WhereLeaf(n);
         if (!leaf.ok) return TFail(leaf.reason);
         var cj = leaf.conj;
