@@ -6,7 +6,7 @@
   <link rel="self" type="application/atom+xml" href="https://unitautogen.com/feed.xml"/>
   <id>https://unitautogen.com/</id>
   <updated>2026-06-22T12:00:00+00:00</updated>
-  <author><name>Munaf Ibrahim Khatri</name></author>
+  <author><name>Munaf Khatri</name></author>
 
   <entry>
     <title>Most Postgres RLS ships untested. Here's how to test it with pgTAP.</title>
@@ -14,7 +14,7 @@
     <id>https://unitautogen.com/blog/most-postgres-rls-ships-untested.html</id>
     <updated>2026-06-22T12:00:00+00:00</updated>
     <published>2026-06-22T12:00:00+00:00</published>
-    <author><name>Munaf Ibrahim Khatri</name></author>
+    <author><name>Munaf Khatri</name></author>
     <summary>How to actually test Postgres / Supabase Row-Level Security with pgTAP: becoming each identity, USING vs WITH CHECK, "0 rows" vs "denied", the seed-data trap, and the cases that bite you.</summary>
     <content type="html"><![CDATA[
 <p>Row-Level Security is the security boundary of most Postgres and Supabase apps. It's the one thing standing between "users see their own data" and a cross-tenant leak. And yet most RLS I see in the wild has zero tests &mdash; not because people don't care, but because testing RLS well is fiddly, and a test that <em>looks</em> like it passes often proves nothing at all.</p>
