@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Most Postgres RLS ships untested. Here's how to test it with pgTAP. - UnitAutogen</title>
+<meta name="description" content="How to actually test Postgres / Supabase Row-Level Security with pgTAP: becoming each identity, USING vs WITH CHECK, '0 rows' vs 'denied', the seed-data trap, and the cases that bite you.">
+<link rel="canonical" href="https://unitautogen.com/blog/most-postgres-rls-ships-untested.html">
+<link rel="alternate" type="application/atom+xml" title="UnitAutogen blog" href="https://unitautogen.com/feed.xml">
+<link rel="icon" href="../docs/logo.png">
+<meta property="og:title" content="Most Postgres RLS ships untested. Here's how to test it with pgTAP.">
+<meta property="og:description" content="The mechanics, the traps, and the handful of RLS cases that bite you - tested with pgTAP.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://unitautogen.com/blog/most-postgres-rls-ships-untested.html">
+<style>
+  :root{
+    --green:#1a7f37; --green-d:#15672c; --ink:#1b1f23; --muted:#5b6470;
+    --line:#e6e9ec; --bg:#ffffff; --bg-soft:#f6f8f7; --code:#0f231a;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+       color:var(--ink);background:var(--bg);line-height:1.6;-webkit-font-smoothing:antialiased}
+  a{color:var(--green);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+  header{position:sticky;top:0;background:rgba(255,255,255,.9);backdrop-filter:blur(8px);
+         border-bottom:1px solid var(--line);z-index:10}
+  .nav{display:flex;align-items:center;justify-content:space-between;height:78px}
+  .nav img{height:50px;display:block}
+  .nav .links{display:flex;gap:22px;align-items:center;font-size:15px}
+  .nav .links a{color:var(--ink)}
+  .btn{display:inline-block;background:var(--green);color:#fff;padding:11px 20px;border-radius:8px;
+       font-weight:600;font-size:15px}
+  .btn:hover{background:var(--green-d);text-decoration:none;color:#fff}
+  pre{background:var(--code);color:#e7f3ec;border-radius:10px;padding:16px 18px;overflow:auto;
+      font-size:13.5px;line-height:1.55;margin:20px 0}
+  code{font-family:"SF Mono",SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace}
+  p code,li code{background:var(--bg-soft);border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:14px}
+  footer{border-top:1px solid var(--line);padding:40px 0;color:var(--muted);font-size:14px;margin-top:48px}
+  .foot{display:flex;justify-content:space-between;flex-wrap:wrap;gap:18px}
+  .foot a{color:var(--muted)}
+  /* article */
+  .article{max-width:760px;margin:0 auto;padding:0 24px}
+  .article h1{font-size:clamp(28px,4.4vw,40px);line-height:1.15;letter-spacing:-.02em;font-weight:800;margin:44px 0 10px}
+  .article .byline{color:var(--muted);font-size:15px;margin:0 0 8px}
+  .article .backlink{font-size:14px;margin:28px 0 0}
+  .article h2{font-size:clamp(21px,3vw,27px);letter-spacing:-.01em;font-weight:800;margin:40px 0 12px}
+  .article p{font-size:17px;margin:16px 0}
+  .article ul{font-size:17px;padding-left:22px}
+  .article li{margin:8px 0}
+  .article hr{border:none;border-top:1px solid var(--line);margin:40px 0}
+  .endcard{background:var(--bg-soft);border:1px solid var(--line);border-left:4px solid var(--green);
+           border-radius:10px;padding:18px 22px;margin:28px 0;font-size:16px}
+  @media(max-width:760px){ .nav .links a.hidem{display:none} }
+</style></head>
+<body>
+<header>
+  <div class="wrap nav">
+    <a href="../index.html"><img src="../assets/logo-lockup-tight.png" alt="UnitAutogen"></a>
+    <div class="links">
+      <a href="../blog/">&larr; Blog</a>
+      <a class="hidem" href="../index.html">Home</a>
+      <a href="https://github.com/unitautogen/rlsautotest">GitHub</a>
+      <a class="btn" href="https://pypi.org/project/rlsautotest/">Install</a>
+    </div>
+  </div>
+</header>
+
+<article class="article">
+  <p class="backlink"><a href="../blog/">&larr; All posts</a></p>
+  <h1>Most Postgres RLS ships untested. Here's how to test it with pgTAP.</h1>
+  <p class="byline">By Munaf Ibrahim Khatri &middot; June 22, 2026</p>
+
+  <p>Row-Level Security is the security boundary of most Postgres and Supabase apps. It's the one thing standing between "users see their own data" and a cross-tenant leak. And yet most RLS I see in the wild has zero tests &mdash; not because people don't care, but because testing RLS well is fiddly, and a test that <em>looks</em> like it passes often proves nothing at all.</p>
+
+  <p>This post is about how to actually test RLS with <a href="https://pgtap.org">pgTAP</a>: the mechanics, the traps, and the handful of cases that bite you. No tooling required to follow along &mdash; just <code>psql</code> and pgTAP (which Supabase ships, and you can <code>CREATE EXTENSION pgtap</code> anywhere else).</p>
+
+  <h2>Why RLS is hard to test</h2>
+  <p>Four things make RLS testing different from normal unit testing:</p>
+  <p><strong>1. You have to <em>become</em> each identity.</strong> A policy like <code>USING (owner = auth.uid())</code> behaves completely differently depending on who's asking. So a real test has to impersonate each one &mdash; anonymous, authenticated user A, authenticated user B, the service role &mdash; and check what each can actually do. In Postgres/Supabase terms that's <code>SET ROLE</code> plus setting the request's JWT claims.</p>
+  <p><strong>2. <code>USING</code> and <code>WITH CHECK</code> are not the same thing.</strong> <code>USING</code> controls which rows you can see/affect (SELECT, UPDATE, DELETE). <code>WITH CHECK</code> controls which rows you're allowed to write (INSERT, and the new value on UPDATE). A table can be perfectly locked down for reads and wide open for writes, or vice versa. You have to test both directions.</p>
+  <p><strong>3. "Denied" has two completely different shapes.</strong> When someone can't do something, it's either filtered to <strong>zero rows</strong> (RLS silently hides rows, no error) or a hard <strong>permission error</strong> (<code>42501</code> &mdash; the role doesn't even have the table grant). These mean different things, and conflating them hides bugs. A test that just checks "got an error" will miss an RLS policy that's silently returning everyone's rows, because that path doesn't error &mdash; it returns data.</p>
+  <p><strong>4. The seed-data trap &mdash; this is the big one.</strong> A test only proves something if the data driving it actually exercises the policy. If your table is empty, "user B sees 0 rows" passes whether or not the policy works. If the row you seeded isn't actually owned by the user you're impersonating, "owner sees their row" fails &mdash; or worse, accidentally passes for the wrong reason. The data has to match the identity and the predicate, or the green checkmark is a lie.</p>
+
+  <h2>A real pgTAP RLS test</h2>
+  <p>Here's an owner-scoped <code>documents</code> table tested by hand. The shape is Arrange &rarr; Act &rarr; Assert, wrapped in a transaction that rolls back so tests don't pollute each other.</p>
+  <pre><code>begin;
+select plan(3);
+
+-- ARRANGE: seed as the test-runner role (superuser/owner -- bypasses RLS).
+-- Two users, one document owned by user A.
+insert into auth.users (id) values
+  ('00000000-0000-0000-0000-00000000000a'),
+  ('00000000-0000-0000-0000-00000000000b');
+insert into documents (owner, title)
+  values ('00000000-0000-0000-0000-00000000000a', 'A''s doc');
+
+-- ACT/ASSERT as user A (the owner) -- should see exactly their row
+set local role authenticated;
+select set_config('request.jwt.claims',
+  '{"sub":"00000000-0000-0000-0000-00000000000a","role":"authenticated"}', true);
+select is( (select count(*) from documents)::int, 1, 'owner sees their own row' );
+
+-- as user B (a different authenticated user) -- should see nothing
+select set_config('request.jwt.claims',
+  '{"sub":"00000000-0000-0000-0000-00000000000b","role":"authenticated"}', true);
+select is( (select count(*) from documents)::int, 0, 'another user sees nothing' );
+
+-- as anon -- should see nothing
+reset role;
+set local role anon;
+select set_config('request.jwt.claims', '', true);
+select is( (select count(*) from documents)::int, 0, 'anon sees nothing' );
+
+select * from finish();
+rollback;</code></pre>
+  <p>Notice the two things that make this <em>mean</em> something: we seeded a row that is genuinely owned by user A (so "owner sees their row" is a real assertion, not a fluke against empty data), and the negative case is a real, different authenticated user &mdash; not just "logged out."</p>
+
+  <h2>The cases that bite you</h2>
+  <p>Once the basic shape is in place, these are the ones that catch people:</p>
+  <p><strong>INSERT is governed by <code>WITH CHECK</code>, which constrains the row, not the caller.</strong> A user who can't see another tenant's data can usually still insert <em>their own</em> row &mdash; and that's correct, not a hole. The actual hole is <code>WITH CHECK (true)</code> (anyone can write anything) or RLS being off entirely. So an INSERT test should assert two things: the caller can insert a row that satisfies the check, and cannot insert one that violates it (e.g. a row attributed to someone else).</p>
+  <pre><code>-- a different user inserting their OWN row: allowed (WITH CHECK passes)
+select lives_ok(
+  $$ insert into documents (owner, title) values (auth.uid(), 'mine') $$,
+  'user can insert their own row'
+);
+-- inserting a row owned by someone ELSE: must be rejected
+select throws_ok(
+  $$ insert into documents (owner, title)
+       values ('00000000-0000-0000-0000-00000000000a', 'not mine') $$,
+  '42501', null, 'user cannot insert a row for another owner'
+);</code></pre>
+  <p><strong>Tenant isolation needs a real rival tenant.</strong> The meaningful negative test for <code>org_id = (auth.jwt() -&gt; 'app_metadata' -&gt;&gt; 'org_id')::uuid</code> isn't an outsider with no org &mdash; it's a legitimate user of a <em>different</em> org. That's the test that catches a subtly-wrong predicate like <code>org_id IS NOT NULL</code>, which a no-org outsider would pass right through.</p>
+  <p><strong>RBAC via SECURITY DEFINER functions.</strong> Policies that delegate to <code>authorize('documents.read')</code> or <code>has_role('admin')</code> are opaque to a black-box test &mdash; you can't always drive them through the JWT. You test the <em>wiring</em>: set up the state the function reads (or control the function), then assert that the policy is allowed when it returns true and denied when it returns false.</p>
+  <p><strong>Self-referential policies.</strong> A policy that queries its own table (a recursive folder tree, say) can throw <code>infinite recursion detected in policy</code>, which locks out <em>every</em> client role. Worth an explicit "the table is even readable" test.</p>
+
+  <h2>Doing this for a whole schema</h2>
+  <p>None of the above is hard for one table. The problem is that a real app has dozens of tables, four commands each, and several identities &mdash; and every single combination needs its own seeded precondition to mean anything. That's a lot of careful, repetitive SQL, and the failure mode is silent: a test that passes against the wrong data tells you you're safe when you're not.</p>
+  <div class="endcard">That repetition is what pushed me to write a generator. <a href="https://github.com/unitautogen/rlsautotest"><strong>rlsautotest</strong></a> reads your policies straight from the catalog and emits this pgTAP for you, including the seed data that matches each policy and identity. It's free and open source (Apache-2.0). But whether you generate the tests or hand-write them, the principles above are the part that matters.</p>
+  <p>Become each identity, test both <code>USING</code> and <code>WITH CHECK</code>, distinguish "0 rows" from "denied," and make sure your seed data actually exercises the policy. Your RLS is your security boundary &mdash; test it like one.</p>
+
+  <p class="backlink"><a href="../blog/">&larr; All posts</a> &nbsp;&middot;&nbsp; <a href="https://github.com/unitautogen/rlsautotest">rlsautotest on GitHub</a></p>
+</article>
+
+<footer>
+  <div class="wrap foot">
+    <div>(c) 2026 UnitAutogen &middot; <a href="../postgresql.html">rlsautotest</a>, the free PostgreSQL member &middot; Open-source under <a href="https://github.com/unitautogen/rlsautotest/blob/main/LICENSE">Apache-2.0</a></div>
+    <div>
+      <a href="../index.html">Products</a> &middot;
+      <a href="https://github.com/unitautogen/rlsautotest">GitHub</a> &middot;
+      <a href="https://pypi.org/project/rlsautotest/">PyPI</a>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blog - UnitAutogen</title>
+<meta name="description" content="Notes on testing PostgreSQL and SQL Server: Row-Level Security, pgTAP, tSQLt, and automated database test generation.">
+<link rel="canonical" href="https://unitautogen.com/blog/">
+<link rel="alternate" type="application/atom+xml" title="UnitAutogen blog" href="https://unitautogen.com/feed.xml">
+<link rel="icon" href="../docs/logo.png">
+<style>
+  :root{ --green:#1a7f37; --green-d:#15672c; --ink:#1b1f23; --muted:#5b6470; --line:#e6e9ec; --bg:#ffffff; --bg-soft:#f6f8f7; }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+       color:var(--ink);background:var(--bg);line-height:1.6;-webkit-font-smoothing:antialiased}
+  a{color:var(--green);text-decoration:none} a:hover{text-decoration:underline}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+  header{position:sticky;top:0;background:rgba(255,255,255,.9);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);z-index:10}
+  .nav{display:flex;align-items:center;justify-content:space-between;height:78px}
+  .nav img{height:50px;display:block}
+  .nav .links{display:flex;gap:22px;align-items:center;font-size:15px}
+  .nav .links a{color:var(--ink)}
+  .btn{display:inline-block;background:var(--green);color:#fff;padding:11px 20px;border-radius:8px;font-weight:600;font-size:15px}
+  .btn:hover{background:var(--green-d);text-decoration:none;color:#fff}
+  .head{max-width:760px;margin:0 auto;padding:48px 24px 8px}
+  .head h1{font-size:clamp(28px,4.4vw,40px);font-weight:800;letter-spacing:-.02em;margin:0 0 8px}
+  .head p{color:var(--muted);font-size:18px;margin:0}
+  .head .rss{font-size:14px;margin-top:10px}
+  .posts{max-width:760px;margin:0 auto;padding:16px 24px 24px}
+  .post{border-top:1px solid var(--line);padding:24px 0}
+  .post .date{color:var(--muted);font-size:14px}
+  .post h2{font-size:22px;font-weight:800;letter-spacing:-.01em;margin:6px 0 8px}
+  .post p{color:var(--muted);margin:0 0 8px;font-size:16px}
+  footer{border-top:1px solid var(--line);padding:40px 0;color:var(--muted);font-size:14px;margin-top:40px}
+  .foot{display:flex;justify-content:space-between;flex-wrap:wrap;gap:18px}
+  .foot a{color:var(--muted)}
+  @media(max-width:760px){ .nav .links a.hidem{display:none} }
+</style></head>
+<body>
+<header>
+  <div class="wrap nav">
+    <a href="../index.html"><img src="../assets/logo-lockup-tight.png" alt="UnitAutogen"></a>
+    <div class="links">
+      <a href="../index.html">&larr; Home</a>
+      <a class="hidem" href="../postgresql.html">PostgreSQL</a>
+      <a href="https://github.com/unitautogen/rlsautotest">GitHub</a>
+      <a class="btn" href="https://pypi.org/project/rlsautotest/">Install</a>
+    </div>
+  </div>
+</header>
+
+<div class="head">
+  <h1>Blog</h1>
+  <p>Notes on testing your database &mdash; Row-Level Security, pgTAP, tSQLt, and generating the tests instead of hand-writing them.</p>
+  <p class="rss"><a href="../feed.xml">RSS / Atom feed</a></p>
+</div>
+
+<div class="posts">
+  <div class="post">
+    <div class="date">June 22, 2026</div>
+    <h2><a href="most-postgres-rls-ships-untested.html">Most Postgres RLS ships untested. Here's how to test it with pgTAP.</a></h2>
+    <p>The mechanics, the traps, and the handful of Row-Level Security cases that bite you &mdash; becoming each identity, USING vs WITH CHECK, "0 rows" vs "denied," and the seed-data trap.</p>
+    <a href="most-postgres-rls-ships-untested.html">Read &rarr;</a>
+  </div>
+</div>
+
+<footer>
+  <div class="wrap foot">
+    <div>(c) 2026 UnitAutogen &middot; automated database test generation</div>
+    <div>
+      <a href="../index.html">Products</a> &middot;
+      <a href="https://github.com/unitautogen/rlsautotest">GitHub</a> &middot;
+      <a href="../feed.xml">Feed</a>
+    </div>
+  </div>
+</footer>
+</body>
+</html>
