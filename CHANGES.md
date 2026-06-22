@@ -9191,3 +9191,31 @@ stays an unsupported skip). REGRESSION-CLEAN on AW2025 + HighValueCustomer:
    witnesses intact) - all 0 fail/err.
 FILES: Install_UnitAutogen.sql (root) == powershell/UnitAutogen/sql/Install_UnitAutogen.sql
 (byte-identical). No CLR change (clr/lib/UnitAutogenClr.dll unchanged from v0.16.6).
+
+================================================================================
+2026-06-18  v0.16.8  Parenthesised sub-expressions in PERROW-ARITH
+================================================================================
+Closes the last v0.16.1 residual. A per-row derived gate whose value groups an
+additive sub-expression in parentheses - e.g. @v = (@qty + @fee) * @rate, or
+@v = @qty * (@price - @fee) - was previously left NOT_TESTABLE (the flat term-split
+flattened parens and would otherwise have produced a WRONG witness, so it fail-safed).
+TestGen.SearchSeedForProc now has a lightweight PAREN-DEPTH tracker (not a full
+precedence walk) that runs BEFORE the flat split: it splits the RHS into depth-0
+factors and neutralises each non-driving column to 0 (additive sibling / other addend)
+or 1 (multiplicative sibling / co-factor), then reuses the existing deterministic
+witness write. Scope: a single level of parens over a pure top-level product (the +/-
+live INSIDE a paren). Fail-safe to NOT_TESTABLE (never a wrong witness) outside it: a
+depth-0 +/- (top-level SUM mixing paren groups), nested parens, a numeric constant
+inside a paren, a leading unary sign, or any leaf that will not resolve to a loop-table
+column. Entry requires a '(' AND a +/-, so paren-free procedures (and pure-product
+parens like (@a*@b)*@c, already handled by the flat path) are untouched.
+VALIDATED: unit test of the parser on 7 shapes (4 handled exactly: (@a+@b)*@rate,
+@a*(@b-@c), (@a+@b)*@rate*@disc, @rate*(@a+@b); 3 fail-safe: constant-in-paren,
+top-level sum, nested); synthetic dbo.usp_V168Paren (@v = (@Volume + @Fee) * @Rate) ->
+correct witness (co-factors {Fee:0},{Rate:1}, knob 100001, test passes), coverage
+IDENTICAL to the non-paren equivalent @Volume*@Rate+@Fee (parity). REGRESSION-CLEAN:
+AW2025 pz (HardLoop 2/4, LoopLocal 3/3, Sum / ScalarCmp / OrComposition 100%,
+Contradiction 1/2) + HighValueCustomer (AssessCustomer 6/6, usp_ReconcileTradedPositions
+15/16 with all witnesses + archetypes unchanged - its (@vol*@price)*@risk parens are
+pure-product, so the new branch correctly skips them) - all 0 fail / 0 err. Pure T-SQL;
+no CLR change. FILES: Install_UnitAutogen.sql == powershell/UnitAutogen/sql/Install_UnitAutogen.sql.

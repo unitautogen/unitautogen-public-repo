@@ -1,5 +1,5 @@
 @{
-    ModuleVersion     = '0.16.7'
+    ModuleVersion     = '0.16.8'
     GUID              = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
     Author            = 'Munaf Ibrahim Khatri'
     CompanyName       = 'UnitAutogen'
@@ -40,6 +40,19 @@
             ProjectUri  = 'https://github.com/unitautogen/unitautogen-public-repo'
             IconUri     = 'https://raw.githubusercontent.com/unitautogen/unitautogen-public-repo/main/docs/logo.png'
             ReleaseNotes = @'
+## v0.16.8 (beta) - 2026-06-18
+
+- **Parenthesised sub-expressions in per-row arithmetic gates are now seeded.** A branch whose value
+  groups an additive sub-expression in parentheses - e.g. `value = (qty + fee) * rate` or
+  `value = qty * (price - fee)` - was previously left NOT_TESTABLE. A lightweight paren-depth tracker now
+  splits the expression into top-level factors and neutralises each non-driving column correctly (0 for an
+  additive sibling, 1 for a multiplicative one), so both arms are covered. Pure-product parens and
+  paren-free expressions are unchanged.
+- Fail-safe by design: a top-level sum mixing paren groups, nested parens, a constant inside a paren, or any
+  unresolved column still falls back to an honest NOT_TESTABLE - never a wrong witness.
+- Validated on a synthetic per-row procedure (correct co-factors; coverage identical to the non-paren
+  equivalent) with full PredicateZoo + reference-DB regression unchanged. Pure T-SQL; no CLR change.
+
 ## v0.16.7 (beta) - 2026-06-18
 
 - **Nondeterministic-gate guard (no more runaway searches).** A branch whose operand is built from a

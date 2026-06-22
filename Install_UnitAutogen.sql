@@ -12206,15 +12206,113 @@ BEGIN
                                 @adTermNeutral NCHAR(1), @adDrvNeutral NCHAR(1), @adIsDrv BIT, @adFv NVARCHAR(200),
                                 @adConstSum FLOAT, @adNeg INT;
                         SET @adFirstVar=NULL; SET @adDrvNeutral=N'1'; SET @adConstSum=0;  -- reset per gate (loop-DECLARE initialisers run once)
+
+                        -- v0.16.8: PAREN-AWARE product factors. Handle a TOP-LEVEL product whose factors
+                        -- may be parenthesised sub-expressions, e.g. (@a + @b) * @rate  or  @a * (@b - @c).
+                        -- A lightweight paren-DEPTH tracker (not a full precedence walk) splits the RHS into
+                        -- depth-0 factors and neutralises each NON-driving column to 0 (additive sibling /
+                        -- other addend) or 1 (multiplicative sibling / co-factor), then reuses the witness
+                        -- write below (sets @adIsProd + @adCof). Runs BEFORE the flat split, whose guard
+                        -- still excludes '(' co-occurring with +/-, so the two never overlap. Entry needs a
+                        -- '(' AND a +/-, so paren-free procs are untouched. Fail-safe to NOT_TESTABLE (never a
+                        -- wrong witness) outside scope: nested parens, a depth-0 +/- (top-level SUM), a numeric
+                        -- constant inside a paren, a leading unary sign, or any leaf that won't resolve to a
+                        -- loop-table column.
+                        DECLARE @pnOk BIT, @pnDepth INT, @pnMaxD INT, @pnI INT, @pnN INT, @pnCh NCHAR(1),
+                                @pnTopSum BIT, @pnMarked NVARCHAR(MAX), @pnSent NCHAR(1), @pnFac NVARCHAR(400),
+                                @pnInner NVARCHAR(400), @pnIsDrv BIT, @pnInnerSum BIT, @pnLeaves NVARCHAR(400),
+                                @pnLeaf NVARCHAR(200), @pnFirst BIT, @pnNeutral NCHAR(1), @pnCur NVARCHAR(200),
+                                @pnFcol SYSNAME, @pnHop INT, @pnFcAsg NVARCHAR(MAX), @pnRhsF NVARCHAR(200);
+                        IF @adRhs IS NOT NULL AND CHARINDEX(N'(',@adRhs)>0
+                           AND (CHARINDEX(N'+',@adRhs)>0 OR CHARINDEX(N'-',@adRhs)>0)
+                        BEGIN
+                            SET @pnOk=1; SET @pnDepth=0; SET @pnMaxD=0; SET @pnTopSum=0;
+                            SET @pnN=LEN(@adRhs); SET @pnI=1;
+                            WHILE @pnI<=@pnN  -- pass 1: balance + nesting depth + any depth-0 +/-
+                            BEGIN
+                                SET @pnCh=SUBSTRING(@adRhs,@pnI,1);
+                                IF @pnCh=N'(' BEGIN SET @pnDepth=@pnDepth+1; IF @pnDepth>@pnMaxD SET @pnMaxD=@pnDepth; END
+                                ELSE IF @pnCh=N')' SET @pnDepth=@pnDepth-1;
+                                ELSE IF @pnDepth=0 AND (@pnCh=N'+' OR @pnCh=N'-') SET @pnTopSum=1;
+                                SET @pnI=@pnI+1;
+                            END;
+                            IF @pnDepth<>0 OR @pnMaxD>1 OR @pnTopSum=1 SET @pnOk=0;  -- only single-level top-level products
+
+                            IF @pnOk=1
+                            BEGIN
+                                SET @adFv=SUBSTRING(@adRhs,CHARINDEX(N'@',@adRhs),200);   -- driving leaf = first @local (== @drvName lineage)
+                                SET @adFirstVar=LEFT(@adFv,PATINDEX(N'%[^A-Za-z0-9_@]%',@adFv+N' ')-1);
+                                -- mark depth-0 '*' with a sentinel, then iterate factors
+                                SET @pnSent=NCHAR(1); SET @pnMarked=N''; SET @pnDepth=0; SET @pnI=1;
+                                WHILE @pnI<=@pnN
+                                BEGIN
+                                    SET @pnCh=SUBSTRING(@adRhs,@pnI,1);
+                                    IF @pnCh=N'(' SET @pnDepth=@pnDepth+1;
+                                    ELSE IF @pnCh=N')' SET @pnDepth=@pnDepth-1;
+                                    SET @pnMarked=@pnMarked+CASE WHEN @pnCh=N'*' AND @pnDepth=0 THEN @pnSent ELSE @pnCh END;
+                                    SET @pnI=@pnI+1;
+                                END;
+                                SET @pnMarked=@pnMarked+@pnSent;
+                                WHILE @pnOk=1 AND CHARINDEX(@pnSent,@pnMarked)>0
+                                BEGIN
+                                    SET @pnFac=LTRIM(RTRIM(LEFT(@pnMarked,CHARINDEX(@pnSent,@pnMarked)-1)));
+                                    SET @pnMarked=SUBSTRING(@pnMarked,CHARINDEX(@pnSent,@pnMarked)+1,LEN(@pnMarked)+1);
+                                    IF @pnFac=N'' CONTINUE;
+                                    SET @pnInner=@pnFac;
+                                    IF LEFT(@pnInner,1)=N'(' AND RIGHT(@pnInner,1)=N')'
+                                        SET @pnInner=LTRIM(RTRIM(SUBSTRING(@pnInner,2,LEN(@pnInner)-2)));
+                                    IF LEFT(@pnInner,1) IN (N'+',N'-') BEGIN SET @pnOk=0; BREAK; END;  -- leading unary sign -> bail
+                                    SET @pnIsDrv=CASE WHEN CHARINDEX(@adFirstVar,@pnFac)>0 THEN 1 ELSE 0 END;
+                                    SET @pnInnerSum=CASE WHEN CHARINDEX(N'+',@pnInner)>0 OR CHARINDEX(N'-',@pnInner)>0 THEN 1 ELSE 0 END;
+                                    IF @pnIsDrv=1 SET @adDrvNeutral=CASE WHEN @pnInnerSum=1 THEN N'0' ELSE N'1' END;  -- driving leaf additive vs multiplicative
+                                    SET @pnLeaves=REPLACE(REPLACE(REPLACE(@pnInner,N'+',@pnSent),N'-',@pnSent),N'*',@pnSent)+@pnSent;
+                                    SET @pnFirst=1;
+                                    WHILE @pnOk=1 AND CHARINDEX(@pnSent,@pnLeaves)>0
+                                    BEGIN
+                                        SET @pnLeaf=LTRIM(RTRIM(LEFT(@pnLeaves,CHARINDEX(@pnSent,@pnLeaves)-1)));
+                                        SET @pnLeaves=SUBSTRING(@pnLeaves,CHARINDEX(@pnSent,@pnLeaves)+1,LEN(@pnLeaves)+1);
+                                        IF @pnLeaf=N'' CONTINUE;
+                                        IF LEFT(@pnLeaf,1)<>N'@' BEGIN SET @pnOk=0; BREAK; END;  -- constant / function inside a paren -> bail
+                                        IF @pnLeaf=@adFirstVar BEGIN SET @pnFirst=0; CONTINUE; END; -- driving column set via @drvName=knob
+                                        SET @pnNeutral =
+                                            CASE WHEN @pnIsDrv=1 AND @pnInnerSum=1 THEN N'0'                     -- other addend of the driving sum
+                                                 WHEN @pnIsDrv=1 AND @pnInnerSum=0 THEN N'1'                     -- other factor of the driving product
+                                                 WHEN @pnIsDrv=0 AND @pnInnerSum=1 AND @pnFirst=1 THEN N'1'      -- first addend of a co-factor sum -> sum=1
+                                                 WHEN @pnIsDrv=0 AND @pnInnerSum=1 THEN N'0'                     -- later addend of a co-factor sum -> 0
+                                                 ELSE N'1' END;                                                  -- co-factor product leaf -> 1
+                                        SET @pnFirst=0;
+                                        SET @pnCur=@pnLeaf; SET @pnFcol=NULL; SET @pnHop=0;   -- resolve leaf -> per-row column (bounded multi-hop)
+                                        WHILE @pnHop<4 AND @pnFcol IS NULL
+                                        BEGIN
+                                            SET @pnFcAsg=(SELECT TOP 1 Txt FROM #src WHERE Txt LIKE N'%'+@pnCur+N'%=%' AND LineNum<@gl
+                                                AND UPPER(LTRIM(Txt)) NOT LIKE N'IF %' AND UPPER(LTRIM(Txt)) NOT LIKE N'ELSE %' AND UPPER(LTRIM(Txt)) NOT LIKE N'WHILE %' ORDER BY LineNum DESC);
+                                            IF @pnFcAsg IS NULL OR CHARINDEX(@pnCur,@pnFcAsg)=0 BREAK;
+                                            SET @pnRhsF=LTRIM(SUBSTRING(@pnFcAsg,CHARINDEX(N'=',@pnFcAsg,CHARINDEX(@pnCur,@pnFcAsg))+1,200));
+                                            SET @pnRhsF=LTRIM(RTRIM(LEFT(@pnRhsF,PATINDEX(N'%[,;]%',@pnRhsF+N';')-1)));
+                                            IF LEFT(@pnRhsF,1)=N'@' SET @pnCur=LEFT(@pnRhsF,PATINDEX(N'%[^A-Za-z0-9_@]%',@pnRhsF+N' ')-1);
+                                            ELSE SET @pnFcol=LTRIM(RTRIM(LEFT(@pnRhsF,PATINDEX(N'%[^A-Za-z0-9_]%',@pnRhsF+N' ')-1)));
+                                            SET @pnHop=@pnHop+1;
+                                        END;
+                                        IF @pnFcol IS NULL OR LEN(@pnFcol)=0
+                                           OR NOT EXISTS(SELECT 1 FROM sys.columns WHERE object_id=OBJECT_ID(@loopTbl) AND name=@pnFcol)
+                                        BEGIN SET @pnOk=0; BREAK; END;  -- unresolved column -> bail
+                                        IF @pnFcol<>@drvName AND CHARINDEX(N'"col":"'+@pnFcol+N'"',@adCof)=0
+                                            SET @adCof=@adCof+N',{"col":"'+@pnFcol+N'","val":"'+@pnNeutral+N'"}';
+                                    END;
+                                END;
+                                IF @pnOk=1 AND @adCof<>N'' BEGIN SET @adIsProd=1; SET @adConstSum=0; END
+                                ELSE SET @adCof=N'';   -- bail: discard partial co-factors, fall through to search/NOT_TESTABLE
+                            END;
+                        END;
+
                         IF @adRhs IS NOT NULL AND (CHARINDEX(N'*',@adRhs)>0 OR CHARINDEX(N'+',@adRhs)>0 OR CHARINDEX(N'-',@adRhs)>0)
-                           -- v0.16.4 (parenthesised sub-expressions): the term-split below flattens
-                           -- parens by replacing '(' / ')' with spaces, so a paren GROUPING an additive
-                           -- sub-expression (e.g. @a*(@b-@c)) is mis-read as @a*@b - @c - the @a co-factor
-                           -- is lost on the @c term -> a WRONG witness. Pure-product parens like
-                           -- @a*(@b*@c) are safe (multiplication is associative). Fail SAFE: skip the
-                           -- arithmetic archetype (-> honest NOT_TESTABLE, never a wrong witness) only when
-                           -- a '(' co-occurs with a '+' or '-'. (Backlog item: a precedence-aware walk that
-                           -- DISTRIBUTES the factor is the future full fix; this guard prevents the bug.)
+                           -- This flat term-split flattens parens (replaces '(' / ')' with spaces), so a
+                           -- paren GROUPING an additive sub-expression (e.g. @a*(@b-@c)) would be mis-read
+                           -- as @a*@b - @c. The v0.16.8 paren-aware branch ABOVE handles top-level products
+                           -- with parenthesised factors (e.g. (@a+@b)*@rate, @a*(@b-@c)); this flat path
+                           -- therefore only runs when there is NO paren co-occurring with a +/-. The
+                           -- residual it still fails SAFE on (-> honest NOT_TESTABLE, never a wrong witness):
+                           -- a top-level SUM that mixes paren groups with bare +/- terms, and nested parens.
                            AND (CHARINDEX(N'(',@adRhs)=0 OR (CHARINDEX(N'+',@adRhs)=0 AND CHARINDEX(N'-',@adRhs)=0))
                         BEGIN
                             SET @adIsProd=1;
