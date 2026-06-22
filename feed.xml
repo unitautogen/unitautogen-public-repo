@@ -5,8 +5,33 @@
   <link href="https://unitautogen.com/blog/"/>
   <link rel="self" type="application/atom+xml" href="https://unitautogen.com/feed.xml"/>
   <id>https://unitautogen.com/</id>
-  <updated>2026-06-22T12:00:00+00:00</updated>
+  <updated>2026-06-22T15:00:00+00:00</updated>
   <author><name>Munaf Khatri</name></author>
+
+  <entry>
+    <title>Testing Supabase RLS locally when it depends on JWT custom claims</title>
+    <link href="https://unitautogen.com/blog/testing-rls-with-jwt-custom-claims-locally.html"/>
+    <id>https://unitautogen.com/blog/testing-rls-with-jwt-custom-claims-locally.html</id>
+    <updated>2026-06-22T15:00:00+00:00</updated>
+    <published>2026-06-22T15:00:00+00:00</published>
+    <author><name>Munaf Khatri</name></author>
+    <summary>RLS that reads JWT custom claims works on Supabase Cloud but fails in local Studio, because the local Dashboard isn't GoTrue-integrated and auth.jwt() comes back with empty claims. Here's how to test it correctly at the database level.</summary>
+    <content type="html"><![CDATA[
+<p>If your Row-Level Security depends on custom JWT claims &mdash; an <code>org_id</code> for multi-tenancy, a role claim for RBAC &mdash; you've probably hit this: it works on Supabase Cloud, then your local tests return empty tables or "new row violates row-level security policy." The policy is fine; the problem is how the claims reach <code>auth.jwt()</code> locally.</p>
+<p><strong>Why it works on Cloud but not in local Studio.</strong> On a real request GoTrue mints a JWT (running your access-token hook, so the custom claims are in it), PostgREST puts the decoded payload into the <code>request.jwt.claims</code> setting, and your policy's <code>auth.jwt()</code> just reads that setting. The local Studio Dashboard isn't tightly GoTrue-integrated, so impersonating a user doesn't carry your custom claims &mdash; <code>auth.jwt()</code> returns them empty, every policy that reads them evaluates false, and you get an empty result.</p>
+<p><strong>The fix: test at the database level.</strong> <code>auth.jwt()</code> only reads <code>request.jwt.claims</code>, so reproduce a real request by setting it yourself, in a transaction, as the right role:</p>
+<pre><code>begin;
+set local role authenticated;
+select set_config('request.jwt.claims',
+  '{"sub":"...","role":"authenticated","app_metadata":{"org_id":"org-a","role":"admin"}}', true);
+-- auth.jwt()-&gt;'app_metadata'-&gt;&gt;'org_id' now returns 'org-a' inside your policy
+select * from documents;     -- runs under RLS as this exact identity
+rollback;</code></pre>
+<p>Copy the exact claim shape from a real API session's token so it matches your hook. For multi-tenancy, run it again with a <em>different</em> org and assert isolation &mdash; a real rival tenant, not a no-org outsider.</p>
+<p>Three things that cause exactly this: (1) <code>set_config(..., true)</code> is transaction-local, so it must be in the same transaction as the query; (2) you must <code>set role authenticated</code> / <code>anon</code>, or you stay superuser and RLS is bypassed; (3) the JSON nesting must match what the policy reads. Bonus: unlike the Dashboard, this runs in CI.</p>
+<p>Full post: <a href="https://unitautogen.com/blog/testing-rls-with-jwt-custom-claims-locally.html">unitautogen.com</a>. I build <a href="https://github.com/unitautogen/rlsautotest">rlsautotest</a> to generate these per-identity RLS tests automatically, at the DB level so they're immune to the Studio/GoTrue gap.</p>
+]]></content>
+  </entry>
 
   <entry>
     <title>Most Postgres RLS ships untested. Here's how to test it with pgTAP.</title>
