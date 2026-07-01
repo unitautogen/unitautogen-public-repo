@@ -51,21 +51,27 @@
 
 <div class="head">
   <h1>Blog</h1>
-  <p>Notes on testing your database &mdash; Row-Level Security, pgTAP, tSQLt, and generating the tests instead of hand-writing them.</p>
+  <p>Notes on testing your database: Row-Level Security, pgTAP, tSQLt, and generating the tests instead of hand-writing them.</p>
   <p class="rss"><a href="../feed.xml">RSS / Atom feed</a></p>
 </div>
 
 <div class="posts">
   <div class="post">
+    <div class="date">July 1, 2026</div>
+    <h2><a href="rls-is-a-compliance-control.html">Your Postgres RLS is a compliance control. Is it tested?</a></h2>
+    <p>RLS is your HIPAA and SOC 2 access-control safeguard on any PostgreSQL, but only if you can show it works. Untested RLS is an assumption; here's what auditable evidence looks like.</p>
+    <a href="rls-is-a-compliance-control.html">Read &rarr;</a>
+  </div>
+  <div class="post">
     <div class="date">June 22, 2026</div>
     <h2><a href="testing-rls-with-jwt-custom-claims-locally.html">Testing Supabase RLS locally when it depends on JWT custom claims</a></h2>
-    <p>It works on Cloud, fails in local Studio &mdash; because the local Dashboard isn't GoTrue-integrated, so <code>auth.jwt()</code> has no custom claims. Here's how to test it correctly at the database level.</p>
+    <p>It works on Cloud, fails in local Studio, because the local Dashboard isn't GoTrue-integrated, so <code>auth.jwt()</code> has no custom claims. Here's how to test it correctly at the database level.</p>
     <a href="testing-rls-with-jwt-custom-claims-locally.html">Read &rarr;</a>
   </div>
   <div class="post">
     <div class="date">June 22, 2026</div>
     <h2><a href="most-postgres-rls-ships-untested.html">Most Postgres RLS ships untested. Here's how to test it with pgTAP.</a></h2>
-    <p>The mechanics, the traps, and the handful of Row-Level Security cases that bite you &mdash; becoming each identity, USING vs WITH CHECK, "0 rows" vs "denied," and the seed-data trap.</p>
+    <p>The mechanics, the traps, and the handful of Row-Level Security cases that bite you: becoming each identity, USING vs WITH CHECK, "0 rows" vs "denied," and the seed-data trap.</p>
     <a href="most-postgres-rls-ships-untested.html">Read &rarr;</a>
   </div>
 </div>

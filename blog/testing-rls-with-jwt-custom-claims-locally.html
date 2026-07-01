@@ -70,14 +70,14 @@
   <h1>Testing Supabase RLS locally when it depends on JWT custom claims</h1>
   <p class="byline">By Munaf Khatri &middot; June 22, 2026</p>
 
-  <p>If your Row-Level Security depends on custom JWT claims &mdash; an <code>org_id</code> for multi-tenancy, a role claim for RBAC &mdash; you've probably hit this: it works perfectly on Supabase Cloud, and then your local tests come back with empty tables or "new row violates row-level security policy." The policy is fine. The problem is how the claims reach <code>auth.jwt()</code> locally.</p>
+  <p>If your Row-Level Security depends on custom JWT claims, say an <code>org_id</code> for multi-tenancy or a role claim for RBAC, you've probably hit this: it works perfectly on Supabase Cloud, and then your local tests come back with empty tables or "new row violates row-level security policy." The policy is fine. The problem is how the claims reach <code>auth.jwt()</code> locally.</p>
 
   <h2>Why it works on Cloud but not in local Studio</h2>
   <p>On a real request, the chain is: GoTrue mints a JWT (running your custom access-token hook, so the custom claims are in it) &rarr; PostgREST receives that JWT and puts the decoded payload into a Postgres setting called <code>request.jwt.claims</code> &rarr; your policy calls <code>auth.jwt()</code>, which simply reads that setting. So the custom claims are present, and RLS behaves.</p>
-  <p>The local <strong>Studio Dashboard</strong> breaks that chain. When you impersonate a user in the local dashboard, it isn't tightly integrated with GoTrue the way Cloud is &mdash; it gives you a session, but the JWT it puts in front of your query doesn't carry your custom claims. So <code>auth.jwt()</code> returns a payload with the custom claims <em>empty</em>, every policy that reads them evaluates false, and you get an empty result (or a denied insert). It looks like your RLS is broken; really, the test harness just isn't feeding it the claims your app feeds it.</p>
+  <p>The local <strong>Studio Dashboard</strong> breaks that chain. When you impersonate a user in the local dashboard, it isn't tightly integrated with GoTrue the way Cloud is. It gives you a session, but the JWT it puts in front of your query doesn't carry your custom claims. So <code>auth.jwt()</code> returns a payload with the custom claims <em>empty</em>, every policy that reads them evaluates false, and you get an empty result (or a denied insert). It looks like your RLS is broken; really, the test harness just isn't feeding it the claims your app feeds it.</p>
 
   <h2>The fix: test at the database level</h2>
-  <p>The key insight is that <code>auth.jwt()</code> is not magic &mdash; it just reads the <code>request.jwt.claims</code> setting. So you can reproduce a real request exactly by setting that yourself, in a transaction, as the right role. No GoTrue, no PostgREST, no Dashboard involved:</p>
+  <p>The key insight is that <code>auth.jwt()</code> is not magic; it just reads the <code>request.jwt.claims</code> setting. So you can reproduce a real request exactly by setting that yourself, in a transaction, as the right role. No GoTrue, no PostgREST, no Dashboard involved:</p>
   <pre><code>begin;
 
 -- become the role your app uses, and inject the claims GoTrue would have minted
@@ -94,19 +94,19 @@ rollback;</code></pre>
   <p>Now the policy sees the same claims it sees in production, and you can assert what this identity should and shouldn't be able to do. Copy the exact JSON shape from a real API session's token (<code>app_metadata</code> vs <code>user_metadata</code> vs a top-level claim) so it matches what your hook actually emits.</p>
 
   <h2>Multi-tenancy: test a real rival tenant</h2>
-  <p>For tenant isolation, the meaningful negative test isn't an outsider with no org &mdash; it's a legitimate user of a <em>different</em> org. Run the same block again with <code>org-b</code> in the claims and assert they see none of org A's rows. That's the test that catches a subtly-wrong predicate like <code>org_id IS NOT NULL</code>, which a no-org outsider would sail right through but a real second tenant would expose.</p>
+  <p>For tenant isolation, the meaningful negative test isn't an outsider with no org; it's a legitimate user of a <em>different</em> org. Run the same block again with <code>org-b</code> in the claims and assert they see none of org A's rows. That's the test that catches a subtly-wrong predicate like <code>org_id IS NOT NULL</code>, which a no-org outsider would sail right through but a real second tenant would expose.</p>
 
   <h2>Three gotchas that cause exactly this</h2>
   <ul>
     <li><strong><code>set_config(..., true)</code> is transaction-local.</strong> It only lasts for the current transaction, so the <code>set_config</code> and the query have to be in the <em>same</em> transaction. Run them separately and the claim is already gone.</li>
-    <li><strong>You must <code>set role</code>.</strong> If you stay connected as the table owner or a superuser, RLS is bypassed entirely &mdash; everything passes and proves nothing. Become <code>authenticated</code> or <code>anon</code>.</li>
+    <li><strong>You must <code>set role</code>.</strong> If you stay connected as the table owner or a superuser, RLS is bypassed entirely, so everything passes and proves nothing. Become <code>authenticated</code> or <code>anon</code>.</li>
     <li><strong>The JSON shape must match.</strong> If your policy reads <code>auth.jwt()-&gt;'app_metadata'-&gt;&gt;'org_id'</code>, the claims you set need that nesting exactly.</li>
   </ul>
 
   <h2>The bonus: this runs in CI</h2>
-  <p>The Dashboard will never run in your pipeline, but this does. Wrap the same pattern in <a href="https://pgtap.org">pgTAP</a> and you have RLS tests &mdash; including the custom-claim and multi-tenant cases &mdash; that run on every push, the same way the app actually executes them.</p>
+  <p>The Dashboard will never run in your pipeline, but this does. Wrap the same pattern in <a href="https://pgtap.org">pgTAP</a> and you have RLS tests, including the custom-claim and multi-tenant cases, that run on every push, the same way the app actually executes them.</p>
 
-  <div class="endcard">Writing one of these by hand per table, per command, per identity is a lot of careful SQL. <a href="https://github.com/unitautogen/rlsautotest"><strong>rlsautotest</strong></a> generates it for you &mdash; it reads your policies, sets the claims per identity and tenant, seeds matching data, and asserts both directions, entirely at the DB level so it's immune to the Studio/GoTrue gap. Free and open source.</div>
+  <div class="endcard">Writing one of these by hand per table, per command, per identity is a lot of careful SQL. <a href="https://github.com/unitautogen/rlsautotest"><strong>rlsautotest</strong></a> generates it for you: it reads your policies, sets the claims per identity and tenant, seeds matching data, and asserts both directions, entirely at the DB level so it's immune to the Studio/GoTrue gap. Free and open source.</div>
 
   <p>However you get there, the principle is the same: test RLS by setting the claims yourself at the database level, as the role your app uses. That's the only place the policy runs the way production runs it.</p>
 
